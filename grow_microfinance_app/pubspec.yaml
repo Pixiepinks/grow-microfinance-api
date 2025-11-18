@@ -1,0 +1,17 @@
+name: grow_microfinance_app
+description: Mobile app for Grow Microfinance daily lending
+publish_to: 'none'
+version: 0.1.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  http: ^1.2.2
+  provider: ^6.1.2
+  shared_preferences: ^2.2.3
+
+flutter:
+  uses-material-design: true
