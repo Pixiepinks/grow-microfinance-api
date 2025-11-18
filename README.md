@@ -67,7 +67,7 @@ scripts/seed_data.py # Optional demo data
    - `FLASK_ENV=production`
    - `DATABASE_URL` (from the Postgres addon)
    - `JWT_SECRET_KEY` (choose a strong value)
-4. Set start command: `gunicorn wsgi:app --bind 0.0.0.0:$PORT`
+4. Set start command: `./entrypoint.sh` (runs migrations + seeds before gunicorn)
 5. Deploy. Use the public Railway URL as the API base for the Flutter app.
 
 ### API highlights

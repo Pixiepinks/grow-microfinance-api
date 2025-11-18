@@ -17,5 +17,8 @@ COPY . .
 # Default environment
 ENV FLASK_ENV=production
 
-# Start the app with gunicorn, binding to the PORT env variable from Railway
-CMD ["bash", "-c", "gunicorn wsgi:app --bind 0.0.0.0:${PORT:-8000}"]
+# Ensure the entrypoint script is executable (handles migrations + seeding)
+RUN chmod +x entrypoint.sh
+
+# Start via entrypoint so migrations/seeds run before gunicorn
+ENTRYPOINT ["./entrypoint.sh"]
