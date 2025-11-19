@@ -13,12 +13,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY . .
+RUN chmod +x /app/entrypoint.sh
 
 # Default environment
 ENV FLASK_ENV=production
 
-# Ensure the entrypoint script is executable (handles migrations + seeding)
-RUN chmod +x entrypoint.sh
-
 # Start via entrypoint so migrations/seeds run before gunicorn
-ENTRYPOINT ["./entrypoint.sh"]
+CMD ["/app/entrypoint.sh"]
