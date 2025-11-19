@@ -21,7 +21,7 @@ def login():
         return jsonify({"message": "Invalid credentials"}), 401
 
     additional_claims = {"role": user.role}
-    access_token = create_access_token(identity=user.id, additional_claims=additional_claims)
+    access_token = create_access_token(identity=str(user.id), additional_claims=additional_claims)
 
     return jsonify(
         {

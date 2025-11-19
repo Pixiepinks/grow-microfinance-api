@@ -54,6 +54,10 @@ scripts/seed_data.py # Optional demo data
    ```bash
    python scripts/seed_data.py
    ```
+   Or seed through the public API (uses Flask's test client, no server needed):
+   ```bash
+   PYTHONPATH=. python scripts/api_seed.py
+   ```
 7. Run locally
    ```bash
    flask --app wsgi run --port 5000
