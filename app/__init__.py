@@ -1,6 +1,8 @@
 import os
 from flask import Flask, jsonify
 
+from flask_migrate import upgrade
+
 from .extensions import db, migrate, jwt
 from .routes.auth import auth_bp
 from .routes.admin import admin_bp
@@ -26,5 +28,14 @@ def create_app():
     @app.route("/health", methods=["GET"])
     def health_check():
         return jsonify({"status": "ok"})
+
+    # Ensure database schema is present even when the deployment start command
+    # skips the entrypoint migration step (e.g., running `gunicorn wsgi:app`).
+    # If migrations have already run, `upgrade()` is a no-op.
+    with app.app_context():
+        try:
+            upgrade()
+        except Exception as exc:  # pragma: no cover - defensive logging
+            app.logger.warning("Skipping automatic migrations: %s", exc)
 
     return app
