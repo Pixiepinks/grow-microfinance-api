@@ -11,7 +11,7 @@ customer_bp = Blueprint("customer", __name__, url_prefix="/customer")
 @customer_bp.route("/me", methods=["GET"])
 @role_required(["customer"])
 def me():
-    user_id = get_jwt_identity()
+    user_id = int(get_jwt_identity())
     customer = Customer.query.filter_by(user_id=user_id).first()
     if not customer:
         return jsonify({"message": "Profile not found"}), 404
@@ -30,7 +30,7 @@ def me():
 @customer_bp.route("/loans", methods=["GET"])
 @role_required(["customer"])
 def my_loans():
-    user_id = get_jwt_identity()
+    user_id = int(get_jwt_identity())
     customer = Customer.query.filter_by(user_id=user_id).first()
     loans = Loan.query.filter_by(customer_id=customer.id).all()
 
@@ -68,7 +68,7 @@ def my_loans():
 @customer_bp.route("/loans/<int:loan_id>/payments", methods=["GET"])
 @role_required(["customer"])
 def loan_payments(loan_id):
-    user_id = get_jwt_identity()
+    user_id = int(get_jwt_identity())
     customer = Customer.query.filter_by(user_id=user_id).first()
     loan = Loan.query.filter_by(id=loan_id, customer_id=customer.id).first()
     if not loan:

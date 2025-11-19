@@ -41,7 +41,7 @@ def record_payment():
         loan_id=loan_id,
         amount_collected=amount,
         collection_date=date.fromisoformat(collection_date) if collection_date else date.today(),
-        collected_by_id=get_jwt_identity(),
+        collected_by_id=int(get_jwt_identity()),
         payment_method=payment_method,
         remarks=remarks,
     )

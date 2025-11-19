@@ -129,7 +129,7 @@ def create_loan():
         end_date=end_date,
         total_payable=total_payable,
         daily_installment=daily_installment,
-        created_by_id=get_jwt_identity(),
+        created_by_id=int(get_jwt_identity()),
     )
     db.session.add(loan)
     db.session.commit()
