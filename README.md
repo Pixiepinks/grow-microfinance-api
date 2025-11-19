@@ -58,6 +58,11 @@ scripts/seed_data.py # Optional demo data
    ```bash
    PYTHONPATH=. python scripts/api_seed.py
    ```
+   To seed a deployed API (e.g., Railway) set `API_BASE_URL` first so the script issues real HTTP calls:
+   ```bash
+   export API_BASE_URL=https://your-railway-url.up.railway.app
+   PYTHONPATH=. python scripts/api_seed.py
+   ```
 7. Run locally
    ```bash
    flask --app wsgi run --port 5000
