@@ -22,6 +22,12 @@ class User(db.Model):
     customer_profile = relationship("Customer", back_populates="user", uselist=False)
     created_loans = relationship("Loan", back_populates="created_by", foreign_keys="Loan.created_by_id")
     collected_payments = relationship("Payment", back_populates="collected_by", foreign_keys="Payment.collected_by_id")
+    created_applications = relationship(
+        "LoanApplication", back_populates="created_by", foreign_keys="LoanApplication.created_by_id"
+    )
+    assigned_applications = relationship(
+        "LoanApplication", back_populates="assigned_officer", foreign_keys="LoanApplication.assigned_officer_id"
+    )
 
     def set_password(self, password: str) -> None:
         self.password_hash = generate_password_hash(password)
@@ -45,6 +51,7 @@ class Customer(db.Model):
 
     user = relationship("User", back_populates="customer_profile")
     loans = relationship("Loan", back_populates="customer")
+    loan_applications = relationship("LoanApplication", back_populates="customer")
 
 
 class Loan(db.Model):
@@ -87,6 +94,66 @@ class Loan(db.Model):
         expected = self.expected_to_date()
         paid = self.total_paid
         return expected - paid if expected > paid else Decimal("0")
+
+
+class LoanApplication(db.Model):
+    __tablename__ = "loan_applications"
+
+    id = db.Column(db.Integer, primary_key=True)
+    application_number = db.Column(db.String(50), unique=True, index=True, nullable=False)
+    customer_id = db.Column(db.Integer, db.ForeignKey("customers.id"), nullable=False)
+    loan_type = db.Column(db.String(50), nullable=False)
+    status = db.Column(db.String(50), default="DRAFT", nullable=False)
+    applied_amount = db.Column(Numeric(12, 2), nullable=False)
+    tenure_months = db.Column(db.Integer, nullable=False)
+    interest_rate = db.Column(Numeric(5, 2))
+    approved_amount = db.Column(Numeric(12, 2))
+    approved_tenure = db.Column(db.Integer)
+    review_notes = db.Column(db.Text)
+    reject_reason = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    submitted_at = db.Column(db.DateTime)
+    approved_at = db.Column(db.DateTime)
+    created_by_id = db.Column(db.Integer, db.ForeignKey("users.id"))
+    assigned_officer_id = db.Column(db.Integer, db.ForeignKey("users.id"))
+
+    full_name = db.Column(db.String(150), nullable=False)
+    nic_number = db.Column(db.String(50), nullable=False)
+    mobile_number = db.Column(db.String(20), nullable=False)
+    email = db.Column(db.String(120))
+    address_line1 = db.Column(db.String(255))
+    address_line2 = db.Column(db.String(255))
+    city = db.Column(db.String(120))
+    district = db.Column(db.String(120))
+    province = db.Column(db.String(120))
+    date_of_birth = db.Column(db.Date)
+    monthly_income = db.Column(Numeric(12, 2))
+    monthly_expenses = db.Column(Numeric(12, 2))
+    has_existing_loans = db.Column(db.Boolean, default=False)
+    existing_loan_details = db.Column(db.Text)
+    extra_data = db.Column(db.JSON, default=dict)
+
+    customer = relationship("Customer", back_populates="loan_applications")
+    created_by = relationship("User", foreign_keys=[created_by_id], back_populates="created_applications")
+    assigned_officer = relationship("User", foreign_keys=[assigned_officer_id], back_populates="assigned_applications")
+    documents = relationship(
+        "LoanApplicationDocument",
+        back_populates="loan_application",
+        cascade="all, delete-orphan",
+    )
+
+
+class LoanApplicationDocument(db.Model):
+    __tablename__ = "loan_application_documents"
+
+    id = db.Column(db.Integer, primary_key=True)
+    loan_application_id = db.Column(db.Integer, db.ForeignKey("loan_applications.id"), nullable=False)
+    document_type = db.Column(db.String(50), nullable=False)
+    file_path = db.Column(db.String(255), nullable=False)
+    uploaded_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    loan_application = relationship("LoanApplication", back_populates="documents")
 
 
 class Payment(db.Model):
