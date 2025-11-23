@@ -1,5 +1,6 @@
 import os
 from flask import Flask, jsonify
+from flask_cors import CORS
 
 from flask_migrate import upgrade
 
@@ -19,6 +20,11 @@ def create_app():
     db.init_app(app)
     migrate.init_app(app, db)
     jwt.init_app(app)
+
+    CORS(
+        app,
+        resources={r"/*": {"origins": app.config.get("CORS_ORIGINS", "*")}},
+    )
 
     app.register_blueprint(auth_bp)
     app.register_blueprint(admin_bp)
