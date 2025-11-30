@@ -4,7 +4,7 @@ from flask_cors import CORS
 
 from flask_migrate import upgrade
 
-from .extensions import db, migrate, jwt
+from .extensions import db, migrate, jwt, init_jwt_handlers
 from .routes.auth import auth_bp
 from .routes.admin import admin_bp
 from .routes.staff import staff_bp
@@ -18,9 +18,13 @@ def create_app():
     config_module = f"config.{config_name}Config"
     app.config.from_object(config_module)
 
+    app.config.setdefault("JWT_TOKEN_LOCATION", ["headers", "cookies", "query_string"])
+    app.config.setdefault("JWT_QUERY_STRING_NAME", "access_token")
+
     db.init_app(app)
     migrate.init_app(app, db)
     jwt.init_app(app)
+    init_jwt_handlers(app)
 
     CORS(
         app,

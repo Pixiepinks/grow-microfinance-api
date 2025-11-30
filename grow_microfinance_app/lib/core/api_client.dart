@@ -37,6 +37,14 @@ class ApiClient {
     if (response.statusCode >= 200 && response.statusCode < 300) {
       return {'data': data};
     }
-    return {'error': data['message'] ?? 'Request failed'};
+    final backendMessage = data['message'];
+    final backendErrors = data['errors'];
+    String errorText = 'Request failed';
+    if (backendErrors is List && backendErrors.isNotEmpty) {
+      errorText = backendErrors.join(', ');
+    } else if (backendMessage is String && backendMessage.isNotEmpty) {
+      errorText = backendMessage;
+    }
+    return {'error': errorText};
   }
 }
