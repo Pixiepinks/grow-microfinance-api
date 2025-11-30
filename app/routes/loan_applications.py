@@ -108,6 +108,12 @@ NIC_REGEX = re.compile(r"^(?:[0-9]{9}[VvXx]|[0-9]{12})$")
 def parse_decimal(value) -> Optional[Decimal]:
     if value is None:
         return None
+    if isinstance(value, str):
+        # Accept user-facing formats such as "1,000,000" or values with currency prefixes
+        cleaned = re.sub(r"[^0-9.\-]", "", value).replace(",", "")
+        value = cleaned.strip()
+        if value == "":
+            return None
     try:
         return Decimal(str(value))
     except Exception:
