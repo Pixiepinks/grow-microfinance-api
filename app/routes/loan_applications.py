@@ -406,7 +406,8 @@ def submit_application(application_id):
         return jsonify({"message": "Application cannot be submitted in its current status"}), 400
 
     data = request.get_json() or {}
-    merged_data = {**build_application_response(application), **application.extra_data, **data}
+    existing_extra_data = application.extra_data or {}
+    merged_data = {**build_application_response(application), **existing_extra_data, **data}
     type_data = collect_type_specific_data(application.loan_type, data)
     merged_data.update(type_data)
 
@@ -417,7 +418,7 @@ def submit_application(application_id):
 
     application.status = STATUS_SUBMITTED
     application.submitted_at = datetime.utcnow()
-    application.extra_data = {**(application.extra_data or {}), **type_data}
+    application.extra_data = {**existing_extra_data, **type_data}
 
     db.session.commit()
     return jsonify(build_application_response(application))
