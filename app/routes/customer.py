@@ -1,5 +1,5 @@
 from decimal import Decimal
-from flask import Blueprint, jsonify
+from flask import Blueprint, jsonify, current_app
 from flask_jwt_extended import get_jwt_identity
 
 from ..models import Customer, Loan
@@ -14,6 +14,7 @@ def me():
     user_id = int(get_jwt_identity())
     customer = Customer.query.filter_by(user_id=user_id).first()
     if not customer:
+        current_app.logger.warning("Customer profile not found for user_id=%s", user_id)
         return jsonify({"message": "Profile not found"}), 404
 
     return jsonify(

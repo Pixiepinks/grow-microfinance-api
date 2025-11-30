@@ -14,7 +14,7 @@ from ..models import Customer, LoanApplication, LoanApplicationDocument
 from .utils import role_required
 
 
-loan_app_bp = Blueprint("loan_applications", __name__, url_prefix="/api/loan-applications")
+loan_app_bp = Blueprint("loan_applications", __name__, url_prefix="/loan-applications")
 
 
 ALLOWED_LOAN_TYPES = {
@@ -139,6 +139,9 @@ def load_customer_id_from_request() -> Optional[int]:
         customer = Customer.query.filter_by(user_id=user_id).first()
         if customer:
             return customer.id
+        current_app.logger.warning(
+            "Customer profile missing for user_id=%s while creating application", user_id
+        )
         return None
     payload = request.get_json(silent=True) or {}
     return payload.get("customer_id")
@@ -271,12 +274,21 @@ def create_application():
     data = request.get_json() or {}
     customer_id = load_customer_id_from_request()
     if not customer_id:
-        return jsonify({"message": "customer_id is required"}), 400
+        return (
+            jsonify({"message": "No customer profile found for this user", "errors": ["customer_id missing"]}),
+            400,
+        )
 
     loan_type = data.get("loan_type")
     type_data = collect_type_specific_data(loan_type, data)
     validation_errors = validate_application_payload({**data, **type_data, "loan_type": loan_type}, loan_type)
     if validation_errors:
+        current_app.logger.warning(
+            "Loan application validation failed for customer_id=%s: %s | payload_keys=%s",
+            customer_id,
+            validation_errors,
+            sorted(list(data.keys())),
+        )
         return jsonify({"errors": validation_errors}), 400
 
     application = LoanApplication(
