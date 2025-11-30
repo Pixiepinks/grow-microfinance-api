@@ -138,6 +138,28 @@ def generate_application_number() -> str:
     return f"GROW-APP-{date_str}-{(daily_count or 0) + 1:04d}"
 
 
+def normalize_application_payload(data: dict) -> dict:
+    """Flattens nested payload sections sent by the web app.
+
+    The web client groups form fields under sections like ``applicant_details``,
+    ``loan_details`` and ``type_specific``. The existing validation and model
+    creation logic expect a flat structure, so we merge those nested dictionaries
+    (when present) into the top-level payload while keeping the original keys
+    intact.
+    """
+
+    if not isinstance(data, dict):
+        return {}
+
+    normalized = {**data}
+    for section in ("applicant_details", "loan_details", "type_specific"):
+        section_data = data.get(section)
+        if isinstance(section_data, dict):
+            normalized.update({k: v for k, v in section_data.items() if v is not None})
+
+    return normalized
+
+
 def load_customer_id_from_request() -> Optional[int]:
     claims = get_jwt()
     user_id = int(get_jwt_identity())
@@ -277,7 +299,7 @@ def assert_application_access(application: LoanApplication) -> Optional[tuple]:
 @loan_app_bp.route("", methods=["POST"])
 @role_required(["customer", "admin", "staff"])
 def create_application():
-    data = request.get_json() or {}
+    data = normalize_application_payload(request.get_json() or {})
     customer_id = load_customer_id_from_request()
     if not customer_id:
         return (
@@ -340,7 +362,7 @@ def update_application(application_id):
     if application.status not in {STATUS_DRAFT, STATUS_SUBMITTED}:
         return jsonify({"message": "Only draft or submitted applications can be updated"}), 400
 
-    data = request.get_json() or {}
+    data = normalize_application_payload(request.get_json() or {})
     loan_type = data.get("loan_type", application.loan_type)
     type_data = collect_type_specific_data(loan_type, data)
 
@@ -405,7 +427,7 @@ def submit_application(application_id):
     if application.status not in {STATUS_DRAFT, STATUS_SUBMITTED, STATUS_UNDER_REVIEW}:
         return jsonify({"message": "Application cannot be submitted in its current status"}), 400
 
-    data = request.get_json() or {}
+    data = normalize_application_payload(request.get_json() or {})
     existing_extra_data = application.extra_data or {}
     merged_data = {**build_application_response(application), **existing_extra_data, **data}
     type_data = collect_type_specific_data(application.loan_type, data)
