@@ -1,6 +1,6 @@
 import os
 import re
-from datetime import datetime, date
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Dict, List, Optional
 
@@ -125,6 +125,33 @@ def parse_int(value, default: Optional[int] = None) -> Optional[int]:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _parse_iso_date(value):
+    """Accept 'YYYY-MM-DD' or full ISO datetime string and return a date object safely."""
+    if not value:
+        return None
+
+    # if already a date object
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+
+    if isinstance(value, str):
+        try:
+            # datetime string
+            if "T" in value:
+                return datetime.fromisoformat(value).date()
+            # pure date string
+            return date.fromisoformat(value)
+        except ValueError:
+            # fallback: try first 10 characters
+            try:
+                return date.fromisoformat(value[:10])
+            except Exception:
+                current_app.logger.warning(f"Invalid date format for date_of_birth: {value}")
+                return None
+
+    return None
 
 
 def generate_application_number() -> str:
@@ -342,7 +369,7 @@ def create_application():
         city=data.get("city"),
         district=data.get("district"),
         province=data.get("province"),
-        date_of_birth=date.fromisoformat(data["date_of_birth"]) if data.get("date_of_birth") else None,
+        date_of_birth=_parse_iso_date(data.get("date_of_birth")),
         monthly_income=parse_decimal(data.get("monthly_income")),
         monthly_expenses=parse_decimal(data.get("monthly_expenses")),
         has_existing_loans=bool(data.get("has_existing_loans", False)),
