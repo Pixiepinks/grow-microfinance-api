@@ -229,11 +229,17 @@ def validate_required_documents(application: LoanApplication) -> List[str]:
     existing = {doc.document_type for doc in application.documents}
     missing_common = COMMON_REQUIRED_DOCUMENTS - existing
     if missing_common:
-        errors.append(f"Missing documents: {', '.join(sorted(missing_common))}")
+        errors.append(
+            "Missing required documents: " + ", ".join(sorted(missing_common))
+        )
 
     type_missing = TYPE_DOCUMENT_REQUIREMENTS.get(application.loan_type, set()) - existing
     if type_missing:
-        errors.append(f"Missing documents for {application.loan_type}: {', '.join(sorted(type_missing))}")
+        errors.append(
+            "Missing required documents for "
+            f"{application.loan_type}: "
+            + ", ".join(sorted(type_missing))
+        )
 
     if application.loan_type == "GROW_ONLINE_BUSINESS" and "STORE_SCREENSHOT" not in existing:
         errors.append("At least one store screenshot is required")
@@ -436,7 +442,10 @@ def submit_application(application_id):
     validation_errors = validate_application_payload(merged_data, application.loan_type)
     validation_errors.extend(validate_required_documents(application))
     if validation_errors:
-        return jsonify({"errors": validation_errors}), 400
+        return (
+            jsonify({"message": "Validation failed", "errors": validation_errors}),
+            400,
+        )
 
     application.status = STATUS_SUBMITTED
     application.submitted_at = datetime.utcnow()
