@@ -329,10 +329,7 @@ def build_application_response(application: LoanApplication) -> dict:
         ],
         "created_at": application.created_at.isoformat() if application.created_at else None,
         "updated_at": application.updated_at.isoformat() if application.updated_at else None,
-        "staff_approved_at": application.staff_approved_at.isoformat()
-        if application.staff_approved_at
-        else None,
-        "staff_approved_by_id": application.staff_approved_by_id,
+        "assigned_officer_id": application.assigned_officer_id,
     }
 
 

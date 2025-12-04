@@ -198,8 +198,6 @@ def staff_approve_application(application_id):
             return transition_error
 
         user_id = int(get_jwt_identity())
-        application.staff_approved_at = datetime.utcnow()
-        application.staff_approved_by_id = user_id
         application.assigned_officer_id = user_id
 
         db.session.commit()

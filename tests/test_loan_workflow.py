@@ -339,8 +339,7 @@ def test_staff_can_approve_submitted_application_via_staff_endpoint(app, client)
     assert response.status_code == 200
     body = response.get_json()
     assert body["status"] == STATUS_STAFF_APPROVED
-    assert body["staff_approved_by_id"] == staff_user.id
-    assert body["staff_approved_at"] is not None
+    assert body.get("assigned_officer_id") == staff_user.id
 
 
 def test_staff_approval_requires_submitted_status(app, client):

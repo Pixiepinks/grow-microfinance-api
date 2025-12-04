@@ -1,4 +1,4 @@
-"""Ensure staff approval columns exist with timezone and FK"""
+"""Finalize removal of staff approval columns from schema history."""
 
 from alembic import op
 import sqlalchemy as sa
@@ -10,61 +10,11 @@ branch_labels = None
 depends_on = None
 
 
-STAFF_APPROVED_BY_FK = "fk_loan_applications_staff_approved_by_id_users_ondelete"
-
-
-def _column_exists(table_name: str, column_name: str) -> bool:
-    inspector = sa.inspect(op.get_bind())
-    try:
-        return any(col["name"] == column_name for col in inspector.get_columns(table_name))
-    except sa.exc.NoSuchTableError:
-        return False
-
-
-def _fk_exists(table_name: str, fk_name: str) -> bool:
-    inspector = sa.inspect(op.get_bind())
-    try:
-        return any(fk["name"] == fk_name for fk in inspector.get_foreign_keys(table_name))
-    except sa.exc.NoSuchTableError:
-        return False
-
-
-def _table_has_column(table_name: str, column_name: str) -> bool:
-    inspector = sa.inspect(op.get_bind())
-    if table_name not in inspector.get_table_names():
-        return False
-    return any(col["name"] == column_name for col in inspector.get_columns(table_name))
-
-
 def upgrade():
-    with op.batch_alter_table("loan_applications") as batch_op:
-        if not _column_exists("loan_applications", "staff_approved_at"):
-            batch_op.add_column(
-                sa.Column("staff_approved_at", sa.DateTime(timezone=True), nullable=True)
-            )
-        if not _column_exists("loan_applications", "staff_approved_by_id"):
-            batch_op.add_column(sa.Column("staff_approved_by_id", sa.Integer(), nullable=True))
-
-    if _column_exists("loan_applications", "staff_approved_by_id") and _table_has_column(
-        "users", "id"
-    ):
-        if not _fk_exists("loan_applications", STAFF_APPROVED_BY_FK):
-            op.create_foreign_key(
-                STAFF_APPROVED_BY_FK,
-                "loan_applications",
-                "users",
-                ["staff_approved_by_id"],
-                ["id"],
-                ondelete="SET NULL",
-            )
+    # No schema changes; columns are intentionally absent from the model and DB.
+    pass
 
 
 def downgrade():
-    if _fk_exists("loan_applications", STAFF_APPROVED_BY_FK):
-        op.drop_constraint(STAFF_APPROVED_BY_FK, "loan_applications", type_="foreignkey")
-
-    with op.batch_alter_table("loan_applications") as batch_op:
-        if _column_exists("loan_applications", "staff_approved_by_id"):
-            batch_op.drop_column("staff_approved_by_id")
-        if _column_exists("loan_applications", "staff_approved_at"):
-            batch_op.drop_column("staff_approved_at")
+    # Matching no-op downgrade.
+    pass
