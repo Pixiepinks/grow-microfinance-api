@@ -1,11 +1,16 @@
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from flask import Blueprint, request, jsonify, current_app
 from flask_jwt_extended import get_jwt_identity
 
 from ..extensions import db
 from ..models import Loan, LoanApplication, Payment, Customer
-from .loan_applications import STATUS_SUBMITTED
+from .loan_applications import (
+    STATUS_STAFF_APPROVED,
+    STATUS_SUBMITTED,
+    apply_status_transition,
+    build_application_response,
+)
 from .utils import role_required
 
 staff_bp = Blueprint("staff", __name__, url_prefix="/staff")
@@ -162,6 +167,53 @@ def staff_loan_applications():
             "Error handling %s %s: %s", request.method, request.path, exc
         )
         return jsonify({"message": "Failed to load loan applications"}), 500
+
+
+@staff_bp.route(
+    "/loan-applications/<int:application_id>/approve", methods=["POST", "OPTIONS"]
+)
+@role_required(["admin", "staff"])
+def staff_approve_application(application_id):
+    logger = current_app.logger
+    try:
+        application = LoanApplication.query.get(application_id)
+        if not application:
+            return jsonify({"message": "Application not found"}), 404
+
+        if application.status != STATUS_SUBMITTED:
+            return (
+                jsonify(
+                    {
+                        "message": "Only SUBMITTED applications can be staff-approved",
+                        "status": application.status,
+                    }
+                ),
+                400,
+            )
+
+        transition_error = apply_status_transition(
+            application, STATUS_STAFF_APPROVED
+        )
+        if transition_error:
+            return transition_error
+
+        user_id = int(get_jwt_identity())
+        application.staff_approved_at = datetime.utcnow()
+        application.staff_approved_by_id = user_id
+        application.assigned_officer_id = user_id
+
+        db.session.commit()
+
+        logger.info(
+            "Application %s approved by staff user_id=%s", application.id, user_id
+        )
+        return jsonify(build_application_response(application))
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.exception(
+            "Error handling %s %s: %s", request.method, request.path, exc
+        )
+        db.session.rollback()
+        return jsonify({"message": "Failed to approve application"}), 500
 
 
 @staff_bp.route("/loans/arrears", methods=["GET"])

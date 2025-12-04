@@ -115,8 +115,10 @@ class LoanApplication(db.Model):
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     submitted_at = db.Column(db.DateTime)
     approved_at = db.Column(db.DateTime)
+    staff_approved_at = db.Column(db.DateTime)
     created_by_id = db.Column(db.Integer, db.ForeignKey("users.id"))
     assigned_officer_id = db.Column(db.Integer, db.ForeignKey("users.id"))
+    staff_approved_by_id = db.Column(db.Integer, db.ForeignKey("users.id"))
 
     full_name = db.Column(db.String(150), nullable=False)
     nic_number = db.Column(db.String(50), nullable=False)
@@ -137,6 +139,7 @@ class LoanApplication(db.Model):
     customer = relationship("Customer", back_populates="loan_applications")
     created_by = relationship("User", foreign_keys=[created_by_id], back_populates="created_applications")
     assigned_officer = relationship("User", foreign_keys=[assigned_officer_id], back_populates="assigned_applications")
+    staff_approved_by = relationship("User", foreign_keys=[staff_approved_by_id])
     documents = relationship(
         "LoanApplicationDocument",
         back_populates="loan_application",
