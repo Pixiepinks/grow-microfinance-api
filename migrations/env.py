@@ -1,12 +1,15 @@
 from __future__ import with_statement
 
 import logging
+import os
 from alembic import context
 from flask import current_app
 from logging.config import fileConfig
 
 config = context.config
-fileConfig(config.config_file_name)
+if config.config_file_name and os.path.exists(config.config_file_name):
+    fileConfig(config.config_file_name)
+config.set_main_option("script_location", os.getenv("ALEMBIC_SCRIPT_LOCATION", "migrations"))
 logger = logging.getLogger('alembic.env')
 
 config.set_main_option('sqlalchemy.url', current_app.config.get('SQLALCHEMY_DATABASE_URI'))
