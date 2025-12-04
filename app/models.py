@@ -115,7 +115,7 @@ class LoanApplication(db.Model):
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     submitted_at = db.Column(db.DateTime)
     approved_at = db.Column(db.DateTime)
-    staff_approved_at = db.Column(db.DateTime)
+    staff_approved_at = db.Column(db.DateTime(timezone=True))
     created_by_id = db.Column(db.Integer, db.ForeignKey("users.id"))
     assigned_officer_id = db.Column(db.Integer, db.ForeignKey("users.id"))
     staff_approved_by_id = db.Column(db.Integer, db.ForeignKey("users.id"))
