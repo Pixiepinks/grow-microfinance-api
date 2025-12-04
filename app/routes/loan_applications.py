@@ -520,45 +520,84 @@ def submit_application(application_id):
 
 
 @loan_app_bp.route("", methods=["GET", "OPTIONS"])
-@cross_origin()
+@cross_origin(
+    origins=os.getenv("CORS_ORIGINS", "*"),
+    methods=["GET", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
+)
 @role_required(["customer", "admin", "staff"])
 def list_applications():
-    claims = get_jwt()
-    role = claims.get("role")
-    query = LoanApplication.query
+    logger = current_app.logger
+    try:
+        claims = get_jwt()
+        role = claims.get("role")
+        query = LoanApplication.query
 
-    if role == "customer":
-        customer = Customer.query.filter_by(user_id=int(get_jwt_identity())).first()
-        if not customer:
-            return jsonify([])
-        query = query.filter_by(customer_id=customer.id)
-    else:
-        customer_id = request.args.get("customer_id")
-        if customer_id:
-            query = query.filter_by(customer_id=customer_id)
+        if role == "customer":
+            customer = Customer.query.filter_by(user_id=int(get_jwt_identity())).first()
+            if not customer:
+                return jsonify([])
+            query = query.filter_by(customer_id=customer.id)
+        else:
+            customer_id = request.args.get("customer_id")
+            if customer_id:
+                query = query.filter_by(customer_id=customer_id)
 
-    status = request.args.get("status")
-    if not status:
-        if role == "staff":
-            status = STATUS_SUBMITTED
-        elif role == "admin":
-            status = STATUS_STAFF_APPROVED
-    if status:
-        query = query.filter_by(status=status)
+        requested_status = request.args.get("status")
+        if requested_status:
+            valid_statuses = {
+                STATUS_DRAFT,
+                STATUS_SUBMITTED,
+                STATUS_STAFF_APPROVED,
+                STATUS_APPROVED,
+                STATUS_REJECTED,
+            }
+            if requested_status not in valid_statuses:
+                return jsonify({"message": "Invalid status value"}), 400
+            status = requested_status
+        else:
+            if role == "staff":
+                status = STATUS_SUBMITTED
+            elif role == "admin":
+                status = STATUS_STAFF_APPROVED
+            else:
+                status = None
 
-    loan_type = request.args.get("loan_type")
-    if loan_type:
-        query = query.filter_by(loan_type=loan_type)
+        if status:
+            query = query.filter_by(status=status)
 
-    start_date = request.args.get("start_date")
-    end_date = request.args.get("end_date")
-    if start_date:
-        query = query.filter(LoanApplication.created_at >= datetime.fromisoformat(start_date))
-    if end_date:
-        query = query.filter(LoanApplication.created_at <= datetime.fromisoformat(end_date))
+        loan_type = request.args.get("loan_type")
+        if loan_type:
+            query = query.filter_by(loan_type=loan_type)
 
-    applications = query.order_by(LoanApplication.created_at.desc()).all()
-    return jsonify([build_application_response(app) for app in applications])
+        start_date = request.args.get("start_date")
+        end_date = request.args.get("end_date")
+        if start_date:
+            query = query.filter(
+                LoanApplication.created_at >= datetime.fromisoformat(start_date)
+            )
+        if end_date:
+            query = query.filter(
+                LoanApplication.created_at <= datetime.fromisoformat(end_date)
+            )
+
+        applications = query.order_by(LoanApplication.created_at.desc()).all()
+        response = jsonify([build_application_response(app) for app in applications])
+        logger.info("Handled %s %s with status %s", request.method, request.path, 200)
+        return response
+    except ValueError as exc:
+        logger.exception(
+            "Invalid request parameter while handling %s %s: %s",
+            request.method,
+            request.path,
+            exc,
+        )
+        return jsonify({"message": "Invalid request parameters"}), 400
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.exception(
+            "Error handling %s %s: %s", request.method, request.path, exc
+        )
+        return jsonify({"message": "Failed to load loan applications"}), 500
 
 
 @loan_app_bp.route("/awaiting-review", methods=["GET", "OPTIONS"])
