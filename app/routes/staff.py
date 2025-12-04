@@ -1,10 +1,11 @@
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, current_app
 from flask_jwt_extended import get_jwt_identity
 
 from ..extensions import db
-from ..models import Loan, Payment, Customer
+from ..models import Loan, LoanApplication, Payment, Customer
+from .loan_applications import STATUS_SUBMITTED
 from .utils import role_required
 
 staff_bp = Blueprint("staff", __name__, url_prefix="/staff")
@@ -92,6 +93,75 @@ def today_collections():
         for p in payments
     ]
     return jsonify(results)
+
+
+@staff_bp.route("/active-loans", methods=["GET", "OPTIONS"])
+@role_required(["admin", "staff"])
+def active_loans():
+    logger = current_app.logger
+    try:
+        loans = Loan.query.filter_by(status="Active").all()
+        results = []
+
+        for loan in loans:
+            payments_made = len(loan.payments)
+            next_due_date = loan.start_date + timedelta(days=payments_made)
+            if next_due_date > loan.end_date:
+                next_due_date = loan.end_date
+
+            results.append(
+                {
+                    "loan_id": loan.id,
+                    "customer_name": loan.customer.full_name if loan.customer else None,
+                    "loan_type": getattr(loan, "loan_type", None) or "Standard",
+                    "approved_amount": float(loan.principal_amount),
+                    "outstanding_balance": float(loan.outstanding),
+                    "next_due_date": next_due_date.isoformat(),
+                }
+            )
+
+        response = jsonify(results)
+        logger.info("Handled %s %s with status %s", request.method, request.path, 200)
+        return response
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.exception("Error handling %s %s: %s", request.method, request.path, exc)
+        return jsonify({"message": "Failed to load active loans"}), 500
+
+
+@staff_bp.route("/loan-applications", methods=["GET", "OPTIONS"])
+@role_required(["admin", "staff"])
+def staff_loan_applications():
+    logger = current_app.logger
+    try:
+        status = request.args.get("status") or STATUS_SUBMITTED
+        applications = (
+            LoanApplication.query.filter_by(status=status)
+            .order_by(LoanApplication.created_at.desc())
+            .all()
+        )
+
+        results = [
+            {
+                "id": app.id,
+                "application_number": app.application_number,
+                "customer_name": app.full_name,
+                "loan_type": app.loan_type,
+                "applied_amount": float(app.applied_amount),
+                "tenure_months": app.tenure_months,
+                "status": app.status,
+                "created_at": app.created_at.isoformat() if app.created_at else None,
+            }
+            for app in applications
+        ]
+
+        response = jsonify(results)
+        logger.info("Handled %s %s with status %s", request.method, request.path, 200)
+        return response
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.exception(
+            "Error handling %s %s: %s", request.method, request.path, exc
+        )
+        return jsonify({"message": "Failed to load loan applications"}), 500
 
 
 @staff_bp.route("/loans/arrears", methods=["GET"])

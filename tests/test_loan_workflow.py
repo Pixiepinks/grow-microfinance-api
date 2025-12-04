@@ -249,3 +249,76 @@ def test_staff_can_record_payment_for_active_loan(app, client):
     assert response.status_code == 200
     assert response.get_json()["message"] == "Payment recorded"
     assert Loan.query.get(loan.id).payments[0].amount_collected == Decimal("500")
+
+
+def test_staff_active_loans_endpoint(app, client):
+    staff_user = _create_user("staff", "Active Staff", "active-staff@example.com")
+    customer_user = _create_user("customer", "Active Customer", "active-cust@example.com")
+    customer = _customer_profile(customer_user, code="CUST-020")
+
+    loan = Loan(
+        loan_number="LN-ACTIVE-1",
+        customer_id=customer.id,
+        principal_amount=Decimal("7500"),
+        interest_rate=Decimal("10"),
+        total_days=60,
+        daily_installment=Decimal("150"),
+        total_payable=Decimal("9000"),
+        start_date=date.today(),
+        end_date=date.today(),
+        status="Active",
+        created_by_id=staff_user.id,
+    )
+    db.session.add(loan)
+    db.session.commit()
+
+    response = client.get("/staff/active-loans", headers=_auth_headers(app, staff_user))
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert len(body) == 1
+    assert body[0]["loan_id"] == loan.id
+    assert body[0]["customer_name"] == customer.full_name
+
+
+def test_staff_loan_applications_endpoint(app, client):
+    staff_user = _create_user("staff", "Staff Reviewer", "staff-review@example.com")
+    customer_user = _create_user("customer", "Applicant", "applicant@example.com")
+    customer = _customer_profile(customer_user, code="CUST-021")
+
+    submitted = LoanApplication(
+        application_number="APP-SUB-1",
+        customer_id=customer.id,
+        loan_type="GROW_BUSINESS",
+        status=STATUS_SUBMITTED,
+        applied_amount=Decimal("12000"),
+        tenure_months=12,
+        full_name="Applicant",
+        nic_number="123456789V",
+        mobile_number="0700000000",
+    )
+    db.session.add(submitted)
+    db.session.commit()
+
+    response = client.get(
+        "/staff/loan-applications?status=SUBMITTED",
+        headers=_auth_headers(app, staff_user),
+    )
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert len(body) == 1
+    assert body[0]["id"] == submitted.id
+    assert body[0]["status"] == STATUS_SUBMITTED
+
+
+def test_non_staff_cannot_access_staff_endpoints(app, client):
+    customer_user = _create_user("customer", "Blocked", "blocked@example.com")
+
+    response = client.get(
+        "/staff/active-loans",
+        headers=_auth_headers(app, customer_user),
+    )
+
+    assert response.status_code == 403
+    assert response.headers.get("Access-Control-Allow-Origin") is not None
