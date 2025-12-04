@@ -557,6 +557,25 @@ def list_applications():
     return jsonify([build_application_response(app) for app in applications])
 
 
+@loan_app_bp.route("/awaiting-review", methods=["GET"])
+@role_required(["admin", "staff"])
+def list_awaiting_review_applications():
+    """List applications pending staff review (SUBMITTED status).
+
+    This dedicated endpoint mirrors the behaviour of the general listing
+    route but fixes the status filter to ``SUBMITTED`` so staff dashboards
+    can reliably fetch awaiting-review items without needing a query
+    parameter.
+    """
+
+    applications = (
+        LoanApplication.query.filter_by(status=STATUS_SUBMITTED)
+        .order_by(LoanApplication.created_at.desc())
+        .all()
+    )
+    return jsonify([build_application_response(app) for app in applications])
+
+
 @loan_app_bp.route("/<int:application_id>", methods=["GET"])
 @role_required(["customer", "admin", "staff"])
 def get_application(application_id):
