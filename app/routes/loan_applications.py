@@ -651,12 +651,13 @@ def approve_application(application_id):
     claims = get_jwt()
     role = claims.get("role")
     target_status = STATUS_APPROVED if role == "admin" else STATUS_STAFF_APPROVED
-    approved_amount = parse_decimal(data.get("approved_amount"))
+    approved_amount = data.get("approved_amount")
     approved_tenure = data.get("approved_tenure")
 
-    if role == "admin":
-        if approved_amount is None or approved_tenure is None:
-            return jsonify({"message": "approved_amount and approved_tenure are required"}), 400
+    if approved_amount is None or approved_tenure is None:
+        return jsonify({"message": "approved_amount and approved_tenure are required"}), 400
+
+    approved_amount = parse_decimal(approved_amount)
 
     transition_error = apply_status_transition(application, target_status)
     if transition_error:
