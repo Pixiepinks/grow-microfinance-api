@@ -5,6 +5,7 @@ from decimal import Decimal
 from typing import Dict, List, Optional
 
 from flask import Blueprint, current_app, jsonify, request
+from flask_cors import cross_origin
 from flask_jwt_extended import get_jwt_identity, get_jwt
 from werkzeug.utils import secure_filename
 from sqlalchemy import func
@@ -516,7 +517,8 @@ def submit_application(application_id):
     return jsonify(build_application_response(application))
 
 
-@loan_app_bp.route("", methods=["GET"])
+@loan_app_bp.route("", methods=["GET", "OPTIONS"])
+@cross_origin()
 @role_required(["customer", "admin", "staff"])
 def list_applications():
     claims = get_jwt()
@@ -557,7 +559,8 @@ def list_applications():
     return jsonify([build_application_response(app) for app in applications])
 
 
-@loan_app_bp.route("/awaiting-review", methods=["GET"])
+@loan_app_bp.route("/awaiting-review", methods=["GET", "OPTIONS"])
+@cross_origin()
 @role_required(["admin", "staff"])
 def list_awaiting_review_applications():
     """List applications pending staff review (SUBMITTED status).
@@ -568,12 +571,23 @@ def list_awaiting_review_applications():
     parameter.
     """
 
-    applications = (
-        LoanApplication.query.filter_by(status=STATUS_SUBMITTED)
-        .order_by(LoanApplication.created_at.desc())
-        .all()
-    )
-    return jsonify([build_application_response(app) for app in applications])
+    logger = current_app.logger
+    try:
+        applications = (
+            LoanApplication.query.filter_by(status=STATUS_SUBMITTED)
+            .order_by(LoanApplication.created_at.desc())
+            .all()
+        )
+        response = jsonify([build_application_response(app) for app in applications])
+        logger.info(
+            "Handled %s %s with status %s", request.method, request.path, 200
+        )
+        return response
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.exception(
+            "Error handling %s %s: %s", request.method, request.path, exc
+        )
+        return jsonify({"message": "Failed to load applications"}), 500
 
 
 @loan_app_bp.route("/<int:application_id>", methods=["GET"])
