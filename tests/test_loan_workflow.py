@@ -312,6 +312,92 @@ def test_staff_loan_applications_endpoint(app, client):
     assert body[0]["status"] == STATUS_SUBMITTED
 
 
+def test_staff_can_approve_submitted_application_via_staff_endpoint(app, client):
+    staff_user = _create_user("staff", "Staff Approver", "staff-approve@example.com")
+    customer_user = _create_user("customer", "Applicant", "staff-approve-applicant@example.com")
+    customer = _customer_profile(customer_user, code="CUST-030")
+
+    application = LoanApplication(
+        application_number="APP-STAFF-1",
+        customer_id=customer.id,
+        loan_type="GROW_BUSINESS",
+        status=STATUS_SUBMITTED,
+        applied_amount=Decimal("10000"),
+        tenure_months=6,
+        full_name="Applicant",
+        nic_number="123456789V",
+        mobile_number="0700000000",
+    )
+    db.session.add(application)
+    db.session.commit()
+
+    response = client.post(
+        f"/staff/loan-applications/{application.id}/approve",
+        headers=_auth_headers(app, staff_user),
+    )
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["status"] == STATUS_STAFF_APPROVED
+    assert body["staff_approved_by_id"] == staff_user.id
+    assert body["staff_approved_at"] is not None
+
+
+def test_staff_approval_requires_submitted_status(app, client):
+    staff_user = _create_user("staff", "Staff Approver", "staff-approve2@example.com")
+    customer_user = _create_user("customer", "Applicant", "staff-approve2-applicant@example.com")
+    customer = _customer_profile(customer_user, code="CUST-031")
+
+    application = LoanApplication(
+        application_number="APP-STAFF-2",
+        customer_id=customer.id,
+        loan_type="GROW_BUSINESS",
+        status="DRAFT",
+        applied_amount=Decimal("8000"),
+        tenure_months=4,
+        full_name="Applicant",
+        nic_number="123456789V",
+        mobile_number="0700000000",
+    )
+    db.session.add(application)
+    db.session.commit()
+
+    response = client.post(
+        f"/staff/loan-applications/{application.id}/approve",
+        headers=_auth_headers(app, staff_user),
+    )
+
+    assert response.status_code == 400
+    body = response.get_json()
+    assert body["status"] == "DRAFT"
+
+
+def test_non_staff_cannot_call_staff_approval_endpoint(app, client):
+    customer_user = _create_user("customer", "Customer", "customer-approval@example.com")
+    customer = _customer_profile(customer_user, code="CUST-032")
+
+    application = LoanApplication(
+        application_number="APP-STAFF-3",
+        customer_id=customer.id,
+        loan_type="GROW_BUSINESS",
+        status=STATUS_SUBMITTED,
+        applied_amount=Decimal("5000"),
+        tenure_months=3,
+        full_name="Customer",
+        nic_number="123456789V",
+        mobile_number="0700000000",
+    )
+    db.session.add(application)
+    db.session.commit()
+
+    response = client.post(
+        f"/staff/loan-applications/{application.id}/approve",
+        headers=_auth_headers(app, customer_user),
+    )
+
+    assert response.status_code == 403
+
+
 def test_non_staff_cannot_access_staff_endpoints(app, client):
     customer_user = _create_user("customer", "Blocked", "blocked@example.com")
 
