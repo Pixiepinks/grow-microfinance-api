@@ -32,15 +32,39 @@ def list_customers():
 def record_payment():
     data = request.get_json() or {}
     loan_id = data.get("loan_id")
-    amount = Decimal(str(data.get("amount_collected", "0")))
-    collection_date = data.get("collection_date")
     payment_method = data.get("payment_method", "Cash")
     remarks = data.get("remarks")
+
+    if not loan_id:
+        return jsonify({"message": "loan_id is required"}), 400
+
+    try:
+        amount = Decimal(str(data.get("amount_collected", "0")))
+    except Exception:
+        return jsonify({"message": "amount_collected must be a valid number"}), 400
+
+    if amount <= 0:
+        return jsonify({"message": "amount_collected must be greater than zero"}), 400
+
+    loan = Loan.query.get(loan_id)
+    if not loan:
+        return jsonify({"message": "Loan not found"}), 404
+
+    if str(loan.status).lower() != "active":
+        return jsonify({"message": "Payments can only be recorded for active loans"}), 400
+
+    collection_date = data.get("collection_date")
+    try:
+        collection_date_value = (
+            date.fromisoformat(collection_date) if collection_date else date.today()
+        )
+    except Exception:
+        return jsonify({"message": "collection_date must be ISO formatted (YYYY-MM-DD)"}), 400
 
     payment = Payment(
         loan_id=loan_id,
         amount_collected=amount,
-        collection_date=date.fromisoformat(collection_date) if collection_date else date.today(),
+        collection_date=collection_date_value,
         collected_by_id=int(get_jwt_identity()),
         payment_method=payment_method,
         remarks=remarks,
