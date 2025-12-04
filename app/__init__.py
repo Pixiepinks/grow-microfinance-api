@@ -43,19 +43,22 @@ def create_app():
 
     # Ensure database schema is present even when the deployment start command
     # skips the entrypoint migration step (e.g., running `gunicorn wsgi:app`).
-    # If migrations have already run, `upgrade()` is a no-op.
-    with app.app_context():
-        try:
-            upgrade()
-        except Exception as exc:  # pragma: no cover - defensive logging
-            app.logger.warning("Skipping automatic migrations: %s", exc)
-            # As a last resort, create tables directly. This protects
-            # environments where Alembic can't run (e.g., missing migrations
-            # config) so the app still has the required schema.
+    # If migrations have already run, `upgrade()` is a no-op. Allow skipping
+    # this auto-run via environment variable so CLI migration commands do not
+    # execute twice.
+    if os.getenv("SKIP_AUTO_MIGRATIONS") != "1":
+        with app.app_context():
             try:
-                db.create_all()
-                app.logger.info("Database tables created with create_all fallback")
-            except Exception as db_exc:  # pragma: no cover - defensive logging
-                app.logger.error("Failed to create database tables: %s", db_exc)
+                upgrade()
+            except Exception as exc:  # pragma: no cover - defensive logging
+                app.logger.warning("Skipping automatic migrations: %s", exc)
+                # As a last resort, create tables directly. This protects
+                # environments where Alembic can't run (e.g., missing migrations
+                # config) so the app still has the required schema.
+                try:
+                    db.create_all()
+                    app.logger.info("Database tables created with create_all fallback")
+                except Exception as db_exc:  # pragma: no cover - defensive logging
+                    app.logger.error("Failed to create database tables: %s", db_exc)
 
     return app
