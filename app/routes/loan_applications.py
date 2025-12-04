@@ -26,10 +26,18 @@ ALLOWED_LOAN_TYPES = {
 
 STATUS_DRAFT = "DRAFT"
 STATUS_SUBMITTED = "SUBMITTED"
-STATUS_UNDER_REVIEW = "UNDER_REVIEW"
+STATUS_STAFF_APPROVED = "STAFF_APPROVED"
 STATUS_APPROVED = "APPROVED"
 STATUS_REJECTED = "REJECTED"
-STATUS_DISBURSED = "DISBURSED"
+
+STATUS_TRANSITIONS = {
+    "staff": {
+        STATUS_SUBMITTED: {STATUS_STAFF_APPROVED, STATUS_REJECTED},
+    },
+    "admin": {
+        STATUS_STAFF_APPROVED: {STATUS_APPROVED, STATUS_REJECTED},
+    },
+}
 
 COMMON_REQUIRED_FIELDS = [
     "full_name",
@@ -275,10 +283,13 @@ def validate_required_documents(application: LoanApplication) -> List[str]:
 
 
 def build_application_response(application: LoanApplication) -> dict:
+    customer = application.customer
     return {
         "id": application.id,
         "application_number": application.application_number,
         "customer_id": application.customer_id,
+        "customer_name": customer.full_name if customer else application.full_name,
+        "customer_code": customer.customer_code if customer else None,
         "loan_type": application.loan_type,
         "status": application.status,
         "applied_amount": float(application.applied_amount) if application.applied_amount is not None else None,
@@ -329,9 +340,30 @@ def assert_application_access(application: LoanApplication) -> Optional[tuple]:
     return None
 
 
+def apply_status_transition(application: LoanApplication, target_status: str) -> Optional[tuple]:
+    claims = get_jwt()
+    role = claims.get("role")
+    allowed = STATUS_TRANSITIONS.get(role, {}).get(application.status, set())
+
+    if target_status not in allowed:
+        return (
+            jsonify({
+                "message": "Invalid status transition",
+                "from": application.status,
+                "to": target_status,
+                "role": role,
+            }),
+            400,
+        )
+
+    application.status = target_status
+    return None
+
+
 @loan_app_bp.route("", methods=["POST"])
 @role_required(["customer", "admin", "staff"])
 def create_application():
+    claims = get_jwt()
     data = normalize_application_payload(request.get_json() or {})
     customer_id = load_customer_id_from_request()
     if not customer_id:
@@ -352,11 +384,12 @@ def create_application():
         )
         return jsonify({"errors": validation_errors}), 400
 
+    initial_status = STATUS_SUBMITTED if claims.get("role") == "customer" else STATUS_DRAFT
     application = LoanApplication(
         application_number=generate_application_number(),
         customer_id=customer_id,
         loan_type=loan_type,
-        status=STATUS_DRAFT,
+        status=initial_status,
         applied_amount=parse_decimal(data.get("applied_amount")) or Decimal("0"),
         tenure_months=parse_int(data.get("tenure_months"), 0) or 0,
         interest_rate=parse_decimal(data.get("interest_rate")),
@@ -376,6 +409,7 @@ def create_application():
         existing_loan_details=data.get("existing_loan_details"),
         extra_data=type_data,
         created_by_id=int(get_jwt_identity()),
+        submitted_at=datetime.utcnow() if initial_status == STATUS_SUBMITTED else None,
     )
 
     db.session.add(application)
@@ -457,7 +491,7 @@ def submit_application(application_id):
     if access_error:
         return access_error
 
-    if application.status not in {STATUS_DRAFT, STATUS_SUBMITTED, STATUS_UNDER_REVIEW}:
+    if application.status not in {STATUS_DRAFT, STATUS_SUBMITTED}:
         return jsonify({"message": "Application cannot be submitted in its current status"}), 400
 
     data = normalize_application_payload(request.get_json() or {})
@@ -500,6 +534,11 @@ def list_applications():
             query = query.filter_by(customer_id=customer_id)
 
     status = request.args.get("status")
+    if not status:
+        if role == "staff":
+            status = STATUS_SUBMITTED
+        elif role == "admin":
+            status = STATUS_STAFF_APPROVED
     if status:
         query = query.filter_by(status=status)
 
@@ -535,19 +574,29 @@ def approve_application(application_id):
     application = LoanApplication.query.get_or_404(application_id)
     data = request.get_json() or {}
 
-    if application.status not in {STATUS_SUBMITTED, STATUS_UNDER_REVIEW}:
-        return jsonify({"message": "Only submitted applications can be approved"}), 400
-
+    claims = get_jwt()
+    role = claims.get("role")
+    target_status = STATUS_APPROVED if role == "admin" else STATUS_STAFF_APPROVED
     approved_amount = parse_decimal(data.get("approved_amount"))
     approved_tenure = data.get("approved_tenure")
-    if approved_amount is None or approved_tenure is None:
-        return jsonify({"message": "approved_amount and approved_tenure are required"}), 400
 
-    application.approved_amount = approved_amount
-    application.approved_tenure = int(approved_tenure)
+    if role == "admin":
+        if approved_amount is None or approved_tenure is None:
+            return jsonify({"message": "approved_amount and approved_tenure are required"}), 400
+
+    transition_error = apply_status_transition(application, target_status)
+    if transition_error:
+        return transition_error
+    if approved_amount is not None:
+        application.approved_amount = approved_amount
+    if approved_tenure is not None:
+        application.approved_tenure = int(approved_tenure)
     application.review_notes = data.get("review_notes")
-    application.status = STATUS_APPROVED
-    application.approved_at = datetime.utcnow()
+
+    if target_status == STATUS_APPROVED:
+        application.approved_at = datetime.utcnow()
+    elif target_status == STATUS_STAFF_APPROVED:
+        application.assigned_officer_id = int(get_jwt_identity())
 
     db.session.commit()
     return jsonify(build_application_response(application))
@@ -559,15 +608,15 @@ def reject_application(application_id):
     application = LoanApplication.query.get_or_404(application_id)
     data = request.get_json() or {}
 
-    if application.status not in {STATUS_SUBMITTED, STATUS_UNDER_REVIEW}:
-        return jsonify({"message": "Only submitted applications can be rejected"}), 400
-
     reason = data.get("reject_reason")
     if not reason:
         return jsonify({"message": "reject_reason is required"}), 400
 
+    transition_error = apply_status_transition(application, STATUS_REJECTED)
+    if transition_error:
+        return transition_error
+
     application.reject_reason = reason
-    application.status = STATUS_REJECTED
 
     db.session.commit()
     return jsonify(build_application_response(application))
