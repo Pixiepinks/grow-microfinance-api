@@ -110,6 +110,50 @@ def test_staff_listing_and_approval_flow(app, client):
     assert approve_response.get_json()["status"] == STATUS_STAFF_APPROVED
 
 
+def test_staff_awaiting_review_endpoint(app, client):
+    staff_user = _create_user("staff", "Staff Awaiting", "staff-await@example.com")
+    customer_user = _create_user("customer", "Customer Awaiting", "cust-await@example.com")
+    customer = _customer_profile(customer_user, code="CUST-010")
+
+    submitted_app = LoanApplication(
+        application_number="APP-AWAIT",
+        customer_id=customer.id,
+        loan_type="GROW_BUSINESS",
+        status=STATUS_SUBMITTED,
+        applied_amount=Decimal("5000"),
+        tenure_months=3,
+        full_name="Customer Awaiting",
+        nic_number="123456789V",
+        mobile_number="0700000000",
+        monthly_income=Decimal("30000"),
+        monthly_expenses=Decimal("5000"),
+    )
+    db.session.add(submitted_app)
+    db.session.commit()
+
+    response = client.get(
+        "/loan-applications/awaiting-review",
+        headers=_auth_headers(app, staff_user),
+    )
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert len(body) == 1
+    assert body[0]["status"] == STATUS_SUBMITTED
+    assert body[0]["customer_name"] == "Customer Awaiting"
+
+
+def test_non_staff_cannot_list_awaiting_review(app, client):
+    customer_user = _create_user("customer", "Customer Blocked", "cust-block@example.com")
+
+    response = client.get(
+        "/loan-applications/awaiting-review",
+        headers=_auth_headers(app, customer_user),
+    )
+
+    assert response.status_code == 403
+
+
 def test_admin_listing_and_decision_flow(app, client):
     admin_user = _create_user("admin", "Admin One", "admin1@example.com")
     customer_user = _create_user("customer", "Customer Three", "customer3@example.com")
