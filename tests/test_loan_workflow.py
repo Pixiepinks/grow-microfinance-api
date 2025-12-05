@@ -104,7 +104,11 @@ def test_staff_listing_and_approval_flow(app, client):
     approve_response = client.post(
         f"/loan-applications/{application.id}/approve",
         headers=_auth_headers(app, staff_user),
-        json={"review_notes": "Looks good"},
+        json={
+            "review_notes": "Looks good",
+            "approved_amount": "10000",
+            "approved_tenure": 6,
+        },
     )
     assert approve_response.status_code == 200
     assert approve_response.get_json()["status"] == STATUS_STAFF_APPROVED
@@ -310,6 +314,110 @@ def test_staff_loan_applications_endpoint(app, client):
     assert len(body) == 1
     assert body[0]["id"] == submitted.id
     assert body[0]["status"] == STATUS_SUBMITTED
+
+
+def test_admin_api_lists_all_statuses(app, client):
+    admin_user = _create_user("admin", "Admin Loans", "admin-loans@example.com")
+    customer_user = _create_user("customer", "Applicant", "admin-list@example.com")
+    customer = _customer_profile(customer_user, code="CUST-099")
+
+    submitted = LoanApplication(
+        application_number="APP-ADMIN-1",
+        customer_id=customer.id,
+        loan_type="GROW_BUSINESS",
+        status=STATUS_SUBMITTED,
+        applied_amount=Decimal("5000"),
+        tenure_months=6,
+        full_name="Applicant",
+        nic_number="123456789V",
+        mobile_number="0700000000",
+    )
+    staff_review = LoanApplication(
+        application_number="APP-ADMIN-2",
+        customer_id=customer.id,
+        loan_type="GROW_BUSINESS",
+        status=STATUS_STAFF_APPROVED,
+        applied_amount=Decimal("6000"),
+        tenure_months=9,
+        full_name="Applicant",
+        nic_number="123456789V",
+        mobile_number="0700000000",
+    )
+    approved = LoanApplication(
+        application_number="APP-ADMIN-3",
+        customer_id=customer.id,
+        loan_type="GROW_BUSINESS",
+        status=STATUS_APPROVED,
+        applied_amount=Decimal("7000"),
+        tenure_months=12,
+        full_name="Applicant",
+        nic_number="123456789V",
+        mobile_number="0700000000",
+    )
+
+    db.session.add_all([submitted, staff_review, approved])
+    db.session.commit()
+
+    response = client.get(
+        "/api/loan-applications", headers=_auth_headers(app, admin_user)
+    )
+
+    assert response.status_code == 200
+    body = response.get_json()
+    statuses = {item["status"] for item in body}
+    assert statuses == {STATUS_SUBMITTED, STATUS_STAFF_APPROVED, STATUS_APPROVED}
+    assert {item["application_number"] for item in body} == {
+        "APP-ADMIN-1",
+        "APP-ADMIN-2",
+        "APP-ADMIN-3",
+    }
+
+
+def test_admin_api_can_filter_status(app, client):
+    admin_user = _create_user("admin", "Admin Filter", "admin-filter@example.com")
+    customer_user = _create_user(
+        "customer", "Applicant", "admin-filter-customer@example.com"
+    )
+    customer = _customer_profile(customer_user, code="CUST-098")
+
+    db.session.add_all(
+        [
+            LoanApplication(
+                application_number="APP-FILTER-1",
+                customer_id=customer.id,
+                loan_type="GROW_BUSINESS",
+                status=STATUS_SUBMITTED,
+                applied_amount=Decimal("5500"),
+                tenure_months=6,
+                full_name="Applicant",
+                nic_number="123456789V",
+                mobile_number="0700000000",
+            ),
+            LoanApplication(
+                application_number="APP-FILTER-2",
+                customer_id=customer.id,
+                loan_type="GROW_BUSINESS",
+                status=STATUS_STAFF_APPROVED,
+                applied_amount=Decimal("6500"),
+                tenure_months=9,
+                full_name="Applicant",
+                nic_number="123456789V",
+                mobile_number="0700000000",
+            ),
+        ]
+    )
+    db.session.commit()
+
+    response = client.get(
+        "/api/loan-applications?status=UNDER_REVIEW",
+        headers=_auth_headers(app, admin_user),
+    )
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert len(body) == 1
+    assert body[0]["status"] == STATUS_STAFF_APPROVED
+    assert body[0]["application_number"] == "APP-FILTER-2"
 
 
 def test_staff_can_approve_submitted_application_via_staff_endpoint(app, client):
