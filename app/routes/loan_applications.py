@@ -16,6 +16,7 @@ from .utils import role_required
 
 
 loan_app_bp = Blueprint("loan_applications", __name__, url_prefix="/loan-applications")
+admin_api_bp = Blueprint("admin_api", __name__, url_prefix="/api")
 
 
 ALLOWED_LOAN_TYPES = {
@@ -593,6 +594,52 @@ def list_applications():
             exc,
         )
         return jsonify({"message": "Invalid request parameters"}), 400
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.exception(
+            "Error handling %s %s: %s", request.method, request.path, exc
+        )
+        return jsonify({"message": "Failed to load loan applications"}), 500
+
+
+@admin_api_bp.route("/loan-applications", methods=["GET", "OPTIONS"])
+@cross_origin(
+    origins=os.getenv("CORS_ORIGINS", "*"),
+    methods=["GET", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
+)
+@role_required(["admin"])
+def admin_list_all_applications():
+    """Return all loan applications for admin dashboards.
+
+    The Admin Loan Applications list in the web app relies on this endpoint to
+    show every application regardless of its current status. Optional status
+    filtering is provided for table filters while keeping "ALL" as the default.
+    """
+
+    logger = current_app.logger
+    try:
+        status_param = (request.args.get("status") or "ALL").upper()
+        status_aliases = {"UNDER_REVIEW": STATUS_STAFF_APPROVED}
+
+        normalized_status = status_aliases.get(status_param, status_param)
+        valid_statuses = {
+            STATUS_DRAFT,
+            STATUS_SUBMITTED,
+            STATUS_STAFF_APPROVED,
+            STATUS_APPROVED,
+            STATUS_REJECTED,
+        }
+
+        query = LoanApplication.query
+        if normalized_status != "ALL":
+            if normalized_status not in valid_statuses:
+                return jsonify({"message": "Invalid status value"}), 400
+            query = query.filter_by(status=normalized_status)
+
+        applications = query.order_by(LoanApplication.created_at.desc()).all()
+        response = jsonify([build_application_response(app) for app in applications])
+        logger.info("Handled %s %s with status %s", request.method, request.path, 200)
+        return response
     except Exception as exc:  # pragma: no cover - defensive logging
         logger.exception(
             "Error handling %s %s: %s", request.method, request.path, exc

@@ -9,7 +9,7 @@ from .routes.auth import auth_bp
 from .routes.admin import admin_bp
 from .routes.staff import staff_bp
 from .routes.customer import customer_bp
-from .routes.loan_applications import loan_app_bp
+from .routes.loan_applications import admin_api_bp, loan_app_bp
 
 def create_app():
     app = Flask(__name__)
@@ -33,6 +33,7 @@ def create_app():
 
     app.register_blueprint(auth_bp)
     app.register_blueprint(admin_bp)
+    app.register_blueprint(admin_api_bp)
     app.register_blueprint(staff_bp)
     app.register_blueprint(customer_bp)
     app.register_blueprint(loan_app_bp)
