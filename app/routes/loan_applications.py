@@ -647,6 +647,50 @@ def admin_list_all_applications():
         return jsonify({"message": "Failed to load loan applications"}), 500
 
 
+@admin_api_bp.route("/admin/customers", methods=["GET", "OPTIONS"])
+@cross_origin(
+    origins=os.getenv("CORS_ORIGINS", "*"),
+    methods=["GET", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
+)
+@role_required(["admin"])
+def admin_list_customers():
+    """Return all customers for the admin dashboard."""
+
+    logger = current_app.logger
+    try:
+        customers = Customer.query.order_by(Customer.id.asc()).all()
+        response = jsonify(
+            {
+                "success": True,
+                "customers": [
+                    {
+                        "id": customer.id,
+                        "user_id": customer.user_id,
+                        "customer_code": customer.customer_code,
+                        "full_name": customer.full_name,
+                        "nic_number": customer.nic_number,
+                        "mobile": customer.mobile,
+                        "address": customer.address,
+                        "business_type": customer.business_type,
+                        "status": customer.status,
+                        "created_at": customer.created_at.isoformat()
+                        if customer.created_at
+                        else None,
+                    }
+                    for customer in customers
+                ],
+            }
+        )
+        logger.info("Handled %s %s with status %s", request.method, request.path, 200)
+        return response
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.exception(
+            "Error handling %s %s: %s", request.method, request.path, exc
+        )
+        return jsonify({"message": "Failed to load customers"}), 500
+
+
 @loan_app_bp.route("/awaiting-review", methods=["GET", "OPTIONS"])
 @cross_origin()
 @role_required(["admin", "staff"])
