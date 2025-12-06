@@ -4,7 +4,14 @@ from flask import Blueprint, request, jsonify
 from flask_jwt_extended import get_jwt_identity
 
 from ..extensions import db
-from ..models import User, Customer, Loan, Payment
+from ..models import (
+    Customer,
+    Loan,
+    LoanApplication,
+    LoanApplicationDocument,
+    Payment,
+    User,
+)
 from .utils import role_required
 
 admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
@@ -214,3 +221,38 @@ def dashboard():
             "todays_collection": float(todays_collection),
         }
     )
+
+
+@admin_bp.route("/documents/repository", methods=["GET"])
+@role_required(["admin"])
+def list_loan_application_documents():
+    documents = (
+        LoanApplicationDocument.query.join(LoanApplication)
+        .join(Customer)
+        .order_by(LoanApplicationDocument.uploaded_at.desc())
+        .all()
+    )
+
+    items = []
+    for document in documents:
+        loan_application = document.loan_application
+        customer = loan_application.customer if loan_application else None
+
+        items.append(
+            {
+                "id": document.id,
+                "loan_application_id": document.loan_application_id,
+                "document_type": document.document_type,
+                "file_path": document.file_path,
+                "uploaded_at": document.uploaded_at.isoformat()
+                if document.uploaded_at
+                else None,
+                "application_number": getattr(loan_application, "application_number", None),
+                "application_status": getattr(loan_application, "status", None),
+                "loan_type": getattr(loan_application, "loan_type", None),
+                "customer_code": getattr(customer, "customer_code", None),
+                "customer_name": getattr(customer, "full_name", None),
+            }
+        )
+
+    return jsonify({"items": items})
