@@ -7,9 +7,13 @@ from typing import Dict, List, Optional
 from flask import Blueprint, current_app, jsonify, request
 from flask_cors import cross_origin
 from flask_jwt_extended import get_jwt_identity, get_jwt
-from werkzeug.utils import secure_filename
 from sqlalchemy import func
 
+from app.supabase_client import (
+    get_storage_bucket,
+    get_supabase_client,
+    get_upload_prefix,
+)
 from ..extensions import db
 from ..models import Customer, LoanApplication, LoanApplicationDocument
 from .utils import role_required
@@ -788,6 +792,29 @@ def reject_application(application_id):
     return jsonify(build_application_response(application))
 
 
+def upload_document_to_supabase(loan_application_id: int, document_type: str, file_storage) -> str:
+    supabase = get_supabase_client()
+    bucket = get_storage_bucket()
+    prefix = get_upload_prefix()
+
+    original_name = file_storage.filename or "file"
+    ext = os.path.splitext(original_name)[1]
+    timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    safe_type = (document_type or "DOC").upper()
+
+    object_path = f"{prefix}/{loan_application_id}/{safe_type}_{timestamp}{ext}"
+
+    file_bytes = file_storage.read()
+
+    supabase.storage.from_(bucket).upload(
+        path=object_path,
+        file=file_bytes,
+        file_options={"content-type": file_storage.mimetype or "application/octet-stream"},
+    )
+
+    return object_path
+
+
 @loan_app_bp.route("/<int:application_id>/documents", methods=["POST"])
 @role_required(["customer", "admin", "staff"])
 def upload_document(application_id):
@@ -801,20 +828,12 @@ def upload_document(application_id):
     if not document_type or not file:
         return jsonify({"message": "document_type and file are required"}), 400
 
-    upload_root = current_app.config.get("UPLOAD_FOLDER", "uploads")
-    target_folder = os.path.join(upload_root, "loan_documents", str(application_id))
-    os.makedirs(target_folder, exist_ok=True)
-
-    filename = secure_filename(file.filename)
-    timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-    stored_name = f"{document_type}_{timestamp}_{filename}"
-    file_path = os.path.join(target_folder, stored_name)
-    file.save(file_path)
+    object_path = upload_document_to_supabase(application_id, document_type, file)
 
     document = LoanApplicationDocument(
         loan_application_id=application_id,
         document_type=document_type,
-        file_path=file_path,
+        file_path=object_path,
     )
     db.session.add(document)
     db.session.commit()

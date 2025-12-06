@@ -3,6 +3,8 @@ from decimal import Decimal
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import get_jwt_identity
 
+from app.supabase_client import build_public_url
+
 from ..extensions import db
 from ..models import (
     Customer,
@@ -237,13 +239,15 @@ def list_loan_application_documents():
     for document in documents:
         loan_application = document.loan_application
         customer = loan_application.customer if loan_application else None
+        file_path = document.file_path
 
         items.append(
             {
                 "id": document.id,
                 "loan_application_id": document.loan_application_id,
                 "document_type": document.document_type,
-                "file_path": document.file_path,
+                "file_path": file_path,
+                "file_url": build_public_url(file_path) if file_path else None,
                 "uploaded_at": document.uploaded_at.isoformat()
                 if document.uploaded_at
                 else None,
