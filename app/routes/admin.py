@@ -10,6 +10,36 @@ from .utils import role_required
 admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
 
 
+@admin_bp.route("/staff", methods=["GET"])
+@role_required(["admin"])
+def list_staff_users():
+    users = (
+        User.query.filter(User.role.in_(["admin", "staff"]))
+        .order_by(User.role.asc(), User.name.asc())
+        .all()
+    )
+
+    results = []
+    for user in users:
+        last_login = getattr(user, "last_login_at", None)
+        if last_login is not None:
+            last_login = last_login.isoformat()
+
+        results.append(
+            {
+                "id": user.id,
+                "email": user.email,
+                "name": user.name,
+                "role": user.role,
+                "is_active": user.is_active,
+                "created_at": user.created_at.isoformat() if user.created_at else None,
+                "last_login_at": last_login,
+            }
+        )
+
+    return jsonify(results)
+
+
 @admin_bp.route("/users", methods=["POST"])
 @role_required(["admin"])
 def create_user():
