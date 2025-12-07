@@ -24,6 +24,9 @@ def me():
             "full_name": customer.full_name,
             "mobile": customer.mobile,
             "status": customer.status,
+            "lead_status": customer.lead_status,
+            "kyc_status": customer.kyc_status,
+            "eligibility_status": customer.eligibility_status,
         }
     )
 

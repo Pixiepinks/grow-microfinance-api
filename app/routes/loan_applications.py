@@ -678,6 +678,9 @@ def admin_list_customers():
                         "address": customer.address,
                         "business_type": customer.business_type,
                         "status": customer.status,
+                        "lead_status": customer.lead_status,
+                        "kyc_status": customer.kyc_status,
+                        "eligibility_status": customer.eligibility_status,
                         "created_at": customer.created_at.isoformat()
                         if customer.created_at
                         else None,
