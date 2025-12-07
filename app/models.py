@@ -2,7 +2,7 @@ from datetime import datetime, date
 from decimal import Decimal
 from werkzeug.security import generate_password_hash, check_password_hash
 from sqlalchemy.orm import relationship
-from sqlalchemy import Numeric
+from sqlalchemy import Numeric, func
 
 from .extensions import db
 
@@ -55,6 +55,21 @@ class Customer(db.Model):
     user = relationship("User", back_populates="customer_profile")
     loans = relationship("Loan", back_populates="customer")
     loan_applications = relationship("LoanApplication", back_populates="customer")
+
+
+class Lead(db.Model):
+    __tablename__ = "leads"
+
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(255))
+    mobile = db.Column(db.String(32), nullable=False)
+    loan_type_interest = db.Column(db.String(64))
+    source = db.Column(db.String(64))
+    status = db.Column(db.String(32), nullable=False, default="NEW")
+    created_at = db.Column(db.DateTime, default=func.now())
+    customer_id = db.Column(db.Integer, db.ForeignKey("customers.id"))
+
+    customer = relationship("Customer")
 
 
 class Loan(db.Model):
