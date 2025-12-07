@@ -51,6 +51,7 @@ class Customer(db.Model):
     lead_status = db.Column(db.String(32), nullable=False, default="NEW")
     kyc_status = db.Column(db.String(32), nullable=False, default="PENDING")
     eligibility_status = db.Column(db.String(32), nullable=False, default="UNKNOWN")
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
     user = relationship("User", back_populates="customer_profile")
     loans = relationship("Loan", back_populates="customer")
