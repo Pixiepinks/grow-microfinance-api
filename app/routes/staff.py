@@ -27,6 +27,9 @@ def list_customers():
             "full_name": c.full_name,
             "mobile": c.mobile,
             "status": c.status,
+            "lead_status": c.lead_status,
+            "kyc_status": c.kyc_status,
+            "eligibility_status": c.eligibility_status,
         }
         for c in customers
     ]

@@ -48,6 +48,9 @@ class Customer(db.Model):
     address = db.Column(db.String(255))
     business_type = db.Column(db.String(120))
     status = db.Column(db.String(50), default="Active")
+    lead_status = db.Column(db.String(32), nullable=False, default="NEW")
+    kyc_status = db.Column(db.String(32), nullable=False, default="PENDING")
+    eligibility_status = db.Column(db.String(32), nullable=False, default="UNKNOWN")
 
     user = relationship("User", back_populates="customer_profile")
     loans = relationship("Loan", back_populates="customer")
