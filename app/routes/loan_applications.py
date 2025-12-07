@@ -380,6 +380,16 @@ def create_application():
             400,
         )
 
+    customer = Customer.query.get(customer_id)
+    if not customer:
+        return jsonify({"message": "Invalid customer_id"}), 400
+
+    if customer.kyc_status != "APPROVED":
+        return jsonify({"message": "Customer KYC is not approved"}), 400
+
+    if customer.eligibility_status != "ELIGIBLE":
+        return jsonify({"message": "Customer is not eligible for loan application"}), 400
+
     loan_type = data.get("loan_type")
     type_data = collect_type_specific_data(loan_type, data)
     validation_errors = validate_application_payload({**data, **type_data, "loan_type": loan_type}, loan_type)
