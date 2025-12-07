@@ -12,7 +12,7 @@ from .routes.customer import customer_bp
 from .routes.customers import customers_bp
 from .routes.loan_applications import admin_api_bp, loan_app_bp
 from .routes.leads import leads_bp
-from .schema_fix import ensure_customer_status_columns
+from .schema_fix import ensure_customers_lead_status_column
 
 def create_app():
     app = Flask(__name__)
@@ -44,7 +44,7 @@ def create_app():
     app.register_blueprint(leads_bp)
 
     with app.app_context():
-        ensure_customer_status_columns()
+        ensure_customers_lead_status_column()
 
     @app.route("/health", methods=["GET"])
     def health_check():
