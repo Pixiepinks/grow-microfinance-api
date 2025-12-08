@@ -2,7 +2,8 @@ import os
 from flask import Flask, jsonify
 from flask_cors import CORS
 
-from flask_migrate import upgrade
+from flask_migrate import stamp, upgrade
+from sqlalchemy import inspect
 
 from .extensions import db, migrate, jwt, init_jwt_handlers
 from .routes.auth import auth_bp
@@ -62,13 +63,14 @@ def create_app():
                 upgrade()
             except Exception as exc:  # pragma: no cover - defensive logging
                 app.logger.warning("Skipping automatic migrations: %s", exc)
-                # As a last resort, create tables directly. This protects
-                # environments where Alembic can't run (e.g., missing migrations
-                # config) so the app still has the required schema.
                 try:
-                    db.create_all()
-                    app.logger.info("Database tables created with create_all fallback")
-                except Exception as db_exc:  # pragma: no cover - defensive logging
-                    app.logger.error("Failed to create database tables: %s", db_exc)
+                    inspector = inspect(db.engine)
+                    if not inspector.has_table("alembic_version"):
+                        stamp()
+                        app.logger.info(
+                            "Database stamped to current migration head after failed upgrade"
+                        )
+                except Exception as stamp_exc:  # pragma: no cover - defensive logging
+                    app.logger.error("Failed to stamp database after migration error: %s", stamp_exc)
 
     return app
