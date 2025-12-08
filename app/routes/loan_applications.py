@@ -661,6 +661,24 @@ def admin_list_all_applications():
         return jsonify({"message": "Failed to load loan applications"}), 500
 
 
+def _serialize_admin_customer(customer: Customer) -> dict:
+    return {
+        "id": customer.id,
+        "user_id": customer.user_id,
+        "customer_code": customer.customer_code,
+        "full_name": customer.full_name,
+        "nic_number": customer.nic_number,
+        "mobile": customer.mobile,
+        "address": customer.address,
+        "business_type": customer.business_type,
+        "status": customer.status,
+        "lead_status": customer.lead_status,
+        "kyc_status": customer.kyc_status,
+        "eligibility_status": customer.eligibility_status,
+        "created_at": customer.created_at.isoformat() if customer.created_at else None,
+    }
+
+
 @admin_api_bp.route("/admin/customers", methods=["GET", "OPTIONS"])
 @cross_origin(
     origins=os.getenv("CORS_ORIGINS", "*"),
@@ -677,26 +695,7 @@ def admin_list_customers():
         response = jsonify(
             {
                 "success": True,
-                "customers": [
-                    {
-                        "id": customer.id,
-                        "user_id": customer.user_id,
-                        "customer_code": customer.customer_code,
-                        "full_name": customer.full_name,
-                        "nic_number": customer.nic_number,
-                        "mobile": customer.mobile,
-                        "address": customer.address,
-                        "business_type": customer.business_type,
-                        "status": customer.status,
-                        "lead_status": customer.lead_status,
-                        "kyc_status": customer.kyc_status,
-                        "eligibility_status": customer.eligibility_status,
-                        "created_at": customer.created_at.isoformat()
-                        if customer.created_at
-                        else None,
-                    }
-                    for customer in customers
-                ],
+                "customers": [_serialize_admin_customer(customer) for customer in customers],
             }
         )
         logger.info("Handled %s %s with status %s", request.method, request.path, 200)
@@ -706,6 +705,30 @@ def admin_list_customers():
             "Error handling %s %s: %s", request.method, request.path, exc
         )
         return jsonify({"message": "Failed to load customers"}), 500
+
+
+@admin_api_bp.route("/admin/customers/<int:customer_id>", methods=["GET", "OPTIONS"])
+@cross_origin(
+    origins=os.getenv("CORS_ORIGINS", "*"),
+    methods=["GET", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
+)
+@role_required(["admin"])
+def admin_get_customer(customer_id: int):
+    """Return a single customer for the admin dashboard."""
+
+    logger = current_app.logger
+    try:
+        customer = Customer.query.get(customer_id)
+        if not customer:
+            return jsonify({"message": "Customer not found"}), 404
+
+        response = jsonify({"success": True, "customer": _serialize_admin_customer(customer)})
+        logger.info("Handled %s %s with status %s", request.method, request.path, 200)
+        return response
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.exception("Error handling %s %s: %s", request.method, request.path, exc)
+        return jsonify({"message": "Failed to load customer"}), 500
 
 
 @loan_app_bp.route("/awaiting-review", methods=["GET", "OPTIONS"])
