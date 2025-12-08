@@ -9,18 +9,9 @@ customers_bp = Blueprint("customers", __name__, url_prefix="/customers")
 
 def _serialize_customer(customer: Customer) -> dict:
     return {
-        "id": customer.id,
+        **customer.to_dict(),
         "user_id": customer.user_id,
-        "customer_code": customer.customer_code,
-        "full_name": customer.full_name,
-        "nic_number": customer.nic_number,
-        "mobile": customer.mobile,
-        "address": customer.address,
-        "business_type": customer.business_type,
         "status": customer.status,
-        "lead_status": customer.lead_status,
-        "kyc_status": customer.kyc_status,
-        "eligibility_status": customer.eligibility_status,
         "created_at": customer.created_at.isoformat() if customer.created_at else None,
     }
 
@@ -55,14 +46,33 @@ def list_customers():
         return jsonify({"message": "Failed to load customers"}), 500
 
 
-def _update_kyc_status(customer_id: int, status: str):
+@customers_bp.route("/<int:customer_id>", methods=["GET"])
+@role_required(["admin", "staff"])
+def get_customer(customer_id: int):
     logger = current_app.logger
     try:
         customer, error_response = _get_customer_or_404(customer_id)
         if error_response:
             return error_response
 
-        customer.kyc_status = status
+        response = jsonify(_serialize_customer(customer))
+        logger.info("Handled %s %s with status %s", request.method, request.path, 200)
+        return response
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.exception("Error handling %s %s: %s", request.method, request.path, exc)
+        return jsonify({"message": "Failed to load customer"}), 500
+
+
+@customers_bp.route("/<int:customer_id>/kyc-uploaded", methods=["POST"])
+@role_required(["admin", "staff"])
+def mark_kyc_uploaded(customer_id: int):
+    logger = current_app.logger
+    try:
+        customer, error_response = _get_customer_or_404(customer_id)
+        if error_response:
+            return error_response
+
+        customer.kyc_status = "UPLOADED"
         db.session.commit()
 
         response = jsonify(_serialize_customer(customer))
@@ -74,41 +84,58 @@ def _update_kyc_status(customer_id: int, status: str):
         return jsonify({"message": "Failed to update customer"}), 500
 
 
-@customers_bp.route("/<int:customer_id>/kyc-uploaded", methods=["POST"])
-@role_required(["admin", "staff"])
-def mark_kyc_uploaded(customer_id: int):
-    return _update_kyc_status(customer_id, "UPLOADED")
-
-
 @customers_bp.route("/<int:customer_id>/kyc-under-review", methods=["POST"])
 @role_required(["admin", "staff"])
 def mark_kyc_under_review(customer_id: int):
-    return _update_kyc_status(customer_id, "UNDER_REVIEW")
-
-
-@customers_bp.route("/<int:customer_id>/kyc-approve", methods=["POST"])
-@role_required(["admin", "staff"])
-def approve_kyc(customer_id: int):
-    return _update_kyc_status(customer_id, "APPROVED")
-
-
-@customers_bp.route("/<int:customer_id>/kyc-reject", methods=["POST"])
-@role_required(["admin", "staff"])
-def reject_kyc(customer_id: int):
-    return _update_kyc_status(customer_id, "REJECTED")
-
-
-def _update_eligibility_status(customer_id: int, status: str):
     logger = current_app.logger
     try:
         customer, error_response = _get_customer_or_404(customer_id)
         if error_response:
             return error_response
 
-        if status == "ELIGIBLE" and (customer.kyc_status or "").upper() != "APPROVED":
-            return jsonify({"message": "Customer KYC must be approved before eligibility"}), 400
+        customer.kyc_status = "UNDER_REVIEW"
+        db.session.commit()
 
-        customer.eligibility_status = status
+        response = jsonify(_serialize_customer(customer))
+        logger.info("Handled %s %s with status %s", request.method, request.path, 200)
+        return response
+    except Exception as exc:  # pragma: no cover - defensive logging
+        db.session.rollback()
+        logger.exception("Error handling %s %s: %s", request.method, request.path, exc)
+        return jsonify({"message": "Failed to update customer"}), 500
+
+
+@customers_bp.route("/<int:customer_id>/kyc-approve", methods=["POST"])
+@role_required(["admin", "staff"])
+def approve_kyc(customer_id: int):
+    logger = current_app.logger
+    try:
+        customer, error_response = _get_customer_or_404(customer_id)
+        if error_response:
+            return error_response
+
+        customer.kyc_status = "APPROVED"
+        db.session.commit()
+
+        response = jsonify(_serialize_customer(customer))
+        logger.info("Handled %s %s with status %s", request.method, request.path, 200)
+        return response
+    except Exception as exc:  # pragma: no cover - defensive logging
+        db.session.rollback()
+        logger.exception("Error handling %s %s: %s", request.method, request.path, exc)
+        return jsonify({"message": "Failed to update customer"}), 500
+
+
+@customers_bp.route("/<int:customer_id>/kyc-reject", methods=["POST"])
+@role_required(["admin", "staff"])
+def reject_kyc(customer_id: int):
+    logger = current_app.logger
+    try:
+        customer, error_response = _get_customer_or_404(customer_id)
+        if error_response:
+            return error_response
+
+        customer.kyc_status = "REJECTED"
         db.session.commit()
 
         response = jsonify(_serialize_customer(customer))
@@ -123,10 +150,43 @@ def _update_eligibility_status(customer_id: int, status: str):
 @customers_bp.route("/<int:customer_id>/mark-eligible", methods=["POST"])
 @role_required(["admin", "staff"])
 def mark_eligible(customer_id: int):
-    return _update_eligibility_status(customer_id, "ELIGIBLE")
+    logger = current_app.logger
+    try:
+        customer, error_response = _get_customer_or_404(customer_id)
+        if error_response:
+            return error_response
+
+        if (customer.kyc_status or "").upper() != "APPROVED":
+            return jsonify({"message": "Cannot mark eligible: KYC not approved"}), 400
+
+        customer.eligibility_status = "ELIGIBLE"
+        db.session.commit()
+
+        response = jsonify(_serialize_customer(customer))
+        logger.info("Handled %s %s with status %s", request.method, request.path, 200)
+        return response
+    except Exception as exc:  # pragma: no cover - defensive logging
+        db.session.rollback()
+        logger.exception("Error handling %s %s: %s", request.method, request.path, exc)
+        return jsonify({"message": "Failed to update customer"}), 500
 
 
 @customers_bp.route("/<int:customer_id>/mark-not-eligible", methods=["POST"])
 @role_required(["admin", "staff"])
 def mark_not_eligible(customer_id: int):
-    return _update_eligibility_status(customer_id, "NOT_ELIGIBLE")
+    logger = current_app.logger
+    try:
+        customer, error_response = _get_customer_or_404(customer_id)
+        if error_response:
+            return error_response
+
+        customer.eligibility_status = "NOT_ELIGIBLE"
+        db.session.commit()
+
+        response = jsonify(_serialize_customer(customer))
+        logger.info("Handled %s %s with status %s", request.method, request.path, 200)
+        return response
+    except Exception as exc:  # pragma: no cover - defensive logging
+        db.session.rollback()
+        logger.exception("Error handling %s %s: %s", request.method, request.path, exc)
+        return jsonify({"message": "Failed to update customer"}), 500
