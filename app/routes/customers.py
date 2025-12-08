@@ -29,6 +29,14 @@ def _get_customer_or_404(customer_id: int):
     if not customer:
         return None, (jsonify({"message": "Customer not found"}), 404)
     return customer, None
+
+
+def _get_customer_by_code(customer_code: str) -> Customer | None:
+    if not customer_code:
+        return None
+    return Customer.query.filter_by(customer_code=customer_code).first()
+
+
 def save_customer_document_file(customer_id: int, uploaded_file, document_type: str) -> str:
     supabase = get_supabase_client()
     bucket = get_storage_bucket()
@@ -169,6 +177,16 @@ def get_customer(customer_id: int):
         return jsonify({"message": "Failed to load customer"}), 500
 
 
+@customers_bp.route("/by-code", methods=["GET"])
+@role_required(["admin", "staff"])
+def get_customer_by_code_admin():
+    customer_code = request.args.get("customer_code", type=str)
+    customer = _get_customer_by_code(customer_code)
+    if not customer:
+        return jsonify({"message": "Customer not found"}), 404
+    return jsonify(_serialize_customer(customer))
+
+
 @customers_bp.route("/<int:customer_id>/kyc-uploaded", methods=["POST"])
 @role_required(["admin", "staff"])
 def mark_kyc_uploaded(customer_id: int):
@@ -296,6 +314,28 @@ def mark_not_eligible(customer_id: int):
         db.session.rollback()
         logger.exception("Error handling %s %s: %s", request.method, request.path, exc)
         return jsonify({"message": "Failed to update customer"}), 500
+
+
+@public_bp.route("/customers/by-code", methods=["GET"])
+def get_customer_by_code_public():
+    """
+    Lightweight public lookup used by the /kyc?code=... page.
+    Should not expose sensitive internal fields.
+    """
+
+    customer_code = request.args.get("customer_code", type=str)
+    customer = _get_customer_by_code(customer_code)
+    if not customer:
+        return jsonify({"message": "Customer not found"}), 404
+
+    data = {
+        "customer_code": customer.customer_code,
+        "full_name": customer.full_name,
+        "mobile": customer.mobile,
+        "kyc_status": customer.kyc_status,
+        "eligibility_status": customer.eligibility_status,
+    }
+    return jsonify(data)
 
 
 @public_bp.route("/customers/<customer_code>/kyc-upload", methods=["POST"])
