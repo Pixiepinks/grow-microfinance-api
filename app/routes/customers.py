@@ -317,10 +317,10 @@ def mark_not_eligible(customer_id: int):
 
 
 @public_bp.route("/customers/by-code", methods=["GET"])
-def get_customer_by_code_public():
+def public_get_customer_by_code():
     """
     Lightweight public lookup used by the /kyc?code=... page.
-    Should not expose sensitive internal fields.
+    No authentication, returns only non-sensitive fields.
     """
 
     customer_code = request.args.get("customer_code", type=str)
