@@ -1,3 +1,4 @@
+import logging
 import os
 from datetime import datetime
 
@@ -5,11 +6,10 @@ from flask import Blueprint, current_app, jsonify, request
 
 from ..extensions import db
 from ..models import Customer, CustomerDocument
-from ..supabase_client import get_supabase_client
+from ..supabase_client import build_public_url, get_storage_bucket, get_supabase_client
 from .utils import role_required
 
-SUPABASE_BUCKET = "grow-documents"
-CUSTOMER_DOCS_PREFIX = "customer_documents"
+logger = logging.getLogger(__name__)
 
 customers_bp = Blueprint("customers", __name__, url_prefix="/customers")
 public_bp = Blueprint("public", __name__, url_prefix="/public")
@@ -30,24 +30,24 @@ def _get_customer_or_404(customer_id: int):
         return None, (jsonify({"message": "Customer not found"}), 404)
     return customer, None
 def save_customer_document_file(customer_id: int, uploaded_file, document_type: str) -> str:
-    original_name = uploaded_file.filename or "file"
-    ext = os.path.splitext(original_name)[1]
+    supabase = get_supabase_client()
+    bucket = get_storage_bucket()
+
+    original_name = uploaded_file.filename or f"{document_type}.bin"
+    ext = os.path.splitext(original_name)[1] or ".bin"
     timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
     safe_type = (document_type or "DOC").upper()
 
-    supabase = get_supabase_client()
-    storage_path = f"{CUSTOMER_DOCS_PREFIX}/{customer_id}/{safe_type}_{timestamp}{ext}"
+    storage_path = f"customer_documents/{customer_id}/{safe_type}_{timestamp}{ext}"
+    file_bytes = uploaded_file.read()
 
-    upload_response = supabase.storage.from_(SUPABASE_BUCKET).upload(
-        storage_path,
-        uploaded_file.stream,
-        {"upsert": True},
+    supabase.storage.from_(bucket).upload(
+        path=storage_path,
+        file=file_bytes,
+        file_options={"content-type": uploaded_file.mimetype or "application/octet-stream"},
     )
 
-    if getattr(upload_response, "error", None):
-        raise ValueError("Failed to upload document to storage")
-
-    return supabase.storage.from_(SUPABASE_BUCKET).get_public_url(storage_path)
+    return build_public_url(storage_path)
 
 
 @customers_bp.route("", methods=["GET"])
@@ -114,18 +114,29 @@ def upload_customer_document(customer_id: int):
 
     try:
         file_path = save_customer_document_file(customer_id, uploaded_file, document_type)
-    except ValueError:
-        return jsonify({"message": "Failed to upload document"}), 500
 
-    doc = CustomerDocument(
-        customer_id=customer_id,
-        document_type=document_type,
-        file_path=file_path,
-    )
-    db.session.add(doc)
-    if customer.kyc_status == "PENDING":
-        customer.kyc_status = "UPLOADED"
-    db.session.commit()
+        doc = CustomerDocument(
+            customer_id=customer_id,
+            document_type=document_type,
+            file_path=file_path,
+            uploaded_at=datetime.utcnow(),
+        )
+        db.session.add(doc)
+        if customer.kyc_status == "PENDING":
+            customer.kyc_status = "UPLOADED"
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        logger.exception("Failed to upload customer document")
+        return (
+            jsonify(
+                {
+                    "error": "Failed to upload customer document",
+                    "details": str(e),
+                }
+            ),
+            500,
+        )
 
     return (
         jsonify(
