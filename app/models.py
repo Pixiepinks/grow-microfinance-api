@@ -56,6 +56,9 @@ class Customer(db.Model):
     user = relationship("User", back_populates="customer_profile")
     loans = relationship("Loan", back_populates="customer")
     loan_applications = relationship("LoanApplication", back_populates="customer")
+    documents = relationship(
+        "CustomerDocument", back_populates="customer", lazy="dynamic", cascade="all, delete-orphan"
+    )
 
     def to_dict(self) -> dict:
         return {
@@ -70,6 +73,18 @@ class Customer(db.Model):
             "kyc_status": self.kyc_status,
             "eligibility_status": self.eligibility_status,
         }
+
+
+class CustomerDocument(db.Model):
+    __tablename__ = "customer_documents"
+
+    id = db.Column(db.Integer, primary_key=True)
+    customer_id = db.Column(db.Integer, db.ForeignKey("customers.id"), nullable=False)
+    document_type = db.Column(db.String(64), nullable=False)
+    file_path = db.Column(db.String(512), nullable=False)
+    uploaded_at = db.Column(db.DateTime, server_default=func.now(), nullable=False)
+
+    customer = relationship("Customer", back_populates="documents")
 
 
 class Lead(db.Model):
