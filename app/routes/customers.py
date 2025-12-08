@@ -1,6 +1,7 @@
 import logging
 import os
-from datetime import datetime
+from datetime import date, datetime
+from decimal import Decimal
 
 from flask import Blueprint, current_app, jsonify, request
 
@@ -187,6 +188,66 @@ def get_customer_by_code_admin():
     return jsonify(_serialize_customer(customer))
 
 
+@customers_bp.route("/<int:customer_id>/kyc-profile", methods=["PATCH", "POST"])
+@role_required(["admin", "staff"])
+def update_customer_kyc_profile(customer_id: int):
+    customer = Customer.query.get(customer_id)
+    if not customer:
+        return jsonify({"message": "Customer not found"}), 404
+
+    data = request.get_json() or {}
+
+    def set_attr(field, cast=str):
+        if field in data and data[field] is not None:
+            setattr(customer, field, cast(data[field]))
+
+    set_attr("civil_status")
+    set_attr("permanent_address_line1")
+    set_attr("permanent_address_line2")
+    set_attr("permanent_city")
+    set_attr("permanent_district")
+    set_attr("permanent_province")
+    set_attr("permanent_postal_code")
+    set_attr("current_address_line1")
+    set_attr("current_address_line2")
+    set_attr("current_city")
+    set_attr("current_district")
+    set_attr("current_province")
+    set_attr("current_postal_code")
+    set_attr("current_address_since")
+    set_attr("household_size", int)
+    set_attr("dependents_count", int)
+    set_attr("customer_type")
+    set_attr("employer_name")
+    set_attr("employer_address")
+    set_attr("occupation")
+    set_attr("business_name")
+    set_attr("business_address")
+    set_attr("guarantor_name")
+    set_attr("guarantor_relationship")
+    set_attr("guarantor_mobile")
+
+    if "monthly_income" in data and data["monthly_income"] is not None:
+        try:
+            customer.monthly_income = Decimal(str(data["monthly_income"]))
+        except Exception:
+            pass
+
+    if "date_of_birth" in data and data["date_of_birth"]:
+        try:
+            customer.date_of_birth = date.fromisoformat(data["date_of_birth"])
+        except ValueError:
+            pass
+
+    if "consent_data_processing" in data:
+        customer.consent_data_processing = bool(data["consent_data_processing"])
+    if "consent_credit_checks" in data:
+        customer.consent_credit_checks = bool(data["consent_credit_checks"])
+
+    db.session.commit()
+    return jsonify(_serialize_customer(customer))
+
+
 @customers_bp.route("/<int:customer_id>/kyc-uploaded", methods=["POST"])
 @role_required(["admin", "staff"])
 def mark_kyc_uploaded(customer_id: int):
@@ -370,6 +431,62 @@ def public_kyc_upload(customer_code: str):
     handle_file("nic_back", "NIC_BACK")
     handle_file("selfie_nic", "SELFIE_NIC")
     handle_file("address_proof", "ADDRESS_PROOF")
+
+    form = request.form
+
+    def set_form_attr(field, cast=str):
+        if field in form and form[field]:
+            setattr(customer, field, cast(form[field]))
+
+    set_form_attr("civil_status")
+    set_form_attr("permanent_address_line1")
+    set_form_attr("permanent_address_line2")
+    set_form_attr("permanent_city")
+    set_form_attr("permanent_district")
+    set_form_attr("permanent_province")
+    set_form_attr("permanent_postal_code")
+    set_form_attr("current_address_line1")
+    set_form_attr("current_address_line2")
+    set_form_attr("current_city")
+    set_form_attr("current_district")
+    set_form_attr("current_province")
+    set_form_attr("current_postal_code")
+    set_form_attr("current_address_since")
+    set_form_attr("customer_type")
+    set_form_attr("employer_name")
+    set_form_attr("employer_address")
+    set_form_attr("occupation")
+    set_form_attr("business_name")
+    set_form_attr("business_address")
+    set_form_attr("guarantor_name")
+    set_form_attr("guarantor_relationship")
+    set_form_attr("guarantor_mobile")
+
+    if "household_size" in form and form["household_size"]:
+        customer.household_size = int(form["household_size"])
+    if "dependents_count" in form and form["dependents_count"]:
+        customer.dependents_count = int(form["dependents_count"])
+
+    if "monthly_income" in form and form["monthly_income"]:
+        try:
+            customer.monthly_income = Decimal(form["monthly_income"])
+        except Exception:
+            pass
+
+    if "date_of_birth" in form and form["date_of_birth"]:
+        try:
+            customer.date_of_birth = date.fromisoformat(form["date_of_birth"])
+        except ValueError:
+            pass
+
+    def form_bool(name):
+        v = form.get(name)
+        return True if v and str(v).lower() in ("1", "true", "on", "yes") else False
+
+    if "consent_data_processing" in form:
+        customer.consent_data_processing = form_bool("consent_data_processing")
+    if "consent_credit_checks" in form:
+        customer.consent_credit_checks = form_bool("consent_credit_checks")
 
     if upload_failed:
         return jsonify({"message": "Failed to upload document"}), 500

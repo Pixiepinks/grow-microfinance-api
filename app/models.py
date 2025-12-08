@@ -47,6 +47,35 @@ class Customer(db.Model):
     mobile = db.Column(db.String(20))
     address = db.Column(db.String(255))
     business_type = db.Column(db.String(120))
+    date_of_birth = db.Column(db.Date, nullable=True)
+    civil_status = db.Column(db.String(20), nullable=True)
+    permanent_address_line1 = db.Column(db.String(255), nullable=True)
+    permanent_address_line2 = db.Column(db.String(255), nullable=True)
+    permanent_city = db.Column(db.String(100), nullable=True)
+    permanent_district = db.Column(db.String(100), nullable=True)
+    permanent_province = db.Column(db.String(100), nullable=True)
+    permanent_postal_code = db.Column(db.String(20), nullable=True)
+    current_address_line1 = db.Column(db.String(255), nullable=True)
+    current_address_line2 = db.Column(db.String(255), nullable=True)
+    current_city = db.Column(db.String(100), nullable=True)
+    current_district = db.Column(db.String(100), nullable=True)
+    current_province = db.Column(db.String(100), nullable=True)
+    current_postal_code = db.Column(db.String(20), nullable=True)
+    current_address_since = db.Column(db.String(10), nullable=True)
+    household_size = db.Column(db.Integer, nullable=True)
+    dependents_count = db.Column(db.Integer, nullable=True)
+    customer_type = db.Column(db.String(20), nullable=True)
+    employer_name = db.Column(db.String(255), nullable=True)
+    employer_address = db.Column(db.String(255), nullable=True)
+    occupation = db.Column(db.String(100), nullable=True)
+    monthly_income = db.Column(db.Numeric(12, 2), nullable=True)
+    business_name = db.Column(db.String(255), nullable=True)
+    business_address = db.Column(db.String(255), nullable=True)
+    guarantor_name = db.Column(db.String(255), nullable=True)
+    guarantor_relationship = db.Column(db.String(100), nullable=True)
+    guarantor_mobile = db.Column(db.String(30), nullable=True)
+    consent_data_processing = db.Column(db.Boolean, nullable=True, default=False)
+    consent_credit_checks = db.Column(db.Boolean, nullable=True, default=False)
     status = db.Column(db.String(50), default="Active")
     lead_status = db.Column(db.String(32), nullable=False, default="NEW")
     kyc_status = db.Column(db.String(32), nullable=False, default="PENDING")
@@ -69,6 +98,35 @@ class Customer(db.Model):
             "mobile": self.mobile,
             "address": self.address,
             "business_type": self.business_type,
+            "date_of_birth": self.date_of_birth.isoformat() if self.date_of_birth else None,
+            "civil_status": self.civil_status,
+            "permanent_address_line1": self.permanent_address_line1,
+            "permanent_address_line2": self.permanent_address_line2,
+            "permanent_city": self.permanent_city,
+            "permanent_district": self.permanent_district,
+            "permanent_province": self.permanent_province,
+            "permanent_postal_code": self.permanent_postal_code,
+            "current_address_line1": self.current_address_line1,
+            "current_address_line2": self.current_address_line2,
+            "current_city": self.current_city,
+            "current_district": self.current_district,
+            "current_province": self.current_province,
+            "current_postal_code": self.current_postal_code,
+            "current_address_since": self.current_address_since,
+            "household_size": self.household_size,
+            "dependents_count": self.dependents_count,
+            "customer_type": self.customer_type,
+            "employer_name": self.employer_name,
+            "employer_address": self.employer_address,
+            "occupation": self.occupation,
+            "monthly_income": float(self.monthly_income) if self.monthly_income is not None else None,
+            "business_name": self.business_name,
+            "business_address": self.business_address,
+            "guarantor_name": self.guarantor_name,
+            "guarantor_relationship": self.guarantor_relationship,
+            "guarantor_mobile": self.guarantor_mobile,
+            "consent_data_processing": self.consent_data_processing,
+            "consent_credit_checks": self.consent_credit_checks,
             "lead_status": self.lead_status,
             "kyc_status": self.kyc_status,
             "eligibility_status": self.eligibility_status,
