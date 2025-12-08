@@ -57,6 +57,20 @@ class Customer(db.Model):
     loans = relationship("Loan", back_populates="customer")
     loan_applications = relationship("LoanApplication", back_populates="customer")
 
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "customer_code": self.customer_code,
+            "full_name": self.full_name,
+            "nic_number": self.nic_number,
+            "mobile": self.mobile,
+            "address": self.address,
+            "business_type": self.business_type,
+            "lead_status": self.lead_status,
+            "kyc_status": self.kyc_status,
+            "eligibility_status": self.eligibility_status,
+        }
+
 
 class Lead(db.Model):
     __tablename__ = "leads"
