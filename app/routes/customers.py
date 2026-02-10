@@ -490,8 +490,9 @@ def public_kyc_upload(customer_code: str):
             "credit_checks": form_bool("consent_credit_checks"),
         }
 
-        def handle_file(field_name: str, doc_type: str):
-            file_storage = files.get(field_name)
+        def handle_file(field_names: str | tuple[str, ...], doc_type: str):
+            normalized_names = (field_names,) if isinstance(field_names, str) else field_names
+            file_storage = next((files.get(name) for name in normalized_names if files.get(name)), None)
             if not file_storage:
                 return
 
@@ -504,10 +505,10 @@ def public_kyc_upload(customer_code: str):
             db.session.add(doc)
             saved_types.append(doc_type)
 
-        handle_file("nic_front", "NIC_FRONT")
-        handle_file("nic_back", "NIC_BACK")
-        handle_file("selfie_nic", "SELFIE_NIC")
-        handle_file("address_proof", "ADDRESS_PROOF")
+        handle_file(("nic_front", "nicFront"), "NIC_FRONT")
+        handle_file(("nic_back", "nicBack"), "NIC_BACK")
+        handle_file(("selfie_nic", "selfieNic", "selfie_with_nic"), "SELFIE_NIC")
+        handle_file(("address_proof", "addressProof"), "ADDRESS_PROOF")
 
         if not saved_types:
             raise ValueError("No files uploaded")
@@ -515,6 +516,10 @@ def public_kyc_upload(customer_code: str):
         customer.kyc_status = "SUBMITTED"
         db.session.commit()
         return jsonify({"success": True, "message": "KYC submitted successfully"}), 200
+    except ValueError as exc:
+        db.session.rollback()
+        current_app.logger.warning("Public KYC validation failed for %s: %s", customer_code, exc)
+        return jsonify({"success": False, "message": str(exc), "detail": str(exc)}), 400
     except Exception as exc:
         db.session.rollback()
         current_app.logger.exception("Public KYC upload failed")
