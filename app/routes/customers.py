@@ -401,10 +401,6 @@ def public_get_customer_by_code():
 
 @public_bp.route("/customers/<customer_code>/kyc-upload", methods=["POST"])
 def public_kyc_upload(customer_code: str):
-    customer = Customer.query.filter_by(customer_code=customer_code).first()
-    if not customer:
-        return jsonify({"message": "Customer not found"}), 404
-
     form = request.form
     files = request.files
     saved_types: list[str] = []
@@ -443,85 +439,85 @@ def public_kyc_upload(customer_code: str):
         return str(value).lower() in ("1", "true", "on", "yes")
 
     try:
-        with db.session.begin():
-            profile = CustomerKYCProfile.query.filter_by(customer_id=customer.id).first()
-            if not profile:
-                profile = CustomerKYCProfile(customer_id=customer.id)
-                db.session.add(profile)
+        customer = Customer.query.filter_by(customer_code=customer_code).first()
+        if not customer:
+            return jsonify({"message": "Customer not found"}), 404
 
-            profile.date_of_birth = form_date("date_of_birth")
-            profile.civil_status = form.get("civil_status") or None
-            profile.permanent_address = {
-                "line1": form.get("permanent_address_line1") or None,
-                "line2": form.get("permanent_address_line2") or None,
-                "city": form.get("permanent_city") or None,
-                "district": form.get("permanent_district") or None,
-                "province": form.get("permanent_province") or None,
-                "postal_code": form.get("permanent_postal_code") or None,
-            }
-            profile.current_address = {
-                "line1": form.get("current_address_line1") or None,
-                "line2": form.get("current_address_line2") or None,
-                "city": form.get("current_city") or None,
-                "district": form.get("current_district") or None,
-                "province": form.get("current_province") or None,
-                "postal_code": form.get("current_postal_code") or None,
-                "since": form.get("current_address_since") or None,
-            }
-            profile.household_size = form_int("household_size")
-            profile.dependents_count = form_int("dependents_count")
-            profile.customer_type = form.get("customer_type") or None
-            profile.employment = {
-                "employer_name": form.get("employer_name") or None,
-                "employer_address": form.get("employer_address") or None,
-                "occupation": form.get("occupation") or None,
-                "monthly_income": form_decimal("monthly_income"),
-            }
-            profile.business = {
-                "business_name": form.get("business_name") or None,
-                "business_address": form.get("business_address") or None,
-            }
-            profile.guarantor = {
-                "name": form.get("guarantor_name") or None,
-                "relationship": form.get("guarantor_relationship") or None,
-                "mobile": form.get("guarantor_mobile") or None,
-            }
-            profile.consents = {
-                "data_processing": form_bool("consent_data_processing"),
-                "credit_checks": form_bool("consent_credit_checks"),
-            }
+        profile = CustomerKYCProfile.query.filter_by(customer_id=customer.id).first()
+        if not profile:
+            profile = CustomerKYCProfile(customer_id=customer.id)
+            db.session.add(profile)
 
-            def handle_file(field_name: str, doc_type: str):
-                file_storage = files.get(field_name)
-                if not file_storage:
-                    return
+        profile.date_of_birth = form_date("date_of_birth")
+        profile.civil_status = form.get("civil_status") or None
+        profile.permanent_address = {
+            "line1": form.get("permanent_address_line1") or None,
+            "line2": form.get("permanent_address_line2") or None,
+            "city": form.get("permanent_city") or None,
+            "district": form.get("permanent_district") or None,
+            "province": form.get("permanent_province") or None,
+            "postal_code": form.get("permanent_postal_code") or None,
+        }
+        profile.current_address = {
+            "line1": form.get("current_address_line1") or None,
+            "line2": form.get("current_address_line2") or None,
+            "city": form.get("current_city") or None,
+            "district": form.get("current_district") or None,
+            "province": form.get("current_province") or None,
+            "postal_code": form.get("current_postal_code") or None,
+            "since": form.get("current_address_since") or None,
+        }
+        profile.household_size = form_int("household_size")
+        profile.dependents_count = form_int("dependents_count")
+        profile.customer_type = form.get("customer_type") or None
+        profile.employment = {
+            "employer_name": form.get("employer_name") or None,
+            "employer_address": form.get("employer_address") or None,
+            "occupation": form.get("occupation") or None,
+            "monthly_income": form_decimal("monthly_income"),
+        }
+        profile.business = {
+            "business_name": form.get("business_name") or None,
+            "business_address": form.get("business_address") or None,
+        }
+        profile.guarantor = {
+            "name": form.get("guarantor_name") or None,
+            "relationship": form.get("guarantor_relationship") or None,
+            "mobile": form.get("guarantor_mobile") or None,
+        }
+        profile.consents = {
+            "data_processing": form_bool("consent_data_processing"),
+            "credit_checks": form_bool("consent_credit_checks"),
+        }
 
-                path = save_customer_document_file(customer.id, file_storage, doc_type)
-                doc = CustomerDocument(
-                    customer_id=customer.id,
-                    document_type=doc_type,
-                    file_path=path,
-                )
-                db.session.add(doc)
-                saved_types.append(doc_type)
+        def handle_file(field_name: str, doc_type: str):
+            file_storage = files.get(field_name)
+            if not file_storage:
+                return
 
-            handle_file("nic_front", "NIC_FRONT")
-            handle_file("nic_back", "NIC_BACK")
-            handle_file("selfie_nic", "SELFIE_NIC")
-            handle_file("address_proof", "ADDRESS_PROOF")
+            path = save_customer_document_file(customer.id, file_storage, doc_type)
+            doc = CustomerDocument(
+                customer_id=customer.id,
+                document_type=doc_type,
+                file_path=path,
+            )
+            db.session.add(doc)
+            saved_types.append(doc_type)
 
-            if not saved_types:
-                raise ValueError("No files uploaded")
+        handle_file("nic_front", "NIC_FRONT")
+        handle_file("nic_back", "NIC_BACK")
+        handle_file("selfie_nic", "SELFIE_NIC")
+        handle_file("address_proof", "ADDRESS_PROOF")
 
-            customer.kyc_status = "SUBMITTED"
+        if not saved_types:
+            raise ValueError("No files uploaded")
 
-    except ValueError as exc:
-        db.session.rollback()
-        status_code = 400 if str(exc) == "No files uploaded" else 422
-        return jsonify({"message": str(exc)}), status_code
+        customer.kyc_status = "SUBMITTED"
+        db.session.commit()
+        return jsonify({"success": True, "message": "KYC submitted successfully"}), 200
     except Exception as exc:
         db.session.rollback()
-        logger.exception("Failed to submit public KYC for customer code %s", customer_code)
-        return jsonify({"message": f"Failed to submit KYC: {exc}"}), 400
-
-    return jsonify({"success": True, "message": "KYC submitted successfully"})
+        current_app.logger.exception("Public KYC upload failed")
+        return jsonify(
+            {"success": False, "message": "Failed to submit KYC", "detail": str(exc)}
+        ), 400
