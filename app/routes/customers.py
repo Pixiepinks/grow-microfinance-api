@@ -6,7 +6,7 @@ from decimal import Decimal
 from flask import Blueprint, current_app, jsonify, request
 
 from ..extensions import db
-from ..models import Customer, CustomerDocument
+from ..models import Customer, CustomerDocument, CustomerKYCProfile
 from ..supabase_client import build_public_url, get_storage_bucket, get_supabase_client
 from .utils import role_required
 
@@ -405,104 +405,123 @@ def public_kyc_upload(customer_code: str):
     if not customer:
         return jsonify({"message": "Customer not found"}), 404
 
+    form = request.form
     files = request.files
     saved_types: list[str] = []
 
-    upload_failed = False
+    def form_int(name: str):
+        value = form.get(name)
+        if value in (None, ""):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid integer for {name}") from exc
 
-    def handle_file(field_name: str, doc_type: str):
-        nonlocal upload_failed
-        file_storage = files.get(field_name)
-        if file_storage:
-            try:
+    def form_date(name: str):
+        value = form.get(name)
+        if value in (None, ""):
+            return None
+        try:
+            return date.fromisoformat(value)
+        except ValueError as exc:
+            raise ValueError(f"Invalid date format for {name}. Use YYYY-MM-DD") from exc
+
+    def form_decimal(name: str):
+        value = form.get(name)
+        if value in (None, ""):
+            return None
+        try:
+            return str(Decimal(value))
+        except Exception as exc:
+            raise ValueError(f"Invalid number for {name}") from exc
+
+    def form_bool(name: str):
+        value = form.get(name)
+        if value in (None, ""):
+            return None
+        return str(value).lower() in ("1", "true", "on", "yes")
+
+    try:
+        with db.session.begin():
+            profile = CustomerKYCProfile.query.filter_by(customer_id=customer.id).first()
+            if not profile:
+                profile = CustomerKYCProfile(customer_id=customer.id)
+                db.session.add(profile)
+
+            profile.date_of_birth = form_date("date_of_birth")
+            profile.civil_status = form.get("civil_status") or None
+            profile.permanent_address = {
+                "line1": form.get("permanent_address_line1") or None,
+                "line2": form.get("permanent_address_line2") or None,
+                "city": form.get("permanent_city") or None,
+                "district": form.get("permanent_district") or None,
+                "province": form.get("permanent_province") or None,
+                "postal_code": form.get("permanent_postal_code") or None,
+            }
+            profile.current_address = {
+                "line1": form.get("current_address_line1") or None,
+                "line2": form.get("current_address_line2") or None,
+                "city": form.get("current_city") or None,
+                "district": form.get("current_district") or None,
+                "province": form.get("current_province") or None,
+                "postal_code": form.get("current_postal_code") or None,
+                "since": form.get("current_address_since") or None,
+            }
+            profile.household_size = form_int("household_size")
+            profile.dependents_count = form_int("dependents_count")
+            profile.customer_type = form.get("customer_type") or None
+            profile.employment = {
+                "employer_name": form.get("employer_name") or None,
+                "employer_address": form.get("employer_address") or None,
+                "occupation": form.get("occupation") or None,
+                "monthly_income": form_decimal("monthly_income"),
+            }
+            profile.business = {
+                "business_name": form.get("business_name") or None,
+                "business_address": form.get("business_address") or None,
+            }
+            profile.guarantor = {
+                "name": form.get("guarantor_name") or None,
+                "relationship": form.get("guarantor_relationship") or None,
+                "mobile": form.get("guarantor_mobile") or None,
+            }
+            profile.consents = {
+                "data_processing": form_bool("consent_data_processing"),
+                "credit_checks": form_bool("consent_credit_checks"),
+            }
+
+            def handle_file(field_name: str, doc_type: str):
+                file_storage = files.get(field_name)
+                if not file_storage:
+                    return
+
                 path = save_customer_document_file(customer.id, file_storage, doc_type)
-            except ValueError:
-                upload_failed = True
-                return
-            doc = CustomerDocument(
-                customer_id=customer.id,
-                document_type=doc_type,
-                file_path=path,
-            )
-            db.session.add(doc)
-            saved_types.append(doc_type)
+                doc = CustomerDocument(
+                    customer_id=customer.id,
+                    document_type=doc_type,
+                    file_path=path,
+                )
+                db.session.add(doc)
+                saved_types.append(doc_type)
 
-    handle_file("nic_front", "NIC_FRONT")
-    handle_file("nic_back", "NIC_BACK")
-    handle_file("selfie_nic", "SELFIE_NIC")
-    handle_file("address_proof", "ADDRESS_PROOF")
+            handle_file("nic_front", "NIC_FRONT")
+            handle_file("nic_back", "NIC_BACK")
+            handle_file("selfie_nic", "SELFIE_NIC")
+            handle_file("address_proof", "ADDRESS_PROOF")
 
-    form = request.form
+            if not saved_types:
+                raise ValueError("No files uploaded")
 
-    def set_form_attr(field, cast=str):
-        if field in form and form[field]:
-            setattr(customer, field, cast(form[field]))
+            customer.kyc_status = "SUBMITTED"
 
-    set_form_attr("civil_status")
-    set_form_attr("permanent_address_line1")
-    set_form_attr("permanent_address_line2")
-    set_form_attr("permanent_city")
-    set_form_attr("permanent_district")
-    set_form_attr("permanent_province")
-    set_form_attr("permanent_postal_code")
-    set_form_attr("current_address_line1")
-    set_form_attr("current_address_line2")
-    set_form_attr("current_city")
-    set_form_attr("current_district")
-    set_form_attr("current_province")
-    set_form_attr("current_postal_code")
-    set_form_attr("current_address_since")
-    set_form_attr("customer_type")
-    set_form_attr("employer_name")
-    set_form_attr("employer_address")
-    set_form_attr("occupation")
-    set_form_attr("business_name")
-    set_form_attr("business_address")
-    set_form_attr("guarantor_name")
-    set_form_attr("guarantor_relationship")
-    set_form_attr("guarantor_mobile")
+    except ValueError as exc:
+        db.session.rollback()
+        status_code = 400 if str(exc) == "No files uploaded" else 422
+        return jsonify({"message": str(exc)}), status_code
+    except Exception as exc:
+        db.session.rollback()
+        logger.exception("Failed to submit public KYC for customer code %s", customer_code)
+        return jsonify({"message": f"Failed to submit KYC: {exc}"}), 400
 
-    if "household_size" in form and form["household_size"]:
-        customer.household_size = int(form["household_size"])
-    if "dependents_count" in form and form["dependents_count"]:
-        customer.dependents_count = int(form["dependents_count"])
-
-    if "monthly_income" in form and form["monthly_income"]:
-        try:
-            customer.monthly_income = Decimal(form["monthly_income"])
-        except Exception:
-            pass
-
-    if "date_of_birth" in form and form["date_of_birth"]:
-        try:
-            customer.date_of_birth = date.fromisoformat(form["date_of_birth"])
-        except ValueError:
-            pass
-
-    def form_bool(name):
-        v = form.get(name)
-        return True if v and str(v).lower() in ("1", "true", "on", "yes") else False
-
-    if "consent_data_processing" in form:
-        customer.consent_data_processing = form_bool("consent_data_processing")
-    if "consent_credit_checks" in form:
-        customer.consent_credit_checks = form_bool("consent_credit_checks")
-
-    if upload_failed:
-        return jsonify({"message": "Failed to upload document"}), 500
-
-    if not saved_types:
-        return jsonify({"message": "No files uploaded"}), 400
-
-    if customer.kyc_status in ("PENDING", "UPLOADED"):
-        customer.kyc_status = "UPLOADED"
-
-    db.session.commit()
-
-    return jsonify(
-        {
-            "message": "KYC documents uploaded",
-            "saved_types": saved_types,
-            "kyc_status": customer.kyc_status,
-        }
-    )
+    return jsonify({"success": True, "message": "KYC submitted successfully"})
