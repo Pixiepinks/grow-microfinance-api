@@ -12,7 +12,7 @@ def get_supabase_client() -> Client:
     return _supabase_client
 
 def get_storage_bucket() -> str:
-    return os.environ.get("SUPABASE_BUCKET", "grow-documents")
+    return os.environ.get("SUPABASE_BUCKET_KYC") or os.environ.get("SUPABASE_BUCKET", "grow-documents")
 
 def get_upload_prefix() -> str:
     return os.environ.get("SUPABASE_UPLOAD_FOLDER", "loan_documents")

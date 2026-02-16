@@ -1,7 +1,7 @@
 """Database schema helpers for runtime safety."""
 
 from sqlalchemy import text
-from sqlalchemy.exc import ProgrammingError
+from sqlalchemy.exc import OperationalError, ProgrammingError
 
 from .extensions import db
 
@@ -32,6 +32,6 @@ def ensure_customers_lead_status_column():
         for ddl in ddl_statements:
             try:
                 conn.execute(ddl)
-            except ProgrammingError:
-                # Column already exists or other harmless issue – ignore
+            except (ProgrammingError, OperationalError):
+                # Column already exists, table is not created yet, or other harmless issue – ignore
                 pass

@@ -2,15 +2,20 @@ import logging
 import os
 from datetime import date, datetime
 from decimal import Decimal
+from pathlib import Path
 
 from flask import Blueprint, current_app, jsonify, request
+from werkzeug.utils import secure_filename
 
 from ..extensions import db
 from ..models import Customer, CustomerDocument, CustomerKYCProfile
-from ..supabase_client import build_public_url, get_storage_bucket, get_supabase_client
+from ..supabase_client import build_public_url, get_supabase_client
 from .utils import role_required
 
 logger = logging.getLogger(__name__)
+
+ALLOWED_UPLOAD_EXTENSIONS = {"jpg", "jpeg", "png", "pdf"}
+MAX_UPLOAD_SIZE_BYTES = 10 * 1024 * 1024
 
 customers_bp = Blueprint("customers", __name__, url_prefix="/customers")
 public_bp = Blueprint("public", __name__, url_prefix="/public")
@@ -38,17 +43,39 @@ def _get_customer_by_code(customer_code: str) -> Customer | None:
     return Customer.query.filter_by(customer_code=customer_code).first()
 
 
-def save_customer_document_file(customer_id: int, uploaded_file, document_type: str) -> str:
-    supabase = get_supabase_client()
-    bucket = get_storage_bucket()
+def _storage_configuration_error() -> dict | None:
+    required = ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_BUCKET_KYC"]
+    missing = [key for key in required if not os.getenv(key)]
+    if missing:
+        current_app.logger.error(
+            "KYC storage is not configured. Missing env vars: %s", ", ".join(missing)
+        )
+        return {"error": "storage_not_configured", "missing": missing}
+    return None
 
-    original_name = uploaded_file.filename or f"{document_type}.bin"
+
+def _is_allowed_extension(filename: str) -> bool:
+    suffix = Path(filename).suffix.lower().lstrip(".")
+    return suffix in ALLOWED_UPLOAD_EXTENSIONS
+
+
+def save_customer_document_file(
+    customer_id: int,
+    uploaded_file,
+    document_type: str,
+    file_bytes: bytes,
+) -> tuple[str, str]:
+    supabase = get_supabase_client()
+    bucket = os.environ["SUPABASE_BUCKET_KYC"]
+
+    original_name = secure_filename(uploaded_file.filename or f"{document_type}.bin")
     ext = os.path.splitext(original_name)[1] or ".bin"
     timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-    safe_type = (document_type or "DOC").upper()
+    safe_type = secure_filename((document_type or "DOC").lower())
+    base_name = Path(original_name).stem or "document"
+    safe_name = secure_filename(f"{base_name}{ext}")
 
-    storage_path = f"customer_documents/{customer_id}/{safe_type}_{timestamp}{ext}"
-    file_bytes = uploaded_file.read()
+    storage_path = f"kyc/{customer_id}/{safe_type}/{timestamp}_{safe_name}"
 
     supabase.storage.from_(bucket).upload(
         path=storage_path,
@@ -56,7 +83,7 @@ def save_customer_document_file(customer_id: int, uploaded_file, document_type: 
         file_options={"content-type": uploaded_file.mimetype or "application/octet-stream"},
     )
 
-    return build_public_url(storage_path)
+    return storage_path, build_public_url(storage_path)
 
 
 @customers_bp.route("", methods=["GET"])
@@ -110,38 +137,63 @@ def list_customer_documents(customer_id: int):
 @customers_bp.route("/<int:customer_id>/documents", methods=["POST"])
 @role_required(["admin", "staff"])
 def upload_customer_document(customer_id: int):
+    if request.mimetype != "multipart/form-data":
+        return jsonify({"error": "invalid_content_type", "detail": "multipart/form-data required"}), 400
+
     customer = Customer.query.get(customer_id)
     if not customer:
         return jsonify({"message": "Customer not found"}), 404
 
-    if "file" not in request.files:
-        return jsonify({"message": "No file uploaded"}), 400
-    uploaded_file = request.files["file"]
+    storage_error = _storage_configuration_error()
+    if storage_error:
+        return jsonify(storage_error), 500
+
+    uploaded_file = request.files.get("file") or request.files.get("document")
+    if not uploaded_file:
+        return jsonify({"error": "file_missing"}), 400
+
     document_type = request.form.get("document_type")
     if not document_type:
-        return jsonify({"message": "document_type is required"}), 400
+        return jsonify({"error": "document_type_missing"}), 400
+
+    if not _is_allowed_extension(uploaded_file.filename or ""):
+        return jsonify({"error": "invalid_extension", "allowed": sorted(ALLOWED_UPLOAD_EXTENSIONS)}), 400
 
     try:
-        file_path = save_customer_document_file(customer_id, uploaded_file, document_type)
+        file_bytes = uploaded_file.read()
+        if len(file_bytes) > MAX_UPLOAD_SIZE_BYTES:
+            return jsonify({"error": "file_too_large", "max_size_bytes": MAX_UPLOAD_SIZE_BYTES}), 413
+
+        storage_path, public_url = save_customer_document_file(
+            customer_id=customer_id,
+            uploaded_file=uploaded_file,
+            document_type=document_type,
+            file_bytes=file_bytes,
+        )
 
         doc = CustomerDocument(
             customer_id=customer_id,
             document_type=document_type,
-            file_path=file_path,
+            file_path=storage_path,
             uploaded_at=datetime.utcnow(),
         )
         db.session.add(doc)
         if customer.kyc_status == "PENDING":
             customer.kyc_status = "UPLOADED"
-        db.session.commit()
+        try:
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            logger.exception("Failed to insert KYC document row for customer_id=%s", customer_id)
+            return jsonify({"error": "db_insert_failed"}), 500
     except Exception as e:
         db.session.rollback()
-        logger.exception("Failed to upload customer document")
+        logger.exception("Failed to upload customer document for customer_id=%s", customer_id)
         return (
             jsonify(
                 {
-                    "error": "Failed to upload customer document",
-                    "details": str(e),
+                    "error": "upload_failed",
+                    "detail": str(e)[:300],
                 }
             ),
             500,
@@ -151,10 +203,10 @@ def upload_customer_document(customer_id: int):
         jsonify(
             {
                 "id": doc.id,
+                "customer_id": doc.customer_id,
                 "document_type": doc.document_type,
-                "file_path": doc.file_path,
+                "url": public_url,
                 "uploaded_at": doc.uploaded_at.isoformat() if doc.uploaded_at else None,
-                "kyc_status": customer.kyc_status,
             }
         ),
         201,
