@@ -5,6 +5,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from flask import Blueprint, current_app, jsonify, request
+from sqlalchemy.dialects.postgresql import insert
 from werkzeug.utils import secure_filename
 
 from ..extensions import db
@@ -18,6 +19,7 @@ ALLOWED_UPLOAD_EXTENSIONS = {"jpg", "jpeg", "png", "pdf"}
 MAX_UPLOAD_SIZE_BYTES = 10 * 1024 * 1024
 
 customers_bp = Blueprint("customers", __name__, url_prefix="/customers")
+api_customers_bp = Blueprint("api_customers", __name__, url_prefix="/api/customers")
 public_bp = Blueprint("public", __name__, url_prefix="/public")
 
 
@@ -298,6 +300,57 @@ def update_customer_kyc_profile(customer_id: int):
 
     db.session.commit()
     return jsonify(_serialize_customer(customer))
+
+
+@api_customers_bp.route("/<int:customer_id>/kyc-profile", methods=["POST"])
+@role_required(["admin", "staff"])
+def upsert_customer_kyc_profile(customer_id: int):
+    customer = Customer.query.get(customer_id)
+    if not customer:
+        return jsonify({"message": "Customer not found"}), 404
+
+    data = request.get_json(silent=True) or {}
+
+    stmt = insert(CustomerKYCProfile).values(
+        customer_id=customer_id,
+        date_of_birth=data.get("date_of_birth"),
+        civil_status=data.get("civil_status"),
+        permanent_address=data.get("permanent_address"),
+        current_address=data.get("current_address"),
+        household_size=data.get("household_size"),
+        dependents_count=data.get("dependents_count"),
+        customer_type=data.get("customer_type"),
+        employment=data.get("employment"),
+        business=data.get("business"),
+        guarantor=data.get("guarantor"),
+        consents=data.get("consents"),
+    )
+    stmt = stmt.on_conflict_do_update(
+        index_elements=[CustomerKYCProfile.customer_id],
+        set_={
+            "date_of_birth": stmt.excluded.date_of_birth,
+            "civil_status": stmt.excluded.civil_status,
+            "permanent_address": stmt.excluded.permanent_address,
+            "current_address": stmt.excluded.current_address,
+            "household_size": stmt.excluded.household_size,
+            "dependents_count": stmt.excluded.dependents_count,
+            "customer_type": stmt.excluded.customer_type,
+            "employment": stmt.excluded.employment,
+            "business": stmt.excluded.business,
+            "guarantor": stmt.excluded.guarantor,
+            "consents": stmt.excluded.consents,
+        },
+    )
+
+    try:
+        db.session.execute(stmt)
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        current_app.logger.exception("Failed to save customer KYC profile")
+        return jsonify({"error": "Failed to save KYC profile"}), 500
+
+    return jsonify({"ok": True})
 
 
 @customers_bp.route("/<int:customer_id>/kyc-uploaded", methods=["POST"])
