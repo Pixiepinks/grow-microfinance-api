@@ -3,6 +3,7 @@ from decimal import Decimal
 from werkzeug.security import generate_password_hash, check_password_hash
 from sqlalchemy.orm import relationship
 from sqlalchemy import Numeric, func
+from sqlalchemy.dialects.postgresql import JSONB
 
 from .extensions import db
 
@@ -155,15 +156,15 @@ class CustomerKYCProfile(db.Model):
     customer_id = db.Column(db.Integer, db.ForeignKey("customers.id"), unique=True, nullable=False)
     date_of_birth = db.Column(db.Date, nullable=True)
     civil_status = db.Column(db.String(50), nullable=True)
-    permanent_address = db.Column(db.JSON, nullable=True)
-    current_address = db.Column(db.JSON, nullable=True)
+    permanent_address = db.Column(JSONB, nullable=True)
+    current_address = db.Column(JSONB, nullable=True)
     household_size = db.Column(db.Integer, nullable=True)
     dependents_count = db.Column(db.Integer, nullable=True)
     customer_type = db.Column(db.String(50), nullable=True)
-    employment = db.Column(db.JSON, nullable=True)
-    business = db.Column(db.JSON, nullable=True)
-    guarantor = db.Column(db.JSON, nullable=True)
-    consents = db.Column(db.JSON, nullable=True)
+    employment = db.Column(JSONB, nullable=True)
+    business = db.Column(JSONB, nullable=True)
+    guarantor = db.Column(JSONB, nullable=True)
+    consents = db.Column(JSONB, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
 
     customer = relationship("Customer", back_populates="kyc_profile")
