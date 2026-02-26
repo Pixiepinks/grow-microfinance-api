@@ -5,11 +5,11 @@ from decimal import Decimal
 from pathlib import Path
 
 from flask import Blueprint, current_app, jsonify, request
-from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy import text
 from werkzeug.utils import secure_filename
 
 from ..extensions import db
-from ..models import Customer, CustomerDocument, CustomerKYCProfile
+from ..models import Customer, CustomerDocument
 from ..supabase_client import build_public_url, get_supabase_client
 from .utils import role_required
 
@@ -242,67 +242,151 @@ def get_customer_by_code_admin():
     return jsonify(_serialize_customer(customer))
 
 
-@customers_bp.route("/<int:customer_id>/kyc-profile", methods=["PATCH", "POST"])
+KYC_PROFILE_FIELDS = [
+    "date_of_birth",
+    "civil_status",
+    "permanent_address_line1",
+    "permanent_address_line2",
+    "permanent_city",
+    "permanent_district",
+    "permanent_province",
+    "permanent_postal_code",
+    "current_address_line1",
+    "current_address_line2",
+    "current_city",
+    "current_district",
+    "current_province",
+    "current_postal_code",
+    "current_address_since",
+    "household_size",
+    "dependents_count",
+    "customer_type",
+    "employer_name",
+    "employer_address",
+    "occupation",
+    "monthly_income",
+    "business_name",
+    "business_address",
+    "guarantor_name",
+    "guarantor_relationship",
+    "guarantor_mobile",
+    "consent_data_processing",
+    "consent_credit_checks",
+]
+
+
+def _normalize_kyc_payload(data: dict) -> tuple[dict, dict]:
+    values = {field: data.get(field) for field in KYC_PROFILE_FIELDS}
+    errors: dict[str, str] = {}
+
+    if values["date_of_birth"]:
+        try:
+            date.fromisoformat(str(values["date_of_birth"]))
+        except ValueError:
+            errors["date_of_birth"] = "must be YYYY-MM-DD"
+
+    for int_field in ("household_size", "dependents_count"):
+        if values[int_field] is not None:
+            try:
+                values[int_field] = int(values[int_field])
+            except (TypeError, ValueError):
+                errors[int_field] = "must be an integer"
+
+    if values["monthly_income"] is not None:
+        try:
+            values["monthly_income"] = str(Decimal(str(values["monthly_income"])))
+        except Exception:
+            errors["monthly_income"] = "must be numeric"
+
+    for bool_field in ("consent_data_processing", "consent_credit_checks"):
+        if values[bool_field] is not None:
+            values[bool_field] = bool(values[bool_field])
+
+    return values, errors
+
+
+def _upsert_customer_kyc_profile(customer_id: int, data: dict):
+    values, errors = _normalize_kyc_payload(data)
+    if errors:
+        return jsonify({"error": "validation_error", "fields": errors}), 400
+
+    sql = """
+    INSERT INTO customer_kyc_profiles (
+      customer_id, date_of_birth, civil_status,
+      permanent_address_line1, permanent_address_line2, permanent_city, permanent_district, permanent_province, permanent_postal_code,
+      current_address_line1, current_address_line2, current_city, current_district, current_province, current_postal_code,
+      current_address_since, household_size, dependents_count, customer_type,
+      employer_name, employer_address, occupation, monthly_income,
+      business_name, business_address,
+      guarantor_name, guarantor_relationship, guarantor_mobile,
+      consent_data_processing, consent_credit_checks
+    ) VALUES (
+      :customer_id, :date_of_birth, :civil_status,
+      :permanent_address_line1, :permanent_address_line2, :permanent_city, :permanent_district, :permanent_province, :permanent_postal_code,
+      :current_address_line1, :current_address_line2, :current_city, :current_district, :current_province, :current_postal_code,
+      :current_address_since, :household_size, :dependents_count, :customer_type,
+      :employer_name, :employer_address, :occupation, :monthly_income,
+      :business_name, :business_address,
+      :guarantor_name, :guarantor_relationship, :guarantor_mobile,
+      :consent_data_processing, :consent_credit_checks
+    )
+    ON CONFLICT (customer_id) DO UPDATE SET
+      date_of_birth=EXCLUDED.date_of_birth,
+      civil_status=EXCLUDED.civil_status,
+      permanent_address_line1=EXCLUDED.permanent_address_line1,
+      permanent_address_line2=EXCLUDED.permanent_address_line2,
+      permanent_city=EXCLUDED.permanent_city,
+      permanent_district=EXCLUDED.permanent_district,
+      permanent_province=EXCLUDED.permanent_province,
+      permanent_postal_code=EXCLUDED.permanent_postal_code,
+      current_address_line1=EXCLUDED.current_address_line1,
+      current_address_line2=EXCLUDED.current_address_line2,
+      current_city=EXCLUDED.current_city,
+      current_district=EXCLUDED.current_district,
+      current_province=EXCLUDED.current_province,
+      current_postal_code=EXCLUDED.current_postal_code,
+      current_address_since=EXCLUDED.current_address_since,
+      household_size=EXCLUDED.household_size,
+      dependents_count=EXCLUDED.dependents_count,
+      customer_type=EXCLUDED.customer_type,
+      employer_name=EXCLUDED.employer_name,
+      employer_address=EXCLUDED.employer_address,
+      occupation=EXCLUDED.occupation,
+      monthly_income=EXCLUDED.monthly_income,
+      business_name=EXCLUDED.business_name,
+      business_address=EXCLUDED.business_address,
+      guarantor_name=EXCLUDED.guarantor_name,
+      guarantor_relationship=EXCLUDED.guarantor_relationship,
+      guarantor_mobile=EXCLUDED.guarantor_mobile,
+      consent_data_processing=EXCLUDED.consent_data_processing,
+      consent_credit_checks=EXCLUDED.consent_credit_checks
+    RETURNING *;
+    """
+
+    try:
+        result = db.session.execute(text(sql), {"customer_id": customer_id, **values})
+        row = result.mappings().one()
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        current_app.logger.exception("Failed to save customer KYC profile")
+        return jsonify({"error": "Failed to save KYC profile"}), 500
+
+    return jsonify({"ok": True, "row": dict(row)}), 200
+
+
+@customers_bp.route("/<int:customer_id>/kyc-profile", methods=["PATCH", "OPTIONS"])
 @role_required(["admin", "staff"])
 def update_customer_kyc_profile(customer_id: int):
     customer = Customer.query.get(customer_id)
     if not customer:
         return jsonify({"message": "Customer not found"}), 404
 
-    data = request.get_json() or {}
-
-    def set_attr(field, cast=str):
-        if field in data and data[field] is not None:
-            setattr(customer, field, cast(data[field]))
-
-    set_attr("civil_status")
-    set_attr("permanent_address_line1")
-    set_attr("permanent_address_line2")
-    set_attr("permanent_city")
-    set_attr("permanent_district")
-    set_attr("permanent_province")
-    set_attr("permanent_postal_code")
-    set_attr("current_address_line1")
-    set_attr("current_address_line2")
-    set_attr("current_city")
-    set_attr("current_district")
-    set_attr("current_province")
-    set_attr("current_postal_code")
-    set_attr("current_address_since")
-    set_attr("household_size", int)
-    set_attr("dependents_count", int)
-    set_attr("customer_type")
-    set_attr("employer_name")
-    set_attr("employer_address")
-    set_attr("occupation")
-    set_attr("business_name")
-    set_attr("business_address")
-    set_attr("guarantor_name")
-    set_attr("guarantor_relationship")
-    set_attr("guarantor_mobile")
-
-    if "monthly_income" in data and data["monthly_income"] is not None:
-        try:
-            customer.monthly_income = Decimal(str(data["monthly_income"]))
-        except Exception:
-            pass
-
-    if "date_of_birth" in data and data["date_of_birth"]:
-        try:
-            customer.date_of_birth = date.fromisoformat(data["date_of_birth"])
-        except ValueError:
-            pass
-
-    if "consent_data_processing" in data:
-        customer.consent_data_processing = bool(data["consent_data_processing"])
-    if "consent_credit_checks" in data:
-        customer.consent_credit_checks = bool(data["consent_credit_checks"])
-
-    db.session.commit()
-    return jsonify(_serialize_customer(customer))
+    data = request.get_json(silent=True) or {}
+    return _upsert_customer_kyc_profile(customer_id=customer_id, data=data)
 
 
-@api_customers_bp.route("/<int:customer_id>/kyc-profile", methods=["POST"])
+@api_customers_bp.route("/<int:customer_id>/kyc-profile", methods=["POST", "PATCH", "OPTIONS"])
 @role_required(["admin", "staff"])
 def upsert_customer_kyc_profile(customer_id: int):
     customer = Customer.query.get(customer_id)
@@ -310,47 +394,7 @@ def upsert_customer_kyc_profile(customer_id: int):
         return jsonify({"message": "Customer not found"}), 404
 
     data = request.get_json(silent=True) or {}
-
-    stmt = insert(CustomerKYCProfile).values(
-        customer_id=customer_id,
-        date_of_birth=data.get("date_of_birth"),
-        civil_status=data.get("civil_status"),
-        permanent_address=data.get("permanent_address"),
-        current_address=data.get("current_address"),
-        household_size=data.get("household_size"),
-        dependents_count=data.get("dependents_count"),
-        customer_type=data.get("customer_type"),
-        employment=data.get("employment"),
-        business=data.get("business"),
-        guarantor=data.get("guarantor"),
-        consents=data.get("consents"),
-    )
-    stmt = stmt.on_conflict_do_update(
-        index_elements=[CustomerKYCProfile.customer_id],
-        set_={
-            "date_of_birth": stmt.excluded.date_of_birth,
-            "civil_status": stmt.excluded.civil_status,
-            "permanent_address": stmt.excluded.permanent_address,
-            "current_address": stmt.excluded.current_address,
-            "household_size": stmt.excluded.household_size,
-            "dependents_count": stmt.excluded.dependents_count,
-            "customer_type": stmt.excluded.customer_type,
-            "employment": stmt.excluded.employment,
-            "business": stmt.excluded.business,
-            "guarantor": stmt.excluded.guarantor,
-            "consents": stmt.excluded.consents,
-        },
-    )
-
-    try:
-        db.session.execute(stmt)
-        db.session.commit()
-    except Exception:
-        db.session.rollback()
-        current_app.logger.exception("Failed to save customer KYC profile")
-        return jsonify({"error": "Failed to save KYC profile"}), 500
-
-    return jsonify({"ok": True})
+    return _upsert_customer_kyc_profile(customer_id=customer_id, data=data)
 
 
 @customers_bp.route("/<int:customer_id>/kyc-uploaded", methods=["POST"])

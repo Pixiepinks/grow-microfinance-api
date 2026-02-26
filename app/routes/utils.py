@@ -11,7 +11,7 @@ def role_required(roles):
                 current_app.logger.debug(
                     "CORS preflight for %s %s", request.method, request.path
                 )
-                return current_app.make_default_options_response()
+                return "", 204
 
             verify_jwt_in_request()
             claims = get_jwt()
