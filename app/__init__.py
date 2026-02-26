@@ -3,7 +3,7 @@ from flask import Flask, jsonify
 from flask_cors import CORS
 
 from flask_migrate import stamp, upgrade
-from sqlalchemy import inspect
+from sqlalchemy import inspect, text
 
 from .extensions import db, migrate, jwt, init_jwt_handlers
 from .routes.auth import auth_bp
@@ -48,6 +48,18 @@ def create_app():
 
     with app.app_context():
         ensure_customers_lead_status_column()
+        try:
+            db.session.execute(
+                text(
+                    """
+                    ALTER TABLE customer_kyc_profiles
+                    ADD CONSTRAINT customer_kyc_profiles_customer_id_key UNIQUE (customer_id);
+                    """
+                )
+            )
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
 
     @app.route("/health", methods=["GET"])
     def health_check():

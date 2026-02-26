@@ -306,73 +306,111 @@ def _normalize_kyc_payload(data: dict) -> tuple[dict, dict]:
 
 
 def _upsert_customer_kyc_profile(customer_id: int, data: dict):
-    values, errors = _normalize_kyc_payload(data)
-    if errors:
-        return jsonify({"error": "validation_error", "fields": errors}), 400
+    values = [
+        customer_id,
+        data.get("date_of_birth") or None,
+        data.get("civil_status") or None,
+        data.get("permanent_address_line1") or None,
+        data.get("permanent_address_line2") or None,
+        data.get("permanent_city") or None,
+        data.get("permanent_district") or None,
+        data.get("permanent_province") or None,
+        data.get("permanent_postal_code") or None,
+        data.get("current_address_line1") or None,
+        data.get("current_address_line2") or None,
+        data.get("current_city") or None,
+        data.get("current_district") or None,
+        data.get("current_province") or None,
+        data.get("current_postal_code") or None,
+        data.get("current_address_since") or None,
+        int(data.get("household_size") or 0),
+        int(data.get("dependents_count") or 0),
+        data.get("customer_type") or None,
+        data.get("employer_name") or None,
+        data.get("employer_address") or None,
+        data.get("occupation") or None,
+        Decimal(str(data.get("monthly_income") or 0)),
+        data.get("business_name") or None,
+        data.get("business_address") or None,
+        data.get("guarantor_name") or None,
+        data.get("guarantor_relationship") or None,
+        data.get("guarantor_mobile") or None,
+        bool(data.get("consent_data_processing")),
+        bool(data.get("consent_credit_checks")),
+    ]
 
-    sql = """
-    INSERT INTO customer_kyc_profiles (
-      customer_id, date_of_birth, civil_status,
-      permanent_address_line1, permanent_address_line2, permanent_city, permanent_district, permanent_province, permanent_postal_code,
-      current_address_line1, current_address_line2, current_city, current_district, current_province, current_postal_code,
-      current_address_since, household_size, dependents_count, customer_type,
-      employer_name, employer_address, occupation, monthly_income,
-      business_name, business_address,
-      guarantor_name, guarantor_relationship, guarantor_mobile,
-      consent_data_processing, consent_credit_checks
-    ) VALUES (
-      :customer_id, :date_of_birth, :civil_status,
-      :permanent_address_line1, :permanent_address_line2, :permanent_city, :permanent_district, :permanent_province, :permanent_postal_code,
-      :current_address_line1, :current_address_line2, :current_city, :current_district, :current_province, :current_postal_code,
-      :current_address_since, :household_size, :dependents_count, :customer_type,
-      :employer_name, :employer_address, :occupation, :monthly_income,
-      :business_name, :business_address,
-      :guarantor_name, :guarantor_relationship, :guarantor_mobile,
-      :consent_data_processing, :consent_credit_checks
+    sql = text(
+        """
+        INSERT INTO customer_kyc_profiles (
+          customer_id,
+          date_of_birth, civil_status,
+          permanent_address_line1, permanent_address_line2, permanent_city, permanent_district, permanent_province, permanent_postal_code,
+          current_address_line1, current_address_line2, current_city, current_district, current_province, current_postal_code,
+          current_address_since,
+          household_size, dependents_count, customer_type,
+          employer_name, employer_address, occupation, monthly_income,
+          business_name, business_address,
+          guarantor_name, guarantor_relationship, guarantor_mobile,
+          consent_data_processing, consent_credit_checks,
+          created_at
+        )
+        VALUES (
+          :p1,
+          :p2, :p3,
+          :p4, :p5, :p6, :p7, :p8, :p9,
+          :p10, :p11, :p12, :p13, :p14, :p15,
+          :p16,
+          :p17, :p18, :p19,
+          :p20, :p21, :p22, :p23,
+          :p24, :p25,
+          :p26, :p27, :p28,
+          :p29, :p30,
+          NOW()
+        )
+        ON CONFLICT (customer_id) DO UPDATE SET
+          date_of_birth = EXCLUDED.date_of_birth,
+          civil_status = EXCLUDED.civil_status,
+          permanent_address_line1 = EXCLUDED.permanent_address_line1,
+          permanent_address_line2 = EXCLUDED.permanent_address_line2,
+          permanent_city = EXCLUDED.permanent_city,
+          permanent_district = EXCLUDED.permanent_district,
+          permanent_province = EXCLUDED.permanent_province,
+          permanent_postal_code = EXCLUDED.permanent_postal_code,
+          current_address_line1 = EXCLUDED.current_address_line1,
+          current_address_line2 = EXCLUDED.current_address_line2,
+          current_city = EXCLUDED.current_city,
+          current_district = EXCLUDED.current_district,
+          current_province = EXCLUDED.current_province,
+          current_postal_code = EXCLUDED.current_postal_code,
+          current_address_since = EXCLUDED.current_address_since,
+          household_size = EXCLUDED.household_size,
+          dependents_count = EXCLUDED.dependents_count,
+          customer_type = EXCLUDED.customer_type,
+          employer_name = EXCLUDED.employer_name,
+          employer_address = EXCLUDED.employer_address,
+          occupation = EXCLUDED.occupation,
+          monthly_income = EXCLUDED.monthly_income,
+          business_name = EXCLUDED.business_name,
+          business_address = EXCLUDED.business_address,
+          guarantor_name = EXCLUDED.guarantor_name,
+          guarantor_relationship = EXCLUDED.guarantor_relationship,
+          guarantor_mobile = EXCLUDED.guarantor_mobile,
+          consent_data_processing = EXCLUDED.consent_data_processing,
+          consent_credit_checks = EXCLUDED.consent_credit_checks
+        RETURNING *;
+        """
     )
-    ON CONFLICT (customer_id) DO UPDATE SET
-      date_of_birth=EXCLUDED.date_of_birth,
-      civil_status=EXCLUDED.civil_status,
-      permanent_address_line1=EXCLUDED.permanent_address_line1,
-      permanent_address_line2=EXCLUDED.permanent_address_line2,
-      permanent_city=EXCLUDED.permanent_city,
-      permanent_district=EXCLUDED.permanent_district,
-      permanent_province=EXCLUDED.permanent_province,
-      permanent_postal_code=EXCLUDED.permanent_postal_code,
-      current_address_line1=EXCLUDED.current_address_line1,
-      current_address_line2=EXCLUDED.current_address_line2,
-      current_city=EXCLUDED.current_city,
-      current_district=EXCLUDED.current_district,
-      current_province=EXCLUDED.current_province,
-      current_postal_code=EXCLUDED.current_postal_code,
-      current_address_since=EXCLUDED.current_address_since,
-      household_size=EXCLUDED.household_size,
-      dependents_count=EXCLUDED.dependents_count,
-      customer_type=EXCLUDED.customer_type,
-      employer_name=EXCLUDED.employer_name,
-      employer_address=EXCLUDED.employer_address,
-      occupation=EXCLUDED.occupation,
-      monthly_income=EXCLUDED.monthly_income,
-      business_name=EXCLUDED.business_name,
-      business_address=EXCLUDED.business_address,
-      guarantor_name=EXCLUDED.guarantor_name,
-      guarantor_relationship=EXCLUDED.guarantor_relationship,
-      guarantor_mobile=EXCLUDED.guarantor_mobile,
-      consent_data_processing=EXCLUDED.consent_data_processing,
-      consent_credit_checks=EXCLUDED.consent_credit_checks
-    RETURNING *;
-    """
 
     try:
-        result = db.session.execute(text(sql), {"customer_id": customer_id, **values})
+        params = {f"p{index}": value for index, value in enumerate(values, start=1)}
+        result = db.session.execute(sql, params)
         row = result.mappings().one()
         db.session.commit()
-    except Exception:
+        return jsonify({"ok": True, "row": dict(row)}), 200
+    except Exception as error:
         db.session.rollback()
-        current_app.logger.exception("Failed to save customer KYC profile")
-        return jsonify({"error": "Failed to save KYC profile"}), 500
-
-    return jsonify({"ok": True, "row": dict(row)}), 200
+        print(error)
+        return jsonify({"ok": False, "error": str(error)}), 500
 
 
 @customers_bp.route("/<int:customer_id>/kyc-profile", methods=["PATCH", "OPTIONS"])
