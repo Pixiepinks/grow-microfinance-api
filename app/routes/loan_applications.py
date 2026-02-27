@@ -536,7 +536,7 @@ def submit_application(application_id):
 
 @loan_app_bp.route("", methods=["GET", "OPTIONS"])
 @cross_origin(
-    origins=os.getenv("CORS_ORIGINS", "*"),
+    origins=os.getenv("CORS_ORIGINS", "https://grow-microfinance-app-production.up.railway.app"),
     methods=["GET", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
@@ -617,7 +617,7 @@ def list_applications():
 
 @admin_api_bp.route("/loan-applications", methods=["GET", "OPTIONS"])
 @cross_origin(
-    origins=os.getenv("CORS_ORIGINS", "*"),
+    origins=os.getenv("CORS_ORIGINS", "https://grow-microfinance-app-production.up.railway.app"),
     methods=["GET", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
@@ -681,7 +681,7 @@ def _serialize_admin_customer(customer: Customer) -> dict:
 
 @admin_api_bp.route("/admin/customers", methods=["GET", "OPTIONS"])
 @cross_origin(
-    origins=os.getenv("CORS_ORIGINS", "*"),
+    origins=os.getenv("CORS_ORIGINS", "https://grow-microfinance-app-production.up.railway.app"),
     methods=["GET", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
@@ -707,15 +707,15 @@ def admin_list_customers():
         return jsonify({"message": "Failed to load customers"}), 500
 
 
-@admin_api_bp.route("/admin/customers/<int:customer_id>", methods=["GET", "OPTIONS"])
+@admin_api_bp.route("/admin/customers/<int:customer_id>", methods=["GET", "PUT", "OPTIONS"])
 @cross_origin(
-    origins=os.getenv("CORS_ORIGINS", "*"),
-    methods=["GET", "OPTIONS"],
+    origins=os.getenv("CORS_ORIGINS", "https://grow-microfinance-app-production.up.railway.app"),
+    methods=["GET", "PUT", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
 @role_required(["admin"])
-def admin_get_customer(customer_id: int):
-    """Return a single customer for the admin dashboard."""
+def admin_customer_detail(customer_id: int):
+    """Return or update a single customer for the admin dashboard."""
 
     logger = current_app.logger
     try:
@@ -723,12 +723,41 @@ def admin_get_customer(customer_id: int):
         if not customer:
             return jsonify({"message": "Customer not found"}), 404
 
+        if request.method == "PUT":
+            payload = request.get_json(silent=True) or {}
+            updatable_fields = {
+                "full_name",
+                "nic_number",
+                "mobile",
+                "address",
+                "business_type",
+                "status",
+                "lead_status",
+                "kyc_status",
+                "eligibility_status",
+            }
+
+            updated = False
+            for field in updatable_fields:
+                if field in payload:
+                    setattr(customer, field, payload[field])
+                    updated = True
+
+            if not updated:
+                return jsonify({"message": "No supported fields provided"}), 400
+
+            db.session.commit()
+            response = jsonify({"success": True, "customer": _serialize_admin_customer(customer)})
+            logger.info("Handled %s %s with status %s", request.method, request.path, 200)
+            return response
+
         response = jsonify({"success": True, "customer": _serialize_admin_customer(customer)})
         logger.info("Handled %s %s with status %s", request.method, request.path, 200)
         return response
     except Exception as exc:  # pragma: no cover - defensive logging
+        db.session.rollback()
         logger.exception("Error handling %s %s: %s", request.method, request.path, exc)
-        return jsonify({"message": "Failed to load customer"}), 500
+        return jsonify({"message": "Failed to process customer"}), 500
 
 
 @loan_app_bp.route("/awaiting-review", methods=["GET", "OPTIONS"])

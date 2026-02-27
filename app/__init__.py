@@ -1,5 +1,5 @@
 import os
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 from flask_migrate import stamp, upgrade
@@ -30,10 +30,22 @@ def create_app():
     jwt.init_app(app)
     init_jwt_handlers(app)
 
+    configured_origins = app.config.get("CORS_ORIGINS", [])
+    if isinstance(configured_origins, str):
+        configured_origins = [origin.strip() for origin in configured_origins.split(",") if origin.strip()]
+
     CORS(
         app,
-        resources={r"/*": {"origins": app.config.get("CORS_ORIGINS", "*")}},
+        resources={r"/*": {"origins": configured_origins}},
+        supports_credentials=True,
+        allow_headers=["Authorization", "Content-Type"],
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     )
+
+    @app.before_request
+    def handle_preflight_requests():
+        if request.method == "OPTIONS":
+            return "", 204
 
     app.register_blueprint(auth_bp)
     app.register_blueprint(admin_bp)
