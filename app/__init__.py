@@ -10,7 +10,7 @@ from .routes.auth import auth_bp
 from .routes.admin import admin_bp
 from .routes.staff import staff_bp
 from .routes.customer import customer_bp
-from .routes.customers import api_customers_bp, customers_bp, public_bp
+from .routes.customers import admin_api_customers_bp, api_customers_bp, customers_bp, public_bp
 from .routes.loan_applications import admin_api_bp, loan_app_bp
 from .routes.leads import leads_bp
 from .schema_fix import ensure_customers_lead_status_column
@@ -54,6 +54,7 @@ def create_app():
     app.register_blueprint(customer_bp)
     app.register_blueprint(customers_bp)
     app.register_blueprint(api_customers_bp)
+    app.register_blueprint(admin_api_customers_bp)
     app.register_blueprint(public_bp)
     app.register_blueprint(loan_app_bp)
     app.register_blueprint(leads_bp)
