@@ -20,6 +20,7 @@ MAX_UPLOAD_SIZE_BYTES = 10 * 1024 * 1024
 
 customers_bp = Blueprint("customers", __name__, url_prefix="/customers")
 api_customers_bp = Blueprint("api_customers", __name__, url_prefix="/api/customers")
+admin_api_customers_bp = Blueprint("admin_api_customers", __name__, url_prefix="/api/admin/customers")
 public_bp = Blueprint("public", __name__, url_prefix="/public")
 
 
@@ -433,6 +434,34 @@ def upsert_customer_kyc_profile(customer_id: int):
 
     data = request.get_json(silent=True) or {}
     return _upsert_customer_kyc_profile(customer_id=customer_id, data=data)
+
+
+@admin_api_customers_bp.route("/<int:customer_id>/kyc-profile", methods=["GET", "PUT", "PATCH", "OPTIONS"])
+@role_required(["admin", "staff"])
+def admin_customer_kyc_profile(customer_id: int):
+    customer = Customer.query.get(customer_id)
+    if not customer:
+        return jsonify({"message": "Customer not found"}), 404
+
+    if request.method == "GET":
+        profile = customer.kyc_profile
+        if not profile:
+            return jsonify({"customer_id": customer_id, "kyc_profile": None}), 200
+
+        profile_data = {field: getattr(profile, field) for field in KYC_PROFILE_FIELDS}
+        if profile.date_of_birth:
+            profile_data["date_of_birth"] = profile.date_of_birth.isoformat()
+        if profile.monthly_income is not None:
+            profile_data["monthly_income"] = float(profile.monthly_income)
+
+        return jsonify({"customer_id": customer_id, "kyc_profile": profile_data}), 200
+
+    data = request.get_json(silent=True) or {}
+    normalized_data, errors = _normalize_kyc_payload(data)
+    if errors:
+        return jsonify({"message": "Invalid KYC profile payload", "errors": errors}), 400
+
+    return _upsert_customer_kyc_profile(customer_id=customer_id, data=normalized_data)
 
 
 @customers_bp.route("/<int:customer_id>/kyc-uploaded", methods=["POST"])
