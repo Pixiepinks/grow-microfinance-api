@@ -3,7 +3,7 @@ from io import BytesIO
 from flask_jwt_extended import create_access_token
 
 from app.extensions import db
-from app.models import Customer, CustomerDocument, User
+from app.models import Customer, CustomerDocument, CustomerKYCProfile, User
 
 
 def _create_user(role: str, name: str, email: str) -> User:
@@ -96,6 +96,51 @@ def test_upload_customer_document_happy_path(app, client, monkeypatch):
     assert body["document_type"] == "NIC_FRONT"
     assert body["url"].endswith(f"kyc/{customer.id}/nic_front/20260101010101_nic-front.jpg")
     assert body["uploaded_at"] is not None
+
+    doc = CustomerDocument.query.filter_by(customer_id=customer.id, document_type="NIC_FRONT").first()
+    assert doc is not None
+    assert doc.file_path.startswith("kyc/")
+
+
+def test_public_kyc_upload_creates_profile_and_document(app, client, monkeypatch):
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "service-role")
+    monkeypatch.setenv("SUPABASE_BUCKET_KYC", "kyc-bucket")
+
+    customer_user = _create_user("customer", "Customer Three", "customer-upload-3@example.com")
+    customer = _create_customer(customer_user, code="CUST-00003")
+
+    def fake_save(customer_id, uploaded_file, document_type, file_bytes):
+        assert customer_id == customer.id
+        assert document_type == "NIC_FRONT"
+        assert uploaded_file.filename == "nic-front.jpg"
+        assert file_bytes == b"public-image-data"
+        return (
+            f"kyc/{customer.id}/nic_front/20260101010101_nic-front.jpg",
+            f"https://example.supabase.co/storage/v1/object/public/kyc-bucket/kyc/{customer.id}/nic_front/20260101010101_nic-front.jpg",
+        )
+
+    monkeypatch.setattr("app.routes.customers.save_customer_document_file", fake_save)
+
+    response = client.post(
+        f"/public/customers/{customer.customer_code}/kyc-upload",
+        data={
+            "date_of_birth": "1999-01-01",
+            "household_size": "4",
+            "dependents_count": "2",
+            "nic_front": (BytesIO(b"public-image-data"), "nic-front.jpg"),
+        },
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["success"] is True
+
+    profile = CustomerKYCProfile.query.filter_by(customer_id=customer.id).first()
+    assert profile is not None
+    assert str(profile.date_of_birth) == "1999-01-01"
+    assert profile.household_size == 4
+    assert profile.dependents_count == 2
 
     doc = CustomerDocument.query.filter_by(customer_id=customer.id, document_type="NIC_FRONT").first()
     assert doc is not None
