@@ -9,7 +9,7 @@ from sqlalchemy import text
 from werkzeug.utils import secure_filename
 
 from ..extensions import db
-from ..models import Customer, CustomerDocument
+from ..models import Customer, CustomerDocument, CustomerKYCProfile
 from ..supabase_client import build_public_url, get_supabase_client
 from .utils import role_required
 
@@ -712,7 +712,16 @@ def public_kyc_upload(customer_code: str):
             if not file_storage:
                 return
 
-            path = save_customer_document_file(customer.id, file_storage, doc_type)
+            file_bytes = file_storage.read()
+            if len(file_bytes) > MAX_UPLOAD_SIZE_BYTES:
+                raise ValueError(f"{doc_type} exceeds max size {MAX_UPLOAD_SIZE_BYTES} bytes")
+
+            path, _public_url = save_customer_document_file(
+                customer_id=customer.id,
+                uploaded_file=file_storage,
+                document_type=doc_type,
+                file_bytes=file_bytes,
+            )
             doc = CustomerDocument(
                 customer_id=customer.id,
                 document_type=doc_type,
