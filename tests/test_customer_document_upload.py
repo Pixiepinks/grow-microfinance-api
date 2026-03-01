@@ -145,3 +145,40 @@ def test_public_kyc_upload_creates_profile_and_document(app, client, monkeypatch
     doc = CustomerDocument.query.filter_by(customer_id=customer.id, document_type="NIC_FRONT").first()
     assert doc is not None
     assert doc.file_path.startswith("kyc/")
+
+
+def test_public_kyc_upload_json_maps_nested_payload_to_flat_columns(app, client):
+    customer_user = _create_user("customer", "Customer Four", "customer-upload-4@example.com")
+    customer = _create_customer(customer_user, code="CUST-00004")
+
+    response = client.post(
+        f"/public/customers/{customer.customer_code}/kyc-upload",
+        json={
+            "permanent_address": {"line1": "12 Main St", "city": "Colombo"},
+            "employment": {"employer_name": "Grow Inc", "monthly_income": ""},
+            "consents": {"data_processing": True},
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["success"] is True
+
+    profile = CustomerKYCProfile.query.filter_by(customer_id=customer.id).first()
+    assert profile is not None
+    assert profile.permanent_address_line1 == "12 Main St"
+    assert profile.permanent_city == "Colombo"
+    assert profile.employer_name == "Grow Inc"
+    assert profile.monthly_income is None
+    assert profile.consent_data_processing is True
+
+    patch_response = client.post(
+        f"/public/customers/{customer.customer_code}/kyc-upload",
+        json={"consents": {"credit_checks": True}},
+    )
+
+    assert patch_response.status_code == 200
+
+    db.session.refresh(profile)
+    assert profile.permanent_address_line1 == "12 Main St"
+    assert profile.consent_data_processing is True
+    assert profile.consent_credit_checks is True
