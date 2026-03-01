@@ -3,7 +3,6 @@ from decimal import Decimal
 from werkzeug.security import generate_password_hash, check_password_hash
 from sqlalchemy.orm import relationship
 from sqlalchemy import Numeric, func
-from sqlalchemy.dialects.postgresql import JSONB
 
 from .extensions import db
 
@@ -184,13 +183,6 @@ class CustomerKYCProfile(db.Model):
     consent_data_processing = db.Column(db.Boolean, nullable=True)
     consent_credit_checks = db.Column(db.Boolean, nullable=True)
 
-    # Backward-compatible JSON payload columns used by older clients.
-    permanent_address = db.Column(JSONB, nullable=True)
-    current_address = db.Column(JSONB, nullable=True)
-    employment = db.Column(JSONB, nullable=True)
-    business = db.Column(JSONB, nullable=True)
-    guarantor = db.Column(JSONB, nullable=True)
-    consents = db.Column(JSONB, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
 
     customer = relationship("Customer", back_populates="kyc_profile")

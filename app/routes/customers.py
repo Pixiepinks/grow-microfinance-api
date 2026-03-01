@@ -306,6 +306,106 @@ def _normalize_kyc_payload(data: dict) -> tuple[dict, dict]:
     return values, errors
 
 
+def _coerce_optional_decimal(value):
+    if value in (None, ""):
+        return None
+    try:
+        return str(Decimal(str(value)))
+    except Exception:
+        return None
+
+
+def _coerce_optional_bool(value):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "on", "yes"}:
+            return True
+        if normalized in {"0", "false", "off", "no"}:
+            return False
+    return None
+
+
+def normalize_public_kyc_payload(payload: dict) -> dict:
+    normalized: dict[str, object] = {}
+    mapping = {
+        "permanent_address": {
+            "line1": "permanent_address_line1",
+            "line2": "permanent_address_line2",
+            "city": "permanent_city",
+            "district": "permanent_district",
+            "province": "permanent_province",
+            "postal_code": "permanent_postal_code",
+        },
+        "current_address": {
+            "line1": "current_address_line1",
+            "line2": "current_address_line2",
+            "city": "current_city",
+            "district": "current_district",
+            "province": "current_province",
+            "postal_code": "current_postal_code",
+            "since": "current_address_since",
+        },
+        "employment": {
+            "employer_name": "employer_name",
+            "employer_address": "employer_address",
+            "occupation": "occupation",
+            "monthly_income": "monthly_income",
+        },
+        "business": {
+            "business_name": "business_name",
+            "business_address": "business_address",
+        },
+        "guarantor": {
+            "name": "guarantor_name",
+            "relationship": "guarantor_relationship",
+            "mobile": "guarantor_mobile",
+        },
+        "consents": {
+            "data_processing": "consent_data_processing",
+            "credit_checks": "consent_credit_checks",
+        },
+    }
+
+    for nested_key, nested_fields in mapping.items():
+        nested_data = payload.get(nested_key)
+        if not isinstance(nested_data, dict):
+            continue
+        for source_key, target_key in nested_fields.items():
+            if source_key in nested_data:
+                value = nested_data.get(source_key)
+                if target_key == "monthly_income":
+                    normalized[target_key] = _coerce_optional_decimal(value)
+                elif target_key in {"consent_data_processing", "consent_credit_checks"}:
+                    normalized[target_key] = _coerce_optional_bool(value)
+                else:
+                    normalized[target_key] = value
+
+    return normalized
+
+
+def _merge_public_flat_fields(payload: dict, normalized: dict) -> dict:
+    merged = dict(normalized)
+    for field in KYC_PROFILE_FIELDS:
+        if field not in payload:
+            continue
+
+        value = payload.get(field)
+        if field == "monthly_income":
+            merged[field] = _coerce_optional_decimal(value)
+            continue
+        if field in {"consent_data_processing", "consent_credit_checks"}:
+            merged[field] = _coerce_optional_bool(value)
+            continue
+        merged[field] = value
+    return merged
+
+
 def _upsert_customer_kyc_profile(customer_id: int, data: dict):
     values = [
         customer_id,
@@ -617,6 +717,7 @@ def public_get_customer_by_code():
 
 @public_bp.route("/customers/<customer_code>/kyc-upload", methods=["POST"])
 def public_kyc_upload(customer_code: str):
+    payload = request.get_json(silent=True) if request.is_json else None
     form = request.form
     files = request.files
     saved_types: list[str] = []
@@ -664,47 +765,57 @@ def public_kyc_upload(customer_code: str):
             profile = CustomerKYCProfile(customer_id=customer.id)
             db.session.add(profile)
 
-        profile.date_of_birth = form_date("date_of_birth")
-        profile.civil_status = form.get("civil_status") or None
-        profile.permanent_address = {
-            "line1": form.get("permanent_address_line1") or None,
-            "line2": form.get("permanent_address_line2") or None,
-            "city": form.get("permanent_city") or None,
-            "district": form.get("permanent_district") or None,
-            "province": form.get("permanent_province") or None,
-            "postal_code": form.get("permanent_postal_code") or None,
-        }
-        profile.current_address = {
-            "line1": form.get("current_address_line1") or None,
-            "line2": form.get("current_address_line2") or None,
-            "city": form.get("current_city") or None,
-            "district": form.get("current_district") or None,
-            "province": form.get("current_province") or None,
-            "postal_code": form.get("current_postal_code") or None,
-            "since": form.get("current_address_since") or None,
-        }
-        profile.household_size = form_int("household_size")
-        profile.dependents_count = form_int("dependents_count")
-        profile.customer_type = form.get("customer_type") or None
-        profile.employment = {
-            "employer_name": form.get("employer_name") or None,
-            "employer_address": form.get("employer_address") or None,
-            "occupation": form.get("occupation") or None,
-            "monthly_income": form_decimal("monthly_income"),
-        }
-        profile.business = {
-            "business_name": form.get("business_name") or None,
-            "business_address": form.get("business_address") or None,
-        }
-        profile.guarantor = {
-            "name": form.get("guarantor_name") or None,
-            "relationship": form.get("guarantor_relationship") or None,
-            "mobile": form.get("guarantor_mobile") or None,
-        }
-        profile.consents = {
-            "data_processing": form_bool("consent_data_processing"),
-            "credit_checks": form_bool("consent_credit_checks"),
-        }
+        if payload is not None:
+            normalized = normalize_public_kyc_payload(payload)
+            merged_data = _merge_public_flat_fields(payload, normalized)
+
+            if "date_of_birth" in merged_data:
+                value = merged_data.get("date_of_birth")
+                if value in (None, ""):
+                    profile.date_of_birth = None
+                else:
+                    profile.date_of_birth = date.fromisoformat(str(value))
+
+            for field in KYC_PROFILE_FIELDS:
+                if field == "date_of_birth" or field not in merged_data:
+                    continue
+                value = merged_data.get(field)
+                if field in {"monthly_income"}:
+                    setattr(profile, field, Decimal(str(value)) if value not in (None, "") else None)
+                elif field in {"household_size", "dependents_count"}:
+                    setattr(profile, field, int(value) if value not in (None, "") else None)
+                else:
+                    setattr(profile, field, value)
+        else:
+            profile.date_of_birth = form_date("date_of_birth")
+            profile.civil_status = form.get("civil_status") or None
+            profile.permanent_address_line1 = form.get("permanent_address_line1") or None
+            profile.permanent_address_line2 = form.get("permanent_address_line2") or None
+            profile.permanent_city = form.get("permanent_city") or None
+            profile.permanent_district = form.get("permanent_district") or None
+            profile.permanent_province = form.get("permanent_province") or None
+            profile.permanent_postal_code = form.get("permanent_postal_code") or None
+            profile.current_address_line1 = form.get("current_address_line1") or None
+            profile.current_address_line2 = form.get("current_address_line2") or None
+            profile.current_city = form.get("current_city") or None
+            profile.current_district = form.get("current_district") or None
+            profile.current_province = form.get("current_province") or None
+            profile.current_postal_code = form.get("current_postal_code") or None
+            profile.current_address_since = form.get("current_address_since") or None
+            profile.household_size = form_int("household_size")
+            profile.dependents_count = form_int("dependents_count")
+            profile.customer_type = form.get("customer_type") or None
+            profile.employer_name = form.get("employer_name") or None
+            profile.employer_address = form.get("employer_address") or None
+            profile.occupation = form.get("occupation") or None
+            profile.monthly_income = form_decimal("monthly_income")
+            profile.business_name = form.get("business_name") or None
+            profile.business_address = form.get("business_address") or None
+            profile.guarantor_name = form.get("guarantor_name") or None
+            profile.guarantor_relationship = form.get("guarantor_relationship") or None
+            profile.guarantor_mobile = form.get("guarantor_mobile") or None
+            profile.consent_data_processing = form_bool("consent_data_processing")
+            profile.consent_credit_checks = form_bool("consent_credit_checks")
 
         def handle_file(field_names: str | tuple[str, ...], doc_type: str):
             normalized_names = (field_names,) if isinstance(field_names, str) else field_names
@@ -735,7 +846,7 @@ def public_kyc_upload(customer_code: str):
         handle_file(("selfie_nic", "selfieNic", "selfie_with_nic"), "SELFIE_NIC")
         handle_file(("address_proof", "addressProof"), "ADDRESS_PROOF")
 
-        if not saved_types:
+        if payload is None and not saved_types:
             raise ValueError("No files uploaded")
 
         customer.kyc_status = "SUBMITTED"
