@@ -106,7 +106,9 @@ def create_customer():
     if User.query.filter_by(email=user_data["email"]).first():
         return jsonify({"message": "User already exists"}), 400
 
-    user = User(email=user_data["email"], name=user_data.get("name", ""), role="customer")
+    user = User(
+        email=user_data["email"], name=user_data.get("name", ""), role="customer"
+    )
     user.set_password(user_data["password"])
 
     customer = Customer(
@@ -210,7 +212,7 @@ def list_loans():
 @role_required(["admin"])
 def dashboard():
     total_customers = Customer.query.count()
-    active_loans = Loan.query.filter_by(status="Active").all()
+    active_loans = Loan.query.filter(Loan.status.in_(["Active", "ACTIVE"])).all()
     total_active_loans = len(active_loans)
     total_outstanding = sum((loan.outstanding for loan in active_loans), Decimal("0"))
 
@@ -251,10 +253,12 @@ def list_loan_application_documents():
                 "document_type": document.document_type,
                 "file_path": file_path,
                 "file_url": build_public_url(file_path) if file_path else None,
-                "uploaded_at": document.uploaded_at.isoformat()
-                if document.uploaded_at
-                else None,
-                "application_number": getattr(loan_application, "application_number", None),
+                "uploaded_at": (
+                    document.uploaded_at.isoformat() if document.uploaded_at else None
+                ),
+                "application_number": getattr(
+                    loan_application, "application_number", None
+                ),
                 "application_status": getattr(loan_application, "status", None),
                 "loan_type": getattr(loan_application, "loan_type", None),
                 "customer_code": getattr(customer, "customer_code", None),

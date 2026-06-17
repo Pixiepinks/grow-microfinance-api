@@ -60,7 +60,10 @@ def record_payment():
         return jsonify({"message": "Loan not found"}), 404
 
     if str(loan.status).lower() != "active":
-        return jsonify({"message": "Payments can only be recorded for active loans"}), 400
+        return (
+            jsonify({"message": "Payments can only be recorded for active loans"}),
+            400,
+        )
 
     collection_date = data.get("collection_date")
     try:
@@ -68,7 +71,10 @@ def record_payment():
             date.fromisoformat(collection_date) if collection_date else date.today()
         )
     except Exception:
-        return jsonify({"message": "collection_date must be ISO formatted (YYYY-MM-DD)"}), 400
+        return (
+            jsonify({"message": "collection_date must be ISO formatted (YYYY-MM-DD)"}),
+            400,
+        )
 
     payment = Payment(
         loan_id=loan_id,
@@ -108,7 +114,7 @@ def today_collections():
 def active_loans():
     logger = current_app.logger
     try:
-        loans = Loan.query.filter_by(status="Active").all()
+        loans = Loan.query.filter(Loan.status.in_(["Active", "ACTIVE"])).all()
         results = []
 
         for loan in loans:
@@ -166,9 +172,7 @@ def staff_loan_applications():
         logger.info("Handled %s %s with status %s", request.method, request.path, 200)
         return response
     except Exception as exc:  # pragma: no cover - defensive logging
-        logger.exception(
-            "Error handling %s %s: %s", request.method, request.path, exc
-        )
+        logger.exception("Error handling %s %s: %s", request.method, request.path, exc)
         return jsonify({"message": "Failed to load loan applications"}), 500
 
 
@@ -194,9 +198,7 @@ def staff_approve_application(application_id):
                 400,
             )
 
-        transition_error = apply_status_transition(
-            application, STATUS_STAFF_APPROVED
-        )
+        transition_error = apply_status_transition(application, STATUS_STAFF_APPROVED)
         if transition_error:
             return transition_error
 
@@ -210,9 +212,7 @@ def staff_approve_application(application_id):
         )
         return jsonify(build_application_response(application))
     except Exception as exc:  # pragma: no cover - defensive logging
-        logger.exception(
-            "Error handling %s %s: %s", request.method, request.path, exc
-        )
+        logger.exception("Error handling %s %s: %s", request.method, request.path, exc)
         db.session.rollback()
         return jsonify({"message": "Failed to approve application"}), 500
 

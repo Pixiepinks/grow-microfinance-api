@@ -1,6 +1,6 @@
 import os
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Dict, List, Optional
 
@@ -15,9 +15,8 @@ from app.supabase_client import (
     get_upload_prefix,
 )
 from ..extensions import db
-from ..models import Customer, LoanApplication, LoanApplicationDocument
+from ..models import Customer, Loan, LoanApplication, LoanApplicationDocument
 from .utils import role_required
-
 
 loan_app_bp = Blueprint("loan_applications", __name__, url_prefix="/loan-applications")
 admin_api_bp = Blueprint("admin_api", __name__, url_prefix="/api")
@@ -35,13 +34,14 @@ STATUS_SUBMITTED = "SUBMITTED"
 STATUS_STAFF_APPROVED = "STAFF_APPROVED"
 STATUS_APPROVED = "APPROVED"
 STATUS_REJECTED = "REJECTED"
+STATUS_DISBURSED = "DISBURSED"
 
 STATUS_TRANSITIONS = {
     "staff": {
         STATUS_SUBMITTED: {STATUS_STAFF_APPROVED, STATUS_REJECTED},
     },
     "admin": {
-        STATUS_SUBMITTED: {STATUS_STAFF_APPROVED},
+        STATUS_SUBMITTED: {STATUS_APPROVED, STATUS_REJECTED, STATUS_STAFF_APPROVED},
         STATUS_STAFF_APPROVED: {STATUS_APPROVED, STATUS_REJECTED},
     },
 }
@@ -106,7 +106,8 @@ TYPE_ALL_FIELDS: Dict[str, List[str]] = {
         "guarantor_mobile",
         "guarantor_relationship",
     ],
-    "GROW_TEAM": TYPE_REQUIRED_FIELDS["GROW_TEAM"] + ["member_list_document", "group_photo"],
+    "GROW_TEAM": TYPE_REQUIRED_FIELDS["GROW_TEAM"]
+    + ["member_list_document", "group_photo"],
 }
 
 COMMON_REQUIRED_DOCUMENTS = {"NIC_FRONT", "NIC_BACK", "SELFIE_NIC"}
@@ -163,7 +164,9 @@ def _parse_iso_date(value):
             try:
                 return date.fromisoformat(value[:10])
             except Exception:
-                current_app.logger.warning(f"Invalid date format for date_of_birth: {value}")
+                current_app.logger.warning(
+                    f"Invalid date format for date_of_birth: {value}"
+                )
                 return None
 
     return None
@@ -210,7 +213,8 @@ def load_customer_id_from_request() -> Optional[int]:
         if customer:
             return customer.id
         current_app.logger.warning(
-            "Customer profile missing for user_id=%s while creating application", user_id
+            "Customer profile missing for user_id=%s while creating application",
+            user_id,
         )
         return None
     payload = request.get_json(silent=True) or {}
@@ -275,18 +279,30 @@ def validate_required_documents(application: LoanApplication) -> List[str]:
             "Missing required documents: " + ", ".join(sorted(missing_common))
         )
 
-    type_missing = TYPE_DOCUMENT_REQUIREMENTS.get(application.loan_type, set()) - existing
+    type_missing = (
+        TYPE_DOCUMENT_REQUIREMENTS.get(application.loan_type, set()) - existing
+    )
     if type_missing:
         errors.append(
             "Missing required documents for "
-            f"{application.loan_type}: "
-            + ", ".join(sorted(type_missing))
+            f"{application.loan_type}: " + ", ".join(sorted(type_missing))
         )
 
-    if application.loan_type == "GROW_ONLINE_BUSINESS" and "STORE_SCREENSHOT" not in existing:
+    if (
+        application.loan_type == "GROW_ONLINE_BUSINESS"
+        and "STORE_SCREENSHOT" not in existing
+    ):
         errors.append("At least one store screenshot is required")
 
     return errors
+
+
+def available_application_actions(application: LoanApplication) -> List[str]:
+    if application.status == STATUS_SUBMITTED:
+        return ["approve", "reject"]
+    if application.status == STATUS_APPROVED:
+        return ["disburse"]
+    return []
 
 
 def build_application_response(application: LoanApplication) -> dict:
@@ -299,15 +315,31 @@ def build_application_response(application: LoanApplication) -> dict:
         "customer_code": customer.customer_code if customer else None,
         "loan_type": application.loan_type,
         "status": application.status,
-        "applied_amount": float(application.applied_amount) if application.applied_amount is not None else None,
+        "applied_amount": (
+            float(application.applied_amount)
+            if application.applied_amount is not None
+            else None
+        ),
         "tenure_months": application.tenure_months,
-        "interest_rate": float(application.interest_rate) if application.interest_rate is not None else None,
-        "approved_amount": float(application.approved_amount) if application.approved_amount is not None else None,
+        "interest_rate": (
+            float(application.interest_rate)
+            if application.interest_rate is not None
+            else None
+        ),
+        "approved_amount": (
+            float(application.approved_amount)
+            if application.approved_amount is not None
+            else None
+        ),
         "approved_tenure": application.approved_tenure,
         "review_notes": application.review_notes,
         "reject_reason": application.reject_reason,
-        "submitted_at": application.submitted_at.isoformat() if application.submitted_at else None,
-        "approved_at": application.approved_at.isoformat() if application.approved_at else None,
+        "submitted_at": (
+            application.submitted_at.isoformat() if application.submitted_at else None
+        ),
+        "approved_at": (
+            application.approved_at.isoformat() if application.approved_at else None
+        ),
         "full_name": application.full_name,
         "nic_number": application.nic_number,
         "mobile_number": application.mobile_number,
@@ -317,9 +349,19 @@ def build_application_response(application: LoanApplication) -> dict:
         "city": application.city,
         "district": application.district,
         "province": application.province,
-        "date_of_birth": application.date_of_birth.isoformat() if application.date_of_birth else None,
-        "monthly_income": float(application.monthly_income) if application.monthly_income is not None else None,
-        "monthly_expenses": float(application.monthly_expenses) if application.monthly_expenses is not None else None,
+        "date_of_birth": (
+            application.date_of_birth.isoformat() if application.date_of_birth else None
+        ),
+        "monthly_income": (
+            float(application.monthly_income)
+            if application.monthly_income is not None
+            else None
+        ),
+        "monthly_expenses": (
+            float(application.monthly_expenses)
+            if application.monthly_expenses is not None
+            else None
+        ),
         "has_existing_loans": application.has_existing_loans,
         "existing_loan_details": application.existing_loan_details,
         "extra_data": application.extra_data or {},
@@ -332,9 +374,14 @@ def build_application_response(application: LoanApplication) -> dict:
             }
             for d in application.documents
         ],
-        "created_at": application.created_at.isoformat() if application.created_at else None,
-        "updated_at": application.updated_at.isoformat() if application.updated_at else None,
+        "created_at": (
+            application.created_at.isoformat() if application.created_at else None
+        ),
+        "updated_at": (
+            application.updated_at.isoformat() if application.updated_at else None
+        ),
         "assigned_officer_id": application.assigned_officer_id,
+        "available_actions": available_application_actions(application),
     }
 
 
@@ -348,19 +395,23 @@ def assert_application_access(application: LoanApplication) -> Optional[tuple]:
     return None
 
 
-def apply_status_transition(application: LoanApplication, target_status: str) -> Optional[tuple]:
+def apply_status_transition(
+    application: LoanApplication, target_status: str
+) -> Optional[tuple]:
     claims = get_jwt()
     role = claims.get("role")
     allowed = STATUS_TRANSITIONS.get(role, {}).get(application.status, set())
 
     if target_status not in allowed:
         return (
-            jsonify({
-                "message": "Invalid status transition",
-                "from": application.status,
-                "to": target_status,
-                "role": role,
-            }),
+            jsonify(
+                {
+                    "message": "Invalid status transition",
+                    "from": application.status,
+                    "to": target_status,
+                    "role": role,
+                }
+            ),
             400,
         )
 
@@ -376,7 +427,12 @@ def create_application():
     customer_id = load_customer_id_from_request()
     if not customer_id:
         return (
-            jsonify({"message": "No customer profile found for this user", "errors": ["customer_id missing"]}),
+            jsonify(
+                {
+                    "message": "No customer profile found for this user",
+                    "errors": ["customer_id missing"],
+                }
+            ),
             400,
         )
 
@@ -388,11 +444,16 @@ def create_application():
         return jsonify({"message": "Customer KYC is not approved"}), 400
 
     if customer.eligibility_status != "ELIGIBLE":
-        return jsonify({"message": "Customer is not eligible for loan application"}), 400
+        return (
+            jsonify({"message": "Customer is not eligible for loan application"}),
+            400,
+        )
 
     loan_type = data.get("loan_type")
     type_data = collect_type_specific_data(loan_type, data)
-    validation_errors = validate_application_payload({**data, **type_data, "loan_type": loan_type}, loan_type)
+    validation_errors = validate_application_payload(
+        {**data, **type_data, "loan_type": loan_type}, loan_type
+    )
     if validation_errors:
         current_app.logger.warning(
             "Loan application validation failed for customer_id=%s: %s | payload_keys=%s",
@@ -402,7 +463,9 @@ def create_application():
         )
         return jsonify({"errors": validation_errors}), 400
 
-    initial_status = STATUS_SUBMITTED if claims.get("role") == "customer" else STATUS_DRAFT
+    initial_status = (
+        STATUS_SUBMITTED if claims.get("role") == "customer" else STATUS_DRAFT
+    )
     application = LoanApplication(
         application_number=generate_application_number(),
         customer_id=customer_id,
@@ -445,7 +508,10 @@ def update_application(application_id):
         return access_error
 
     if application.status not in {STATUS_DRAFT, STATUS_SUBMITTED}:
-        return jsonify({"message": "Only draft or submitted applications can be updated"}), 400
+        return (
+            jsonify({"message": "Only draft or submitted applications can be updated"}),
+            400,
+        )
 
     data = normalize_application_payload(request.get_json() or {})
     loan_type = data.get("loan_type", application.loan_type)
@@ -492,7 +558,9 @@ def update_application(application_id):
         application.monthly_expenses = parse_decimal(data.get("monthly_expenses"))
 
     if "tenure_months" in data:
-        application.tenure_months = parse_int(data.get("tenure_months"), application.tenure_months)
+        application.tenure_months = parse_int(
+            data.get("tenure_months"), application.tenure_months
+        )
 
     application.extra_data = {**(application.extra_data or {}), **type_data}
 
@@ -510,11 +578,20 @@ def submit_application(application_id):
         return access_error
 
     if application.status not in {STATUS_DRAFT, STATUS_SUBMITTED}:
-        return jsonify({"message": "Application cannot be submitted in its current status"}), 400
+        return (
+            jsonify(
+                {"message": "Application cannot be submitted in its current status"}
+            ),
+            400,
+        )
 
     data = normalize_application_payload(request.get_json() or {})
     existing_extra_data = application.extra_data or {}
-    merged_data = {**build_application_response(application), **existing_extra_data, **data}
+    merged_data = {
+        **build_application_response(application),
+        **existing_extra_data,
+        **data,
+    }
     type_data = collect_type_specific_data(application.loan_type, data)
     merged_data.update(type_data)
 
@@ -536,7 +613,9 @@ def submit_application(application_id):
 
 @loan_app_bp.route("", methods=["GET", "OPTIONS"])
 @cross_origin(
-    origins=os.getenv("CORS_ORIGINS", "https://grow-microfinance-app-production.up.railway.app"),
+    origins=os.getenv(
+        "CORS_ORIGINS", "https://grow-microfinance-app-production.up.railway.app"
+    ),
     methods=["GET", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
@@ -566,6 +645,7 @@ def list_applications():
                 STATUS_STAFF_APPROVED,
                 STATUS_APPROVED,
                 STATUS_REJECTED,
+                STATUS_DISBURSED,
             }
             if requested_status not in valid_statuses:
                 return jsonify({"message": "Invalid status value"}), 400
@@ -609,15 +689,15 @@ def list_applications():
         )
         return jsonify({"message": "Invalid request parameters"}), 400
     except Exception as exc:  # pragma: no cover - defensive logging
-        logger.exception(
-            "Error handling %s %s: %s", request.method, request.path, exc
-        )
+        logger.exception("Error handling %s %s: %s", request.method, request.path, exc)
         return jsonify({"message": "Failed to load loan applications"}), 500
 
 
 @admin_api_bp.route("/loan-applications", methods=["GET", "OPTIONS"])
 @cross_origin(
-    origins=os.getenv("CORS_ORIGINS", "https://grow-microfinance-app-production.up.railway.app"),
+    origins=os.getenv(
+        "CORS_ORIGINS", "https://grow-microfinance-app-production.up.railway.app"
+    ),
     methods=["GET", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
@@ -642,6 +722,7 @@ def admin_list_all_applications():
             STATUS_STAFF_APPROVED,
             STATUS_APPROVED,
             STATUS_REJECTED,
+            STATUS_DISBURSED,
         }
 
         query = LoanApplication.query
@@ -655,9 +736,7 @@ def admin_list_all_applications():
         logger.info("Handled %s %s with status %s", request.method, request.path, 200)
         return response
     except Exception as exc:  # pragma: no cover - defensive logging
-        logger.exception(
-            "Error handling %s %s: %s", request.method, request.path, exc
-        )
+        logger.exception("Error handling %s %s: %s", request.method, request.path, exc)
         return jsonify({"message": "Failed to load loan applications"}), 500
 
 
@@ -681,7 +760,9 @@ def _serialize_admin_customer(customer: Customer) -> dict:
 
 @admin_api_bp.route("/admin/customers", methods=["GET", "OPTIONS"])
 @cross_origin(
-    origins=os.getenv("CORS_ORIGINS", "https://grow-microfinance-app-production.up.railway.app"),
+    origins=os.getenv(
+        "CORS_ORIGINS", "https://grow-microfinance-app-production.up.railway.app"
+    ),
     methods=["GET", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
@@ -695,21 +776,25 @@ def admin_list_customers():
         response = jsonify(
             {
                 "success": True,
-                "customers": [_serialize_admin_customer(customer) for customer in customers],
+                "customers": [
+                    _serialize_admin_customer(customer) for customer in customers
+                ],
             }
         )
         logger.info("Handled %s %s with status %s", request.method, request.path, 200)
         return response
     except Exception as exc:  # pragma: no cover - defensive logging
-        logger.exception(
-            "Error handling %s %s: %s", request.method, request.path, exc
-        )
+        logger.exception("Error handling %s %s: %s", request.method, request.path, exc)
         return jsonify({"message": "Failed to load customers"}), 500
 
 
-@admin_api_bp.route("/admin/customers/<int:customer_id>", methods=["GET", "PUT", "OPTIONS"])
+@admin_api_bp.route(
+    "/admin/customers/<int:customer_id>", methods=["GET", "PUT", "OPTIONS"]
+)
 @cross_origin(
-    origins=os.getenv("CORS_ORIGINS", "https://grow-microfinance-app-production.up.railway.app"),
+    origins=os.getenv(
+        "CORS_ORIGINS", "https://grow-microfinance-app-production.up.railway.app"
+    ),
     methods=["GET", "PUT", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
@@ -747,11 +832,17 @@ def admin_customer_detail(customer_id: int):
                 return jsonify({"message": "No supported fields provided"}), 400
 
             db.session.commit()
-            response = jsonify({"success": True, "customer": _serialize_admin_customer(customer)})
-            logger.info("Handled %s %s with status %s", request.method, request.path, 200)
+            response = jsonify(
+                {"success": True, "customer": _serialize_admin_customer(customer)}
+            )
+            logger.info(
+                "Handled %s %s with status %s", request.method, request.path, 200
+            )
             return response
 
-        response = jsonify({"success": True, "customer": _serialize_admin_customer(customer)})
+        response = jsonify(
+            {"success": True, "customer": _serialize_admin_customer(customer)}
+        )
         logger.info("Handled %s %s with status %s", request.method, request.path, 200)
         return response
     except Exception as exc:  # pragma: no cover - defensive logging
@@ -780,14 +871,10 @@ def list_awaiting_review_applications():
             .all()
         )
         response = jsonify([build_application_response(app) for app in applications])
-        logger.info(
-            "Handled %s %s with status %s", request.method, request.path, 200
-        )
+        logger.info("Handled %s %s with status %s", request.method, request.path, 200)
         return response
     except Exception as exc:  # pragma: no cover - defensive logging
-        logger.exception(
-            "Error handling %s %s: %s", request.method, request.path, exc
-        )
+        logger.exception("Error handling %s %s: %s", request.method, request.path, exc)
         return jsonify({"message": "Failed to load applications"}), 500
 
 
@@ -811,13 +898,20 @@ def approve_application(application_id):
     claims = get_jwt()
     role = claims.get("role")
     target_status = STATUS_APPROVED if role == "admin" else STATUS_STAFF_APPROVED
-    approved_amount = data.get("approved_amount")
-    approved_tenure = data.get("approved_tenure")
-
-    if approved_amount is None or approved_tenure is None:
-        return jsonify({"message": "approved_amount and approved_tenure are required"}), 400
+    approved_amount = data.get(
+        "approved_amount", application.approved_amount or application.applied_amount
+    )
+    approved_tenure = data.get(
+        "approved_tenure", application.approved_tenure or application.tenure_months
+    )
 
     approved_amount = parse_decimal(approved_amount)
+    approved_tenure = parse_int(approved_tenure)
+    if approved_amount is None or approved_tenure is None:
+        return (
+            jsonify({"message": "approved_amount and approved_tenure must be valid"}),
+            400,
+        )
 
     transition_error = apply_status_transition(application, target_status)
     if transition_error:
@@ -825,16 +919,114 @@ def approve_application(application_id):
     if approved_amount is not None:
         application.approved_amount = approved_amount
     if approved_tenure is not None:
-        application.approved_tenure = int(approved_tenure)
+        application.approved_tenure = approved_tenure
     application.review_notes = data.get("review_notes")
 
     if target_status == STATUS_APPROVED:
         application.approved_at = datetime.utcnow()
+        if hasattr(application, "approved_by"):
+            application.approved_by = int(get_jwt_identity())
+        if hasattr(application, "approved_by_id"):
+            application.approved_by_id = int(get_jwt_identity())
     elif target_status == STATUS_STAFF_APPROVED:
         application.assigned_officer_id = int(get_jwt_identity())
 
-    db.session.commit()
-    return jsonify(build_application_response(application))
+    try:
+        db.session.commit()
+        current_app.logger.info(
+            "Application %s approved to %s by user_id=%s",
+            application.id,
+            target_status,
+            get_jwt_identity(),
+        )
+        return jsonify(build_application_response(application))
+    except Exception as exc:  # pragma: no cover - defensive logging
+        db.session.rollback()
+        current_app.logger.exception(
+            "Failed to approve application %s: %s", application.id, exc
+        )
+        return jsonify({"message": "Failed to approve application"}), 500
+
+
+def generate_loan_number() -> str:
+    today = date.today()
+    date_str = today.strftime("%Y%m%d")
+    daily_count = (
+        db.session.query(func.count(Loan.id))
+        .filter(func.date(Loan.created_at) == today)
+        .scalar()
+    )
+    return f"GROW-LOAN-{date_str}-{(daily_count or 0) + 1:04d}"
+
+
+@loan_app_bp.route("/<int:application_id>/disburse", methods=["POST"])
+@role_required(["admin"])
+def disburse_application(application_id):
+    application = LoanApplication.query.get_or_404(application_id)
+    if application.status != STATUS_APPROVED:
+        return (
+            jsonify(
+                {
+                    "message": "Only APPROVED applications can be disbursed",
+                    "status": application.status,
+                }
+            ),
+            400,
+        )
+
+    principal = application.approved_amount or application.applied_amount
+    tenure_months = application.approved_tenure or application.tenure_months
+    interest_rate = application.interest_rate or Decimal("0")
+    total_days = max(int(tenure_months or 0) * 30, 1)
+    start_date = date.today()
+    end_date = start_date + timedelta(days=total_days - 1)
+    total_payable = Decimal(principal) + (
+        Decimal(principal) * (Decimal(interest_rate) / Decimal("100"))
+    )
+
+    loan = Loan(
+        loan_number=generate_loan_number(),
+        customer_id=application.customer_id,
+        principal_amount=principal,
+        interest_rate=interest_rate,
+        total_days=total_days,
+        daily_installment=total_payable / Decimal(total_days),
+        total_payable=total_payable,
+        start_date=start_date,
+        end_date=end_date,
+        status="ACTIVE",
+        created_by_id=int(get_jwt_identity()),
+    )
+
+    try:
+        db.session.add(loan)
+        application.status = STATUS_DISBURSED
+        if hasattr(application, "disbursed_at"):
+            application.disbursed_at = datetime.utcnow()
+        db.session.commit()
+        current_app.logger.info(
+            "Application %s disbursed into loan %s by user_id=%s",
+            application.id,
+            loan.id,
+            get_jwt_identity(),
+        )
+        return (
+            jsonify(
+                {
+                    "message": "Loan disbursed",
+                    "loan_id": loan.id,
+                    "loan_number": loan.loan_number,
+                    "application": build_application_response(application),
+                }
+            ),
+            201,
+        )
+    except Exception as exc:  # pragma: no cover - defensive logging
+        db.session.rollback()
+        current_app.logger.exception(
+            "Failed to disburse application %s: %s", application.id, exc
+        )
+        return jsonify({"message": "Failed to disburse loan"}), 500
 
 
 @loan_app_bp.route("/<int:application_id>/reject", methods=["POST"])
@@ -857,7 +1049,9 @@ def reject_application(application_id):
     return jsonify(build_application_response(application))
 
 
-def upload_document_to_supabase(loan_application_id: int, document_type: str, file_storage) -> str:
+def upload_document_to_supabase(
+    loan_application_id: int, document_type: str, file_storage
+) -> str:
     supabase = get_supabase_client()
     bucket = get_storage_bucket()
     prefix = get_upload_prefix()
@@ -874,7 +1068,9 @@ def upload_document_to_supabase(loan_application_id: int, document_type: str, fi
     supabase.storage.from_(bucket).upload(
         path=object_path,
         file=file_bytes,
-        file_options={"content-type": file_storage.mimetype or "application/octet-stream"},
+        file_options={
+            "content-type": file_storage.mimetype or "application/octet-stream"
+        },
     )
 
     return object_path
@@ -903,4 +1099,13 @@ def upload_document(application_id):
     db.session.add(document)
     db.session.commit()
 
-    return jsonify({"message": "Document uploaded", "document_id": document.id, "file_path": document.file_path}), 201
+    return (
+        jsonify(
+            {
+                "message": "Document uploaded",
+                "document_id": document.id,
+                "file_path": document.file_path,
+            }
+        ),
+        201,
+    )
