@@ -30,6 +30,8 @@ def _customer_profile(user: User, code: str = "CUST-001") -> Customer:
         mobile="0700000000",
         address="123 Street",
         business_type="Retail",
+        kyc_status="APPROVED",
+        eligibility_status="ELIGIBLE",
     )
     db.session.add(customer)
     db.session.commit()
@@ -38,7 +40,9 @@ def _customer_profile(user: User, code: str = "CUST-001") -> Customer:
 
 def _auth_headers(app, user: User):
     with app.app_context():
-        token = create_access_token(identity=str(user.id), additional_claims={"role": user.role})
+        token = create_access_token(
+            identity=str(user.id), additional_claims={"role": user.role}
+        )
     return {"Authorization": f"Bearer {token}"}
 
 
@@ -96,7 +100,9 @@ def test_staff_listing_and_approval_flow(app, client):
     db.session.add(application)
     db.session.commit()
 
-    list_response = client.get("/loan-applications", headers=_auth_headers(app, staff_user))
+    list_response = client.get(
+        "/loan-applications", headers=_auth_headers(app, staff_user)
+    )
     assert list_response.status_code == 200
     assert len(list_response.get_json()) == 1
     assert list_response.get_json()[0]["status"] == STATUS_SUBMITTED
@@ -116,7 +122,9 @@ def test_staff_listing_and_approval_flow(app, client):
 
 def test_staff_awaiting_review_endpoint(app, client):
     staff_user = _create_user("staff", "Staff Awaiting", "staff-await@example.com")
-    customer_user = _create_user("customer", "Customer Awaiting", "cust-await@example.com")
+    customer_user = _create_user(
+        "customer", "Customer Awaiting", "cust-await@example.com"
+    )
     customer = _customer_profile(customer_user, code="CUST-010")
 
     submitted_app = LoanApplication(
@@ -148,7 +156,9 @@ def test_staff_awaiting_review_endpoint(app, client):
 
 
 def test_non_staff_cannot_list_awaiting_review(app, client):
-    customer_user = _create_user("customer", "Customer Blocked", "cust-block@example.com")
+    customer_user = _create_user(
+        "customer", "Customer Blocked", "cust-block@example.com"
+    )
 
     response = client.get(
         "/loan-applications/awaiting-review",
@@ -196,7 +206,9 @@ def test_admin_listing_and_decision_flow(app, client):
     db.session.add(review_application)
     db.session.commit()
 
-    list_response = client.get("/loan-applications", headers=_auth_headers(app, admin_user))
+    list_response = client.get(
+        "/loan-applications", headers=_auth_headers(app, admin_user)
+    )
     results = list_response.get_json()
     assert list_response.status_code == 200
     assert all(item["status"] == STATUS_STAFF_APPROVED for item in results)
@@ -257,7 +269,9 @@ def test_staff_can_record_payment_for_active_loan(app, client):
 
 def test_staff_active_loans_endpoint(app, client):
     staff_user = _create_user("staff", "Active Staff", "active-staff@example.com")
-    customer_user = _create_user("customer", "Active Customer", "active-cust@example.com")
+    customer_user = _create_user(
+        "customer", "Active Customer", "active-cust@example.com"
+    )
     customer = _customer_profile(customer_user, code="CUST-020")
 
     loan = Loan(
@@ -422,7 +436,9 @@ def test_admin_api_can_filter_status(app, client):
 
 def test_staff_can_approve_submitted_application_via_staff_endpoint(app, client):
     staff_user = _create_user("staff", "Staff Approver", "staff-approve@example.com")
-    customer_user = _create_user("customer", "Applicant", "staff-approve-applicant@example.com")
+    customer_user = _create_user(
+        "customer", "Applicant", "staff-approve-applicant@example.com"
+    )
     customer = _customer_profile(customer_user, code="CUST-030")
 
     application = LoanApplication(
@@ -452,7 +468,9 @@ def test_staff_can_approve_submitted_application_via_staff_endpoint(app, client)
 
 def test_staff_approval_requires_submitted_status(app, client):
     staff_user = _create_user("staff", "Staff Approver", "staff-approve2@example.com")
-    customer_user = _create_user("customer", "Applicant", "staff-approve2-applicant@example.com")
+    customer_user = _create_user(
+        "customer", "Applicant", "staff-approve2-applicant@example.com"
+    )
     customer = _customer_profile(customer_user, code="CUST-031")
 
     application = LoanApplication(
@@ -480,7 +498,9 @@ def test_staff_approval_requires_submitted_status(app, client):
 
 
 def test_non_staff_cannot_call_staff_approval_endpoint(app, client):
-    customer_user = _create_user("customer", "Customer", "customer-approval@example.com")
+    customer_user = _create_user(
+        "customer", "Customer", "customer-approval@example.com"
+    )
     customer = _customer_profile(customer_user, code="CUST-032")
 
     application = LoanApplication(
@@ -515,3 +535,86 @@ def test_non_staff_cannot_access_staff_endpoints(app, client):
 
     assert response.status_code == 403
     assert response.headers.get("Access-Control-Allow-Origin") is not None
+
+
+def test_admin_can_approve_submitted_application_without_payload(app, client):
+    admin_user = _create_user("admin", "Admin Direct", "admin-direct@example.com")
+    customer_user = _create_user(
+        "customer", "Direct Customer", "direct-customer@example.com"
+    )
+    customer = _customer_profile(customer_user, code="CUST-DIRECT")
+    application = LoanApplication(
+        application_number="APP-DIRECT",
+        customer_id=customer.id,
+        loan_type="GROW_BUSINESS",
+        status=STATUS_SUBMITTED,
+        applied_amount=Decimal("8000"),
+        tenure_months=4,
+        full_name="Direct Customer",
+        nic_number="123456789V",
+        mobile_number="0700000000",
+    )
+    db.session.add(application)
+    db.session.commit()
+
+    response = client.post(
+        f"/loan-applications/{application.id}/approve",
+        headers=_auth_headers(app, admin_user),
+        json={},
+    )
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["status"] == STATUS_APPROVED
+    assert body["approved_amount"] == 8000.0
+    assert body["approved_tenure"] == 4
+    assert body["approved_at"] is not None
+
+
+def test_admin_can_disburse_approved_application_into_active_loan(app, client):
+    admin_user = _create_user("admin", "Admin Disburse", "admin-disburse@example.com")
+    customer_user = _create_user(
+        "customer", "Disburse Customer", "disburse-customer@example.com"
+    )
+    customer = _customer_profile(customer_user, code="CUST-DISBURSE")
+    application = LoanApplication(
+        application_number="APP-DISBURSE",
+        customer_id=customer.id,
+        loan_type="GROW_BUSINESS",
+        status=STATUS_APPROVED,
+        applied_amount=Decimal("10000"),
+        approved_amount=Decimal("9000"),
+        tenure_months=6,
+        approved_tenure=3,
+        interest_rate=Decimal("10"),
+        full_name="Disburse Customer",
+        nic_number="123456789V",
+        mobile_number="0700000000",
+    )
+    db.session.add(application)
+    db.session.commit()
+
+    response = client.post(
+        f"/loan-applications/{application.id}/disburse",
+        headers=_auth_headers(app, admin_user),
+        json={},
+    )
+
+    assert response.status_code == 201
+    body = response.get_json()
+    assert body["loan_number"].startswith("GROW-LOAN-")
+    assert body["application"]["status"] == "DISBURSED"
+
+    loan = Loan.query.get(body["loan_id"])
+    assert loan is not None
+    assert loan.customer_id == customer.id
+    assert loan.principal_amount == Decimal("9000.00")
+    assert loan.interest_rate == Decimal("10.00")
+    assert loan.total_days == 90
+    assert loan.status == "ACTIVE"
+
+    loans_response = client.get("/admin/loans", headers=_auth_headers(app, admin_user))
+    assert loans_response.status_code == 200
+    assert body["loan_number"] in {
+        item["loan_number"] for item in loans_response.get_json()
+    }
