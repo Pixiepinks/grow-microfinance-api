@@ -11,8 +11,15 @@ from ..models import (
     Loan,
     LoanApplication,
     LoanApplicationDocument,
+    LoanLedger,
     Payment,
     User,
+)
+from ..loan_ledger import (
+    daily_interest_rate,
+    generate_loan_ledger,
+    ledger_totals,
+    money,
 )
 from .utils import role_required
 
@@ -157,6 +164,7 @@ def create_loan():
     principal = Decimal(str(data.get("principal_amount", "0")))
     interest_rate = Decimal(str(data.get("interest_rate", "0")))
     total_days = int(data.get("total_days", 0))
+    payment_interval_days = int(data.get("payment_interval_days", 7) or 7)
     start_date = date.fromisoformat(data.get("start_date"))
     end_date = date.fromisoformat(data.get("end_date"))
 
@@ -169,6 +177,7 @@ def create_loan():
         principal_amount=principal,
         interest_rate=interest_rate,
         total_days=total_days,
+        payment_interval_days=payment_interval_days,
         start_date=start_date,
         end_date=end_date,
         total_payable=total_payable,
@@ -176,6 +185,8 @@ def create_loan():
         created_by_id=int(get_jwt_identity()),
     )
     db.session.add(loan)
+    db.session.flush()
+    generate_loan_ledger(loan)
     db.session.commit()
 
     return jsonify({"message": "Loan created", "loan_id": loan.id})
@@ -206,6 +217,98 @@ def list_loans():
         for l in loans
     ]
     return jsonify(results)
+
+
+def _loan_to_dict(loan: Loan) -> dict:
+    return {
+        "id": loan.id,
+        "loan_number": loan.loan_number,
+        "customer_id": loan.customer_id,
+        "principal_amount": float(loan.principal_amount),
+        "interest_rate": float(loan.interest_rate),
+        "total_days": loan.total_days,
+        "payment_interval_days": loan.payment_interval_days,
+        "start_date": loan.start_date.isoformat() if loan.start_date else None,
+        "end_date": loan.end_date.isoformat() if loan.end_date else None,
+        "status": loan.status,
+    }
+
+
+def _ledger_to_dict(entry: LoanLedger) -> dict:
+    return {
+        "id": entry.id,
+        "loan_id": entry.loan_id,
+        "installment_no": entry.installment_no,
+        "period_start_date": (
+            entry.period_start_date.isoformat() if entry.period_start_date else None
+        ),
+        "due_date": entry.due_date.isoformat() if entry.due_date else None,
+        "period_days": entry.period_days,
+        "opening_balance": float(entry.opening_balance),
+        "interest_amount": float(entry.interest_amount),
+        "principal_amount": float(entry.principal_amount),
+        "installment_amount": float(entry.installment_amount),
+        "closing_balance": float(entry.closing_balance),
+        "paid_amount": float(entry.paid_amount or 0),
+        "paid_date": entry.paid_date.isoformat() if entry.paid_date else None,
+        "delay_days": entry.delay_days or 0,
+        "delay_interest": float(entry.delay_interest or 0),
+        "status": entry.status,
+    }
+
+
+@admin_bp.route("/loans/<int:loan_id>/ledger", methods=["GET"])
+@role_required(["admin"])
+def get_loan_ledger(loan_id):
+    loan = Loan.query.get_or_404(loan_id)
+    if not loan.ledger_entries:
+        generate_loan_ledger(loan)
+        db.session.commit()
+    return jsonify(
+        {
+            "loan": _loan_to_dict(loan),
+            "ledger": [_ledger_to_dict(entry) for entry in loan.ledger_entries],
+            "totals": ledger_totals(loan),
+        }
+    )
+
+
+@admin_bp.route("/loans/<int:loan_id>/ledger/<int:entry_id>/payment", methods=["POST"])
+@role_required(["admin"])
+def record_ledger_payment(loan_id, entry_id):
+    loan = Loan.query.get_or_404(loan_id)
+    entry = LoanLedger.query.filter_by(id=entry_id, loan_id=loan.id).first_or_404()
+    data = request.get_json() or {}
+    paid_amount = money(Decimal(str(data.get("paid_amount", "0"))))
+    paid_date = date.fromisoformat(data.get("paid_date"))
+
+    entry.paid_amount = paid_amount
+    entry.paid_date = paid_date
+    entry.delay_days = max((paid_date - entry.due_date).days, 0)
+    entry.delay_interest = money(
+        Decimal(entry.opening_balance)
+        * daily_interest_rate(loan)
+        * Decimal(entry.delay_days)
+    )
+    payable = money(
+        Decimal(entry.installment_amount) + Decimal(entry.delay_interest or 0)
+    )
+    if paid_amount >= payable:
+        entry.status = "PAID"
+    elif paid_amount > 0:
+        entry.status = "PARTIAL"
+    elif entry.delay_days > 0:
+        entry.status = "OVERDUE"
+    else:
+        entry.status = "PENDING"
+
+    db.session.commit()
+    return jsonify(
+        {
+            "ledger": _ledger_to_dict(entry),
+            "totals": ledger_totals(loan),
+        }
+    )
 
 
 @admin_bp.route("/dashboard", methods=["GET"])

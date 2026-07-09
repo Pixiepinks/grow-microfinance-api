@@ -17,16 +17,26 @@ class User(db.Model):
     role = db.Column(db.String(20), nullable=False)
     is_active = db.Column(db.Boolean, default=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_at = db.Column(
+        db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
 
     customer_profile = relationship("Customer", back_populates="user", uselist=False)
-    created_loans = relationship("Loan", back_populates="created_by", foreign_keys="Loan.created_by_id")
-    collected_payments = relationship("Payment", back_populates="collected_by", foreign_keys="Payment.collected_by_id")
+    created_loans = relationship(
+        "Loan", back_populates="created_by", foreign_keys="Loan.created_by_id"
+    )
+    collected_payments = relationship(
+        "Payment", back_populates="collected_by", foreign_keys="Payment.collected_by_id"
+    )
     created_applications = relationship(
-        "LoanApplication", back_populates="created_by", foreign_keys="LoanApplication.created_by_id"
+        "LoanApplication",
+        back_populates="created_by",
+        foreign_keys="LoanApplication.created_by_id",
     )
     assigned_applications = relationship(
-        "LoanApplication", back_populates="assigned_officer", foreign_keys="LoanApplication.assigned_officer_id"
+        "LoanApplication",
+        back_populates="assigned_officer",
+        foreign_keys="LoanApplication.assigned_officer_id",
     )
 
     def set_password(self, password: str) -> None:
@@ -40,7 +50,9 @@ class Customer(db.Model):
     __tablename__ = "customers"
 
     id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), unique=True, nullable=False)
+    user_id = db.Column(
+        db.Integer, db.ForeignKey("users.id"), unique=True, nullable=False
+    )
     customer_code = db.Column(db.String(50), unique=True, index=True, nullable=False)
     full_name = db.Column(db.String(150), nullable=False)
     nic_number = db.Column(db.String(50))
@@ -86,10 +98,16 @@ class Customer(db.Model):
     loans = relationship("Loan", back_populates="customer")
     loan_applications = relationship("LoanApplication", back_populates="customer")
     documents = relationship(
-        "CustomerDocument", back_populates="customer", lazy="dynamic", cascade="all, delete-orphan"
+        "CustomerDocument",
+        back_populates="customer",
+        lazy="dynamic",
+        cascade="all, delete-orphan",
     )
     kyc_profile = relationship(
-        "CustomerKYCProfile", back_populates="customer", uselist=False, cascade="all, delete-orphan"
+        "CustomerKYCProfile",
+        back_populates="customer",
+        uselist=False,
+        cascade="all, delete-orphan",
     )
 
     def to_dict(self) -> dict:
@@ -101,7 +119,9 @@ class Customer(db.Model):
             "mobile": self.mobile,
             "address": self.address,
             "business_type": self.business_type,
-            "date_of_birth": self.date_of_birth.isoformat() if self.date_of_birth else None,
+            "date_of_birth": (
+                self.date_of_birth.isoformat() if self.date_of_birth else None
+            ),
             "civil_status": self.civil_status,
             "permanent_address_line1": self.permanent_address_line1,
             "permanent_address_line2": self.permanent_address_line2,
@@ -122,7 +142,9 @@ class Customer(db.Model):
             "employer_name": self.employer_name,
             "employer_address": self.employer_address,
             "occupation": self.occupation,
-            "monthly_income": float(self.monthly_income) if self.monthly_income is not None else None,
+            "monthly_income": (
+                float(self.monthly_income) if self.monthly_income is not None else None
+            ),
             "business_name": self.business_name,
             "business_address": self.business_address,
             "guarantor_name": self.guarantor_name,
@@ -152,7 +174,9 @@ class CustomerKYCProfile(db.Model):
     __tablename__ = "customer_kyc_profiles"
 
     id = db.Column(db.Integer, primary_key=True)
-    customer_id = db.Column(db.Integer, db.ForeignKey("customers.id"), unique=True, nullable=False)
+    customer_id = db.Column(
+        db.Integer, db.ForeignKey("customers.id"), unique=True, nullable=False
+    )
     date_of_birth = db.Column(db.Date, nullable=True)
     civil_status = db.Column(db.String(50), nullable=True)
     permanent_address_line1 = db.Column(db.String(255), nullable=True)
@@ -212,6 +236,7 @@ class Loan(db.Model):
     principal_amount = db.Column(Numeric(12, 2), nullable=False)
     interest_rate = db.Column(Numeric(5, 2), nullable=False)
     total_days = db.Column(db.Integer, nullable=False)
+    payment_interval_days = db.Column(db.Integer, nullable=False, default=7)
     daily_installment = db.Column(Numeric(12, 2), nullable=False)
     total_payable = db.Column(Numeric(12, 2), nullable=False)
     start_date = db.Column(db.Date, nullable=False)
@@ -221,12 +246,22 @@ class Loan(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
     customer = relationship("Customer", back_populates="loans")
-    created_by = relationship("User", back_populates="created_loans", foreign_keys=[created_by_id])
+    created_by = relationship(
+        "User", back_populates="created_loans", foreign_keys=[created_by_id]
+    )
     payments = relationship("Payment", back_populates="loan")
+    ledger_entries = relationship(
+        "LoanLedger",
+        back_populates="loan",
+        cascade="all, delete-orphan",
+        order_by="LoanLedger.installment_no",
+    )
 
     @property
     def total_paid(self) -> Decimal:
-        return sum((payment.amount_collected for payment in self.payments), Decimal("0"))
+        return sum(
+            (payment.amount_collected for payment in self.payments), Decimal("0")
+        )
 
     @property
     def outstanding(self) -> Decimal:
@@ -245,11 +280,47 @@ class Loan(db.Model):
         return expected - paid if expected > paid else Decimal("0")
 
 
+class LoanLedger(db.Model):
+    __tablename__ = "loan_ledger"
+    __table_args__ = (
+        db.UniqueConstraint(
+            "loan_id", "installment_no", name="uq_loan_ledger_loan_installment"
+        ),
+    )
+
+    id = db.Column(db.Integer, primary_key=True)
+    loan_id = db.Column(
+        db.Integer, db.ForeignKey("loans.id"), nullable=False, index=True
+    )
+    installment_no = db.Column(db.Integer, nullable=False)
+    period_start_date = db.Column(db.Date, nullable=False)
+    due_date = db.Column(db.Date, nullable=False)
+    period_days = db.Column(db.Integer, nullable=False)
+    opening_balance = db.Column(Numeric(12, 2), nullable=False)
+    interest_amount = db.Column(Numeric(12, 2), nullable=False)
+    principal_amount = db.Column(Numeric(12, 2), nullable=False)
+    installment_amount = db.Column(Numeric(12, 2), nullable=False)
+    closing_balance = db.Column(Numeric(12, 2), nullable=False)
+    paid_amount = db.Column(Numeric(12, 2), nullable=False, default=Decimal("0.00"))
+    paid_date = db.Column(db.Date)
+    delay_days = db.Column(db.Integer, nullable=False, default=0)
+    delay_interest = db.Column(Numeric(12, 2), nullable=False, default=Decimal("0.00"))
+    status = db.Column(db.String(20), nullable=False, default="PENDING")
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(
+        db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+    loan = relationship("Loan", back_populates="ledger_entries")
+
+
 class LoanApplication(db.Model):
     __tablename__ = "loan_applications"
 
     id = db.Column(db.Integer, primary_key=True)
-    application_number = db.Column(db.String(50), unique=True, index=True, nullable=False)
+    application_number = db.Column(
+        db.String(50), unique=True, index=True, nullable=False
+    )
     customer_id = db.Column(db.Integer, db.ForeignKey("customers.id"), nullable=False)
     loan_type = db.Column(db.String(50), nullable=False)
     status = db.Column(db.String(50), default="DRAFT", nullable=False)
@@ -261,7 +332,9 @@ class LoanApplication(db.Model):
     review_notes = db.Column(db.Text)
     reject_reason = db.Column(db.Text)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_at = db.Column(
+        db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
     submitted_at = db.Column(db.DateTime)
     approved_at = db.Column(db.DateTime)
     created_by_id = db.Column(db.Integer, db.ForeignKey("users.id"))
@@ -284,8 +357,14 @@ class LoanApplication(db.Model):
     extra_data = db.Column(db.JSON, default=dict)
 
     customer = relationship("Customer", back_populates="loan_applications")
-    created_by = relationship("User", foreign_keys=[created_by_id], back_populates="created_applications")
-    assigned_officer = relationship("User", foreign_keys=[assigned_officer_id], back_populates="assigned_applications")
+    created_by = relationship(
+        "User", foreign_keys=[created_by_id], back_populates="created_applications"
+    )
+    assigned_officer = relationship(
+        "User",
+        foreign_keys=[assigned_officer_id],
+        back_populates="assigned_applications",
+    )
     documents = relationship(
         "LoanApplicationDocument",
         back_populates="loan_application",
@@ -297,7 +376,9 @@ class LoanApplicationDocument(db.Model):
     __tablename__ = "loan_application_documents"
 
     id = db.Column(db.Integer, primary_key=True)
-    loan_application_id = db.Column(db.Integer, db.ForeignKey("loan_applications.id"), nullable=False)
+    loan_application_id = db.Column(
+        db.Integer, db.ForeignKey("loan_applications.id"), nullable=False
+    )
     document_type = db.Column(db.String(50), nullable=False)
     file_path = db.Column(db.String(255), nullable=False)
     uploaded_at = db.Column(db.DateTime, default=datetime.utcnow)
@@ -318,4 +399,6 @@ class Payment(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
     loan = relationship("Loan", back_populates="payments")
-    collected_by = relationship("User", back_populates="collected_payments", foreign_keys=[collected_by_id])
+    collected_by = relationship(
+        "User", back_populates="collected_payments", foreign_keys=[collected_by_id]
+    )
