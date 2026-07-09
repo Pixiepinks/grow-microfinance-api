@@ -16,6 +16,7 @@ from app.supabase_client import (
 )
 from ..extensions import db
 from ..models import Customer, Loan, LoanApplication, LoanApplicationDocument
+from ..loan_ledger import generate_loan_ledger
 from .utils import role_required
 
 loan_app_bp = Blueprint("loan_applications", __name__, url_prefix="/loan-applications")
@@ -978,6 +979,9 @@ def disburse_application(application_id):
     tenure_months = application.approved_tenure or application.tenure_months
     interest_rate = application.interest_rate or Decimal("0")
     total_days = max(int(tenure_months or 0) * 30, 1)
+    payment_interval_days = int(
+        (request.get_json(silent=True) or {}).get("payment_interval_days", 7) or 7
+    )
     start_date = date.today()
     end_date = start_date + timedelta(days=total_days - 1)
     total_payable = Decimal(principal) + (
@@ -990,6 +994,7 @@ def disburse_application(application_id):
         principal_amount=principal,
         interest_rate=interest_rate,
         total_days=total_days,
+        payment_interval_days=payment_interval_days,
         daily_installment=total_payable / Decimal(total_days),
         total_payable=total_payable,
         start_date=start_date,
@@ -1000,6 +1005,8 @@ def disburse_application(application_id):
 
     try:
         db.session.add(loan)
+        db.session.flush()
+        generate_loan_ledger(loan)
         application.status = STATUS_DISBURSED
         if hasattr(application, "disbursed_at"):
             application.disbursed_at = datetime.utcnow()

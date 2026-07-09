@@ -618,3 +618,145 @@ def test_admin_can_disburse_approved_application_into_active_loan(app, client):
     assert body["loan_number"] in {
         item["loan_number"] for item in loans_response.get_json()
     }
+
+
+def test_admin_loan_creation_generates_63_day_weekly_ledger(app, client):
+    admin_user = _create_user("admin", "Ledger Admin", "ledger-admin@example.com")
+    customer_user = _create_user(
+        "customer", "Ledger Customer", "ledger-customer@example.com"
+    )
+    customer = _customer_profile(customer_user, code="CUST-LEDGER-1")
+
+    response = client.post(
+        "/admin/loans",
+        headers=_auth_headers(app, admin_user),
+        json={
+            "loan_number": "LN-LEDGER-63",
+            "customer_id": customer.id,
+            "principal_amount": "9000",
+            "interest_rate": "3",
+            "total_days": 63,
+            "payment_interval_days": 7,
+            "start_date": "2026-01-01",
+            "end_date": "2026-03-04",
+        },
+    )
+
+    assert response.status_code == 200
+    ledger_response = client.get(
+        f"/admin/loans/{response.get_json()['loan_id']}/ledger",
+        headers=_auth_headers(app, admin_user),
+    )
+    body = ledger_response.get_json()
+    assert ledger_response.status_code == 200
+    assert len(body["ledger"]) == 9
+    assert all(entry["period_days"] == 7 for entry in body["ledger"])
+    assert body["ledger"][0]["opening_balance"] == 9000.0
+    assert body["ledger"][-1]["closing_balance"] == 0.0
+    assert body["totals"]["total_principal"] == 9000.0
+
+
+def test_admin_loan_creation_generates_final_stub_period(app, client):
+    admin_user = _create_user("admin", "Stub Admin", "stub-admin@example.com")
+    customer_user = _create_user(
+        "customer", "Stub Customer", "stub-customer@example.com"
+    )
+    customer = _customer_profile(customer_user, code="CUST-STUB-1")
+
+    response = client.post(
+        "/admin/loans",
+        headers=_auth_headers(app, admin_user),
+        json={
+            "loan_number": "LN-LEDGER-STUB",
+            "customer_id": customer.id,
+            "principal_amount": "10000",
+            "interest_rate": "3",
+            "total_days": 65,
+            "start_date": "2026-01-01",
+            "end_date": "2026-03-06",
+        },
+    )
+
+    assert response.status_code == 200
+    body = client.get(
+        f"/admin/loans/{response.get_json()['loan_id']}/ledger",
+        headers=_auth_headers(app, admin_user),
+    ).get_json()
+    assert [entry["period_days"] for entry in body["ledger"]] == [7] * 9 + [2]
+    assert body["ledger"][-1]["due_date"] == "2026-03-06"
+
+
+def test_admin_ledger_payment_calculates_delay_interest(app, client):
+    admin_user = _create_user("admin", "Payment Admin", "payment-admin@example.com")
+    customer_user = _create_user(
+        "customer", "Payment Customer", "payment-customer@example.com"
+    )
+    customer = _customer_profile(customer_user, code="CUST-PAY-1")
+    loan = Loan(
+        loan_number="LN-PAY-DELAY",
+        customer_id=customer.id,
+        principal_amount=Decimal("3000"),
+        interest_rate=Decimal("3"),
+        total_days=7,
+        payment_interval_days=7,
+        daily_installment=Decimal("0"),
+        total_payable=Decimal("0"),
+        start_date=date(2026, 1, 1),
+        end_date=date(2026, 1, 7),
+        status="ACTIVE",
+        created_by_id=admin_user.id,
+    )
+    db.session.add(loan)
+    db.session.flush()
+    from app.loan_ledger import generate_loan_ledger
+
+    generate_loan_ledger(loan)
+    db.session.commit()
+    entry = loan.ledger_entries[0]
+
+    response = client.post(
+        f"/admin/loans/{loan.id}/ledger/{entry.id}/payment",
+        headers=_auth_headers(app, admin_user),
+        json={"paid_amount": "3020", "paid_date": "2026-01-10"},
+    )
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["ledger"]["delay_days"] == 3
+    assert body["ledger"]["delay_interest"] == 9.0
+    assert body["ledger"]["status"] == "PARTIAL"
+
+
+def test_disbursement_creates_ledger_automatically(app, client):
+    admin_user = _create_user("admin", "Auto Ledger", "auto-ledger@example.com")
+    customer_user = _create_user(
+        "customer", "Auto Customer", "auto-customer@example.com"
+    )
+    customer = _customer_profile(customer_user, code="CUST-AUTO-LEDGER")
+    application = LoanApplication(
+        application_number="APP-AUTO-LEDGER",
+        customer_id=customer.id,
+        loan_type="GROW_BUSINESS",
+        status=STATUS_APPROVED,
+        applied_amount=Decimal("7000"),
+        approved_amount=Decimal("7000"),
+        tenure_months=1,
+        approved_tenure=1,
+        interest_rate=Decimal("3"),
+        full_name="Auto Customer",
+        nic_number="123456789V",
+        mobile_number="0700000000",
+    )
+    db.session.add(application)
+    db.session.commit()
+
+    response = client.post(
+        f"/loan-applications/{application.id}/disburse",
+        headers=_auth_headers(app, admin_user),
+        json={"payment_interval_days": 7},
+    )
+
+    assert response.status_code == 201
+    loan = Loan.query.get(response.get_json()["loan_id"])
+    assert len(loan.ledger_entries) == 5
+    assert [entry.period_days for entry in loan.ledger_entries] == [7, 7, 7, 7, 2]
