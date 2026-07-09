@@ -79,6 +79,45 @@ def test_customer_submission_sets_submitted_status(app, client):
     assert body["submitted_at"] is not None
 
 
+def test_staff_can_submit_draft_application_without_documents(app, client):
+    staff_user = _create_user("staff", "Staff Submit", "staff-submit@example.com")
+    customer_user = _create_user(
+        "customer", "Submit Customer", "submit-customer@example.com"
+    )
+    customer = _customer_profile(customer_user, code="CUST-SUBMIT")
+    application = LoanApplication(
+        application_number="APP-SUBMIT-NO-DOCS",
+        customer_id=customer.id,
+        loan_type="GROW_PERSONAL",
+        status="DRAFT",
+        applied_amount=Decimal("7000"),
+        tenure_months=5,
+        full_name="Submit Customer",
+        nic_number="123456789V",
+        mobile_number="0700000000",
+        monthly_income=Decimal("45000"),
+        monthly_expenses=Decimal("12000"),
+        extra_data={
+            "employment_type": "salaried",
+            "net_monthly_salary": "45000",
+            "employer_name": "Acme Ltd",
+        },
+    )
+    db.session.add(application)
+    db.session.commit()
+
+    response = client.post(
+        f"/loan-applications/{application.id}/submit",
+        headers=_auth_headers(app, staff_user),
+        json={},
+    )
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["status"] == STATUS_SUBMITTED
+    assert body["submitted_at"] is not None
+    assert body["documents"] == []
+
 def test_staff_listing_and_approval_flow(app, client):
     staff_user = _create_user("staff", "Staff One", "staff1@example.com")
     customer_user = _create_user("customer", "Customer Two", "customer2@example.com")
