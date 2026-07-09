@@ -6,11 +6,13 @@ from flask_jwt_extended import get_jwt_identity
 from app.supabase_client import build_public_url
 
 from ..extensions import db
+from ..loan_ledger import generate_repayment_schedule, ledger_totals, money
 from ..models import (
     Customer,
     Loan,
     LoanApplication,
     LoanApplicationDocument,
+    LoanLedger,
     Payment,
     User,
 )
@@ -176,6 +178,11 @@ def create_loan():
         created_by_id=int(get_jwt_identity()),
     )
     db.session.add(loan)
+    db.session.flush()
+    for entry in generate_repayment_schedule(
+        loan, int(data.get("payment_interval_days", 7))
+    ):
+        db.session.add(entry)
     db.session.commit()
 
     return jsonify({"message": "Loan created", "loan_id": loan.id})
@@ -206,6 +213,89 @@ def list_loans():
         for l in loans
     ]
     return jsonify(results)
+
+
+@admin_bp.route("/loans/<int:loan_id>/ledger", methods=["GET"])
+@role_required(["admin"])
+def get_loan_ledger(loan_id):
+    loan = Loan.query.get_or_404(loan_id)
+    entries = (
+        LoanLedger.query.filter_by(loan_id=loan.id)
+        .order_by(LoanLedger.installment_no.asc())
+        .all()
+    )
+    return jsonify(
+        {
+            "loan_id": loan.id,
+            "items": [e.to_dict() for e in entries],
+            "totals": ledger_totals(entries),
+        }
+    )
+
+
+@admin_bp.route("/loans/<int:loan_id>/ledger/<int:entry_id>/payment", methods=["POST"])
+@role_required(["admin"])
+def record_ledger_payment(loan_id, entry_id):
+    data = request.get_json() or {}
+    loan = Loan.query.get_or_404(loan_id)
+    entry = LoanLedger.query.filter_by(id=entry_id, loan_id=loan.id).first_or_404()
+
+    try:
+        amount = Decimal(
+            str(data.get("paid_amount", data.get("amount_collected", "0")))
+        )
+    except Exception:
+        return jsonify({"message": "paid_amount must be a valid number"}), 400
+    if amount <= 0:
+        return jsonify({"message": "paid_amount must be greater than zero"}), 400
+
+    try:
+        paid_date = (
+            date.fromisoformat(data.get("paid_date"))
+            if data.get("paid_date")
+            else date.today()
+        )
+    except Exception:
+        return jsonify({"message": "paid_date must be ISO formatted (YYYY-MM-DD)"}), 400
+
+    entry.paid_amount = money(Decimal(entry.paid_amount or 0) + amount)
+    entry.paid_date = paid_date
+    entry.delay_days = max((paid_date - entry.due_date).days, 0)
+    daily_interest_rate = Decimal(loan.interest_rate) / Decimal("100") / Decimal("30")
+    entry.delay_interest = money(
+        Decimal(entry.installment_amount)
+        * daily_interest_rate
+        * Decimal(entry.delay_days)
+    )
+    payable = Decimal(entry.installment_amount) + Decimal(entry.delay_interest or 0)
+    if entry.paid_amount >= payable:
+        entry.status = "PAID"
+    elif entry.paid_amount > 0:
+        entry.status = "PARTIAL"
+    elif entry.delay_days > 0:
+        entry.status = "OVERDUE"
+    else:
+        entry.status = "PENDING"
+
+    payment = Payment(
+        loan_id=loan.id,
+        amount_collected=amount,
+        collection_date=paid_date,
+        collected_by_id=int(get_jwt_identity()),
+        payment_method=data.get("payment_method", "Cash"),
+        remarks=data.get("remarks"),
+    )
+    db.session.add(payment)
+    db.session.commit()
+    entries = LoanLedger.query.filter_by(loan_id=loan.id).all()
+    return jsonify(
+        {
+            "message": "Payment recorded",
+            "entry": entry.to_dict(),
+            "payment_id": payment.id,
+            "totals": ledger_totals(entries),
+        }
+    )
 
 
 @admin_bp.route("/dashboard", methods=["GET"])

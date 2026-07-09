@@ -618,3 +618,82 @@ def test_admin_can_disburse_approved_application_into_active_loan(app, client):
     assert body["loan_number"] in {
         item["loan_number"] for item in loans_response.get_json()
     }
+
+
+def test_admin_create_loan_generates_weekly_ledger_with_stub_period(app, client):
+    admin_user = _create_user("admin", "Ledger Admin", "ledger-admin@example.com")
+    customer_user = _create_user(
+        "customer", "Ledger Customer", "ledger-cust@example.com"
+    )
+    customer = _customer_profile(customer_user, code="CUST-LEDGER")
+
+    response = client.post(
+        "/admin/loans",
+        headers=_auth_headers(app, admin_user),
+        json={
+            "loan_number": "LN-LEDGER-1",
+            "customer_id": customer.id,
+            "principal_amount": "1000",
+            "interest_rate": "3",
+            "total_days": 10,
+            "payment_interval_days": 7,
+            "start_date": "2026-07-01",
+            "end_date": "2026-07-10",
+        },
+    )
+
+    assert response.status_code == 200
+    loan_id = response.get_json()["loan_id"]
+    ledger_response = client.get(
+        f"/admin/loans/{loan_id}/ledger", headers=_auth_headers(app, admin_user)
+    )
+    assert ledger_response.status_code == 200
+    body = ledger_response.get_json()
+    assert [item["period_days"] for item in body["items"]] == [7, 3]
+    assert body["items"][0]["principal_amount"] == 500.0
+    assert body["items"][0]["interest_amount"] == 7.0
+    assert body["items"][1]["period_start_date"] == "2026-07-08"
+    assert body["items"][1]["due_date"] == "2026-07-10"
+    assert body["totals"]["total_principal"] == 1000.0
+
+
+def test_admin_can_record_ledger_payment_and_delay_interest(app, client):
+    admin_user = _create_user("admin", "Pay Admin", "pay-admin@example.com")
+    customer_user = _create_user("customer", "Pay Customer", "pay-cust@example.com")
+    customer = _customer_profile(customer_user, code="CUST-PAY")
+
+    create_response = client.post(
+        "/admin/loans",
+        headers=_auth_headers(app, admin_user),
+        json={
+            "loan_number": "LN-PAY-1",
+            "customer_id": customer.id,
+            "principal_amount": "1000",
+            "interest_rate": "3",
+            "total_days": 7,
+            "start_date": "2026-07-01",
+            "end_date": "2026-07-07",
+        },
+    )
+    loan_id = create_response.get_json()["loan_id"]
+    entry = client.get(
+        f"/admin/loans/{loan_id}/ledger", headers=_auth_headers(app, admin_user)
+    ).get_json()["items"][0]
+
+    response = client.post(
+        f"/admin/loans/{loan_id}/ledger/{entry['id']}/payment",
+        headers=_auth_headers(app, admin_user),
+        json={
+            "paid_amount": "500",
+            "paid_date": "2026-07-09",
+            "payment_method": "Cash",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["entry"]["paid_amount"] == 500.0
+    assert body["entry"]["delay_days"] == 2
+    assert body["entry"]["delay_interest"] > 0
+    assert body["entry"]["status"] == "PARTIAL"
+    assert body["payment_id"] is not None

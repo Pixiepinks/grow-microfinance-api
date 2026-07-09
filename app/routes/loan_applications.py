@@ -15,6 +15,7 @@ from app.supabase_client import (
     get_upload_prefix,
 )
 from ..extensions import db
+from ..loan_ledger import generate_repayment_schedule
 from ..models import Customer, Loan, LoanApplication, LoanApplicationDocument
 from .utils import role_required
 
@@ -1000,6 +1001,12 @@ def disburse_application(application_id):
 
     try:
         db.session.add(loan)
+        db.session.flush()
+        for entry in generate_repayment_schedule(
+            loan,
+            int((request.get_json(silent=True) or {}).get("payment_interval_days", 7)),
+        ):
+            db.session.add(entry)
         application.status = STATUS_DISBURSED
         if hasattr(application, "disbursed_at"):
             application.disbursed_at = datetime.utcnow()
