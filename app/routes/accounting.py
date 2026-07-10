@@ -109,19 +109,40 @@ def reverse_existing_journal(journal_id):
         rev=reverse_journal(AccountingJournalEntry.query.get_or_404(journal_id), date.fromisoformat(data.get("journal_date") or date.today().isoformat()), data.get("reason","Correction"), _uid()); db.session.commit(); return jsonify(serialize_journal(rev)), 201
     except Exception as exc: return _error(exc)
 
+def _arg(name):
+    value = request.args.get(name)
+    return None if value is None or not value.strip() else value
+
+def _arg_date(name):
+    value = _arg(name)
+    return date.fromisoformat(value) if value else None
+
+def _ledger_data():
+    return general_ledger(
+        account_id=_arg("account_id"),
+        account_code=_arg("account_code"),
+        date_from=_arg_date("date_from"),
+        date_to=_arg_date("date_to"),
+        customer_id=_arg("customer_id"),
+        loan_id=_arg("loan_id"),
+        query_params=request.args.to_dict(flat=True),
+    )
+
 @accounting_bp.route("/general-ledger", methods=["GET"])
 @role_required(["admin"])
 def get_gl():
-    if not request.args.get("account_id"): return jsonify({"message":"account_id is required"}), 400
+    if not _arg("account_id") and not _arg("account_code"): return jsonify({"message":"account_id is required"}), 400
     try:
-        return jsonify(general_ledger(int(request.args["account_id"]), date.fromisoformat(request.args["date_from"]) if request.args.get("date_from") else None, date.fromisoformat(request.args["date_to"]) if request.args.get("date_to") else None, request.args.get("customer_id"), request.args.get("loan_id")))
+        return jsonify(_ledger_data())
     except Exception as exc: return _error(exc)
 
 @accounting_bp.route("/general-ledger/export.csv", methods=["GET"])
 @role_required(["admin"])
 def export_gl():
-    if not request.args.get("account_id"): return jsonify({"message":"account_id is required"}), 400
-    data=general_ledger(int(request.args["account_id"]), date.fromisoformat(request.args["date_from"]) if request.args.get("date_from") else None, date.fromisoformat(request.args["date_to"]) if request.args.get("date_to") else None, request.args.get("customer_id"), request.args.get("loan_id"))
+    if not _arg("account_id") and not _arg("account_code"): return jsonify({"message":"account_id is required"}), 400
+    try:
+        data=_ledger_data()
+    except Exception as exc: return _error(exc)
     return Response(ledger_csv(data), mimetype="text/csv", headers={"Content-Disposition":"attachment; filename=general-ledger.csv"})
 
 @accounting_bp.route("/reconciliation/issues", methods=["GET"])
