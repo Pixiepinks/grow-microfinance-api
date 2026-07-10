@@ -5,6 +5,7 @@ from datetime import date, datetime
 from decimal import Decimal, ROUND_HALF_UP
 from io import StringIO
 
+from flask import current_app
 from sqlalchemy import func, text
 
 from .extensions import db
@@ -206,22 +207,85 @@ def post_loan_payment(payment, user_id=None):
 def serialize_journal(entry):
     return {"id": entry.id, "journal_no": entry.journal_no, "journal_date": entry.journal_date.isoformat(), "description": entry.description, "reference_type": entry.reference_type, "reference_id": entry.reference_id, "status": entry.status, "total_debit": f"{money(entry.total_debit):.2f}", "total_credit": f"{money(entry.total_credit):.2f}", "lines": [{"id": l.id, "line_no": l.line_no, "account_id": l.account_id, "account_code": l.account.account_code, "account_name": l.account.account_name, "debit": f"{money(l.debit):.2f}", "credit": f"{money(l.credit):.2f}", "customer_id": l.customer_id, "loan_id": l.loan_id, "payment_id": l.payment_id, "description": l.description} for l in entry.lines]}
 
-def general_ledger(account_id, date_from=None, date_to=None, customer_id=None, loan_id=None):
-    account = AccountingAccount.query.get(account_id)
-    if not account: raise AccountingError("Account not found")
-    q = AccountingJournalLine.query.join(AccountingJournalEntry).filter(AccountingJournalLine.account_id==account_id, AccountingJournalEntry.status.in_(["POSTED", "REVERSED"]))
-    if customer_id: q=q.filter(AccountingJournalLine.customer_id==customer_id)
-    if loan_id: q=q.filter(AccountingJournalLine.loan_id==loan_id)
-    before=q
-    if date_from: before=before.filter(AccountingJournalEntry.journal_date < date_from); q=q.filter(AccountingJournalEntry.journal_date >= date_from)
-    if date_to: q=q.filter(AccountingJournalEntry.journal_date <= date_to)
+def _blank_to_none(value):
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    return value
+
+def _resolve_ledger_account(account_id=None, account_code=None):
+    account_id = _blank_to_none(account_id)
+    account_code = _blank_to_none(account_code)
+    if account_id is not None:
+        try:
+            numeric_account_id = int(account_id)
+        except (TypeError, ValueError) as exc:
+            raise AccountingError("account_id must be a numeric accounting account ID") from exc
+        account = AccountingAccount.query.get(numeric_account_id)
+        if not account:
+            raise AccountingError("Account not found")
+        return account
+    if account_code is not None:
+        account = AccountingAccount.query.filter_by(account_code=str(account_code)).first()
+        if not account:
+            raise AccountingError("Account not found")
+        return account
+    raise AccountingError("account_id is required")
+
+def _int_filter(value, name):
+    value = _blank_to_none(value)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise AccountingError(f"{name} must be numeric") from exc
+
+def general_ledger(account_id=None, date_from=None, date_to=None, customer_id=None, loan_id=None, account_code=None, query_params=None):
+    account = _resolve_ledger_account(account_id, account_code)
+    customer_id = _int_filter(customer_id, "customer_id")
+    loan_id = _int_filter(loan_id, "loan_id")
+    posted_statuses = ["POSTED", "REVERSED"]
+    base_filters = [
+        AccountingJournalLine.account_id == account.id,
+        func.upper(AccountingJournalEntry.status).in_(posted_statuses),
+    ]
+    if customer_id is not None:
+        base_filters.append(AccountingJournalLine.customer_id == customer_id)
+    if loan_id is not None:
+        base_filters.append(AccountingJournalLine.loan_id == loan_id)
+
+    q = (
+        AccountingJournalLine.query
+        .join(AccountingJournalEntry, AccountingJournalLine.journal_entry_id == AccountingJournalEntry.id)
+        .join(AccountingAccount, AccountingJournalLine.account_id == AccountingAccount.id)
+        .filter(*base_filters)
+    )
+    before = q
+    tx_query = q
+    generated_filters = {"account_id": account.id, "statuses": posted_statuses}
+    if customer_id is not None:
+        generated_filters["customer_id"] = customer_id
+    if loan_id is not None:
+        generated_filters["loan_id"] = loan_id
+    if date_from:
+        before = before.filter(AccountingJournalEntry.journal_date < date_from)
+        tx_query = tx_query.filter(AccountingJournalEntry.journal_date >= date_from)
+        generated_filters["date_from"] = date_from.isoformat()
+    if date_to:
+        tx_query = tx_query.filter(AccountingJournalEntry.journal_date <= date_to)
+        generated_filters["date_to"] = date_to.isoformat()
+
     def signed(line): return money(line.debit-line.credit) if account.normal_balance=="DEBIT" else money(line.credit-line.debit)
     opening=sum((signed(l) for l in before.all()), Decimal("0.00")) if date_from else Decimal("0.00")
     running=money(opening); tx=[]; td=tc=Decimal("0.00")
-    for l in q.order_by(AccountingJournalEntry.journal_date, AccountingJournalEntry.journal_no, AccountingJournalLine.line_no).all():
+    rows = tx_query.order_by(AccountingJournalEntry.journal_date, AccountingJournalEntry.journal_no, AccountingJournalLine.line_no).all()
+    current_app.logger.info("general_ledger query", extra={"query_params": query_params or {}, "resolved_account_id": account.id, "resolved_account_code": account.account_code, "generated_filters": generated_filters, "journal_lines_found": len(rows)})
+    for l in rows:
         running=money(running+signed(l)); td+=money(l.debit); tc+=money(l.credit); e=l.journal_entry
         tx.append({"journal_date": e.journal_date.isoformat(), "journal_no": e.journal_no, "description": e.description, "reference_type": e.reference_type, "reference_id": e.reference_id, "debit": f"{money(l.debit):.2f}", "credit": f"{money(l.credit):.2f}", "running_balance": f"{running:.2f}", "customer_id": l.customer_id, "loan_id": l.loan_id})
-    return {"opening_balance": f"{money(opening):.2f}", "transactions": tx, "running_balance": f"{running:.2f}", "closing_balance": f"{running:.2f}", "total_debit": f"{money(td):.2f}", "total_credit": f"{money(tc):.2f}"}
+    return {"account": {"id": account.id, "account_code": account.account_code, "account_name": account.account_name, "account_type": account.account_type, "normal_balance": account.normal_balance}, "opening_balance": f"{money(opening):.2f}", "transactions": tx, "running_balance": f"{running:.2f}", "closing_balance": f"{running:.2f}", "total_debit": f"{money(td):.2f}", "total_credit": f"{money(tc):.2f}"}
 
 def ledger_csv(data):
     out=StringIO(); w=csv.DictWriter(out, fieldnames=["journal_date","journal_no","description","reference_type","reference_id","debit","credit","running_balance","customer_id","loan_id"]); w.writeheader(); w.writerows(data["transactions"]); return out.getvalue()
