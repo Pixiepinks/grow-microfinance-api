@@ -3,6 +3,7 @@ from decimal import Decimal
 from flask import Blueprint, request, jsonify, current_app
 from flask_jwt_extended import get_jwt_identity
 
+from ..currency import CURRENCY_CODE, format_currency
 from ..extensions import db
 from ..models import Loan, LoanApplication, Payment, Customer
 from .loan_applications import (
@@ -98,7 +99,9 @@ def today_collections():
     results = [
         {
             "loan_id": p.loan_id,
+            "currency": CURRENCY_CODE,
             "amount_collected": float(p.amount_collected),
+            "amount_collected_formatted": format_currency(p.amount_collected),
             "collected_by": p.collected_by_id,
             "payment_method": p.payment_method,
             "remarks": p.remarks,
@@ -128,8 +131,11 @@ def active_loans():
                     "loan_id": loan.id,
                     "customer_name": loan.customer.full_name if loan.customer else None,
                     "loan_type": getattr(loan, "loan_type", None) or "Standard",
+                    "currency": CURRENCY_CODE,
                     "approved_amount": float(loan.principal_amount),
+                    "approved_amount_formatted": format_currency(loan.principal_amount),
                     "outstanding_balance": float(loan.outstanding),
+                    "outstanding_balance_formatted": format_currency(loan.outstanding),
                     "next_due_date": next_due_date.isoformat(),
                 }
             )
@@ -160,7 +166,9 @@ def staff_loan_applications():
                 "application_number": app.application_number,
                 "customer_name": app.full_name,
                 "loan_type": app.loan_type,
+                "currency": CURRENCY_CODE,
                 "applied_amount": float(app.applied_amount),
+                "applied_amount_formatted": format_currency(app.applied_amount),
                 "tenure_months": app.tenure_months,
                 "status": app.status,
                 "created_at": app.created_at.isoformat() if app.created_at else None,
@@ -230,8 +238,11 @@ def loans_in_arrears():
                     "loan_id": loan.id,
                     "loan_number": loan.loan_number,
                     "customer_id": loan.customer_id,
+                    "currency": CURRENCY_CODE,
                     "arrears": float(arrears_amount),
+                    "arrears_formatted": format_currency(arrears_amount),
                     "outstanding": float(loan.outstanding),
+                    "outstanding_formatted": format_currency(loan.outstanding),
                 }
             )
     return jsonify(arrears_list)

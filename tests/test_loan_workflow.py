@@ -939,3 +939,83 @@ def test_document_upload_unhandled_exception_returns_structured_json(app, client
         "error": "storage service unavailable",
     }
     assert LoanApplicationDocument.query.filter_by(loan_application_id=application.id).count() == 0
+
+
+def test_customer_currency_fields_are_lkr_formatted_without_changing_numbers(app, client):
+    customer_user = _create_user("customer", "Currency Customer", "currency@example.com")
+    staff_user = _create_user("staff", "Currency Staff", "currency-staff@example.com")
+    customer = _customer_profile(customer_user, code="CUST-CURRENCY")
+
+    loan = Loan(
+        loan_number="LN-CURRENCY-1",
+        customer_id=customer.id,
+        principal_amount=Decimal("15000.00"),
+        interest_rate=Decimal("10.00"),
+        total_days=30,
+        daily_installment=Decimal("550.00"),
+        total_payable=Decimal("16500.00"),
+        start_date=date.today(),
+        end_date=date.today(),
+        status="Active",
+        created_by_id=staff_user.id,
+    )
+    db.session.add(loan)
+    db.session.commit()
+
+    response = client.get("/customer/loans", headers=_auth_headers(app, customer_user))
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["summary"]["currency"] == "LKR"
+    assert body["summary"]["total_outstanding"] == 16500.0
+    assert isinstance(body["summary"]["total_outstanding"], float)
+    assert body["summary"]["total_outstanding_formatted"] == "Rs. 16,500.00"
+
+    loan_body = body["loans"][0]
+    assert loan_body["currency"] == "LKR"
+    assert loan_body["principal_amount"] == 15000.0
+    assert isinstance(loan_body["principal_amount"], float)
+    assert loan_body["principal_amount_formatted"] == "Rs. 15,000.00"
+    assert Loan.query.get(loan.id).principal_amount == Decimal("15000.00")
+
+
+def test_admin_ledger_currency_fields_are_lkr_formatted_without_changing_numbers(app, client):
+    admin_user = _create_user("admin", "Currency Admin", "currency-admin@example.com")
+    customer_user = _create_user(
+        "customer", "Ledger Currency Customer", "ledger-currency@example.com"
+    )
+    customer = _customer_profile(customer_user, code="CUST-LEDGER-CURRENCY")
+
+    create_response = client.post(
+        "/admin/loans",
+        headers=_auth_headers(app, admin_user),
+        json={
+            "loan_number": "LN-LEDGER-CURRENCY",
+            "customer_id": customer.id,
+            "principal_amount": "15000.00",
+            "interest_rate": "0",
+            "total_days": 1,
+            "payment_interval_days": 1,
+            "start_date": date.today().isoformat(),
+            "end_date": date.today().isoformat(),
+        },
+    )
+    assert create_response.status_code == 200
+    loan_id = create_response.get_json()["loan_id"]
+
+    response = client.get(
+        f"/admin/loans/{loan_id}/ledger", headers=_auth_headers(app, admin_user)
+    )
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["loan"]["currency"] == "LKR"
+    assert body["loan"]["principal_amount"] == 15000.0
+    assert body["loan"]["principal_amount_formatted"] == "Rs. 15,000.00"
+    assert body["ledger"][0]["currency"] == "LKR"
+    assert body["ledger"][0]["installment_amount"] == 15000.0
+    assert body["ledger"][0]["installment_amount_formatted"] == "Rs. 15,000.00"
+    assert body["totals"]["currency"] == "LKR"
+    assert body["totals"]["total_payable"] == 15000.0
+    assert body["totals"]["total_payable_formatted"] == "Rs. 15,000.00"
+    assert Loan.query.get(loan_id).total_payable == Decimal("15000.00")

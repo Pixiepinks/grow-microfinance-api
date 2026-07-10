@@ -56,12 +56,12 @@ class _LoanDetailsScreenState extends State<LoanDetailsScreen> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text('Principal: LKR ${_loan?['principal_amount']}'),
-                      Text('Total Payable: LKR ${_loan?['total_payable']}'),
-                      Text('Paid: LKR ${_loan?['total_paid']}'),
-                      Text('Outstanding: LKR ${_loan?['outstanding']}'),
+                      Text('Principal: Rs. ${_loan?['principal_amount']}'),
+                      Text('Total Payable: Rs. ${_loan?['total_payable']}'),
+                      Text('Paid: Rs. ${_loan?['total_paid']}'),
+                      Text('Outstanding: Rs. ${_loan?['outstanding']}'),
                       Text(
-                        'Arrears: LKR ${_loan?['arrears']}',
+                        'Arrears: Rs. ${_loan?['arrears']}',
                         style: const TextStyle(color: Colors.red),
                       ),
                       const SizedBox(height: 16),
@@ -74,7 +74,7 @@ class _LoanDetailsScreenState extends State<LoanDetailsScreen> {
                           itemBuilder: (context, index) {
                             final payment = _payments[index];
                             return ListTile(
-                              title: Text('LKR ${payment['amount_collected']}'),
+                              title: Text('Rs. ${payment['amount_collected']}'),
                               subtitle: Text('${payment['collection_date']} · ${payment['payment_method']}'),
                               trailing: Text(payment['remarks'] ?? ''),
                             );

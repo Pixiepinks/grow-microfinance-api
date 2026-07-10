@@ -2,6 +2,7 @@ from decimal import Decimal
 from flask import Blueprint, jsonify, current_app
 from flask_jwt_extended import get_jwt_identity
 
+from ..currency import CURRENCY_CODE, format_currency
 from ..models import Customer, Loan
 from .utils import role_required
 
@@ -49,12 +50,19 @@ def my_loans():
             {
                 "id": loan.id,
                 "loan_number": loan.loan_number,
+                "currency": CURRENCY_CODE,
                 "principal_amount": float(loan.principal_amount),
+                "principal_amount_formatted": format_currency(loan.principal_amount),
                 "total_payable": float(loan.total_payable),
+                "total_payable_formatted": format_currency(loan.total_payable),
                 "total_paid": float(loan.total_paid),
+                "total_paid_formatted": format_currency(loan.total_paid),
                 "outstanding": float(loan.outstanding),
+                "outstanding_formatted": format_currency(loan.outstanding),
                 "expected_to_date": float(loan.expected_to_date()),
+                "expected_to_date_formatted": format_currency(loan.expected_to_date()),
                 "arrears": float(arrears),
+                "arrears_formatted": format_currency(arrears),
                 "start_date": loan.start_date.isoformat(),
                 "end_date": loan.end_date.isoformat(),
                 "status": loan.status,
@@ -63,8 +71,11 @@ def my_loans():
 
     summary = {
         "total_active_loans": len(loans),
+        "currency": CURRENCY_CODE,
         "total_outstanding": float(total_outstanding),
+        "total_outstanding_formatted": format_currency(total_outstanding),
         "total_arrears": float(total_arrears),
+        "total_arrears_formatted": format_currency(total_arrears),
     }
     return jsonify({"summary": summary, "loans": loan_list})
 
@@ -82,7 +93,9 @@ def loan_payments(loan_id):
         {
             "id": p.id,
             "collection_date": p.collection_date.isoformat(),
+            "currency": CURRENCY_CODE,
             "amount_collected": float(p.amount_collected),
+            "amount_collected_formatted": format_currency(p.amount_collected),
             "payment_method": p.payment_method,
             "remarks": p.remarks,
         }
@@ -91,11 +104,17 @@ def loan_payments(loan_id):
 
     loan_info = {
         "loan_number": loan.loan_number,
+        "currency": CURRENCY_CODE,
         "principal_amount": float(loan.principal_amount),
+        "principal_amount_formatted": format_currency(loan.principal_amount),
         "total_payable": float(loan.total_payable),
+        "total_payable_formatted": format_currency(loan.total_payable),
         "total_paid": float(loan.total_paid),
+        "total_paid_formatted": format_currency(loan.total_paid),
         "outstanding": float(loan.outstanding),
+        "outstanding_formatted": format_currency(loan.outstanding),
         "arrears": float(loan.arrears()),
+        "arrears_formatted": format_currency(loan.arrears()),
         "start_date": loan.start_date.isoformat(),
         "end_date": loan.end_date.isoformat(),
     }

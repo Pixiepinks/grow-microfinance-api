@@ -1,6 +1,7 @@
 from datetime import timedelta
 from decimal import Decimal, ROUND_HALF_UP
 
+from .currency import CURRENCY_CODE, format_currency
 from .extensions import db
 from .models import Loan, LoanLedger
 
@@ -96,10 +97,17 @@ def ledger_totals(loan: Loan) -> dict:
         sum((Decimal(e.paid_amount or 0) for e in entries), Decimal("0.00"))
     )
     return {
+        "currency": CURRENCY_CODE,
         "total_principal": float(total_principal),
+        "total_principal_formatted": format_currency(total_principal),
         "total_interest": float(total_interest),
+        "total_interest_formatted": format_currency(total_interest),
         "total_payable": float(total_payable),
+        "total_payable_formatted": format_currency(total_payable),
         "total_paid": float(total_paid),
+        "total_paid_formatted": format_currency(total_paid),
         "outstanding": float(money(total_payable - total_paid)),
+        "outstanding_formatted": format_currency(money(total_payable - total_paid)),
         "total_delay_interest": float(total_delay_interest),
+        "total_delay_interest_formatted": format_currency(total_delay_interest),
     }
