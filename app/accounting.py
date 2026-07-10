@@ -17,12 +17,14 @@ from .models import (
     Loan,
     LoanLedger,
     Payment,
+    LoanApplication,
 )
 
 CENT = Decimal("0.01")
 ACCOUNT_TYPES = {"ASSET", "LIABILITY", "EQUITY", "INCOME", "EXPENSE"}
 NORMAL_BALANCES = {"DEBIT", "CREDIT"}
 SYSTEM_MAPPINGS = {
+    "DEFAULT_DISBURSEMENT_ACCOUNT": "1010",
     "CASH_ACCOUNT": "1000",
     "BANK_ACCOUNT": "1010",
     "LOAN_RECEIVABLE_ACCOUNT": "1100",
@@ -33,23 +35,23 @@ SYSTEM_MAPPINGS = {
     "OTHER_FEE_INCOME_ACCOUNT": "4020",
 }
 DEFAULT_ACCOUNTS = [
-    ("1000", "Cash on Hand", "ASSET", "DEBIT", True),
-    ("1010", "Main Bank Account", "ASSET", "DEBIT", True),
-    ("1100", "Loan Principal Receivable", "ASSET", "DEBIT", True),
-    ("1110", "Interest Receivable", "ASSET", "DEBIT", True),
-    ("1120", "Penalty Receivable", "ASSET", "DEBIT", True),
-    ("2000", "Accounts Payable", "LIABILITY", "CREDIT", False),
-    ("2100", "Borrowings", "LIABILITY", "CREDIT", False),
-    ("3000", "Owner's Capital", "EQUITY", "CREDIT", False),
-    ("3100", "Retained Earnings", "EQUITY", "CREDIT", False),
-    ("4000", "Interest Income", "INCOME", "CREDIT", True),
-    ("4010", "Penalty Income", "INCOME", "CREDIT", True),
-    ("4020", "Processing Fee Income", "INCOME", "CREDIT", False),
-    ("5000", "Salary Expense", "EXPENSE", "DEBIT", False),
-    ("5010", "Rent Expense", "EXPENSE", "DEBIT", False),
-    ("5020", "Utilities Expense", "EXPENSE", "DEBIT", False),
-    ("5030", "Transport Expense", "EXPENSE", "DEBIT", False),
-    ("5040", "Office Expense", "EXPENSE", "DEBIT", False),
+    ("1000", "Cash on Hand", "ASSET", "DEBIT", True, "CASH"),
+    ("1010", "Main Bank Account", "ASSET", "DEBIT", True, "BANK"),
+    ("1100", "Loan Principal Receivable", "ASSET", "DEBIT", True, "RECEIVABLE"),
+    ("1110", "Interest Receivable", "ASSET", "DEBIT", True, "RECEIVABLE"),
+    ("1120", "Penalty Receivable", "ASSET", "DEBIT", True, "RECEIVABLE"),
+    ("2000", "Accounts Payable", "LIABILITY", "CREDIT", False, "NONE"),
+    ("2100", "Borrowings", "LIABILITY", "CREDIT", False, "NONE"),
+    ("3000", "Owner's Capital", "EQUITY", "CREDIT", False, "NONE"),
+    ("3100", "Retained Earnings", "EQUITY", "CREDIT", False, "NONE"),
+    ("4000", "Interest Income", "INCOME", "CREDIT", True, "NONE"),
+    ("4010", "Penalty Income", "INCOME", "CREDIT", True, "NONE"),
+    ("4020", "Processing Fee Income", "INCOME", "CREDIT", False, "NONE"),
+    ("5000", "Salary Expense", "EXPENSE", "DEBIT", False, "NONE"),
+    ("5010", "Rent Expense", "EXPENSE", "DEBIT", False, "NONE"),
+    ("5020", "Utilities Expense", "EXPENSE", "DEBIT", False, "NONE"),
+    ("5030", "Transport Expense", "EXPENSE", "DEBIT", False, "NONE"),
+    ("5040", "Office Expense", "EXPENSE", "DEBIT", False, "NONE"),
 ]
 
 class AccountingError(ValueError):
@@ -62,10 +64,14 @@ def log_audit(action, entity_type, entity_id=None, user_id=None, details=None):
     db.session.add(AccountingAuditLog(action=action, entity_type=entity_type, entity_id=str(entity_id) if entity_id else None, user_id=user_id, details=details))
 
 def seed_default_accounts():
-    for code, name, typ, normal, system in DEFAULT_ACCOUNTS:
+    for code, name, typ, normal, system, category in DEFAULT_ACCOUNTS:
         acct = AccountingAccount.query.filter_by(account_code=code).first()
         if not acct:
-            db.session.add(AccountingAccount(account_code=code, account_name=name, account_type=typ, normal_balance=normal, is_system_account=system))
+            db.session.add(AccountingAccount(account_code=code, account_name=name, account_type=typ, normal_balance=normal, is_system_account=system, cash_flow_category=category))
+        else:
+            acct.is_system_account = bool(system) or acct.is_system_account
+            if getattr(acct, "cash_flow_category", None) in (None, "NONE") and category != "NONE":
+                acct.cash_flow_category = category
     db.session.flush()
     for key, code in SYSTEM_MAPPINGS.items():
         setting = AccountingSetting.query.filter_by(setting_key=key).first()
@@ -101,11 +107,11 @@ def create_account(data, user_id=None):
         parent = AccountingAccount.query.get(parent_id)
         if not parent or parent.account_type != typ:
             raise AccountingError("Parent account type is incompatible")
-    acct = AccountingAccount(account_code=data["account_code"], account_name=data["account_name"], account_type=typ, normal_balance=normal, parent_id=parent_id, description=data.get("description"), is_active=data.get("is_active", True), allow_manual_posting=data.get("allow_manual_posting", True))
+    acct = AccountingAccount(account_code=data["account_code"], account_name=data["account_name"], account_type=typ, normal_balance=normal, parent_id=parent_id, description=data.get("description"), is_active=data.get("is_active", True), allow_manual_posting=data.get("allow_manual_posting", True), cash_flow_category=data.get("cash_flow_category", "NONE"))
     db.session.add(acct); db.session.flush(); log_audit("ACCOUNT_CREATE", "AccountingAccount", acct.id, user_id); return acct
 
 def update_account(acct, data, user_id=None):
-    for field in ["account_name", "description", "is_active", "allow_manual_posting"]:
+    for field in ["account_name", "description", "is_active", "allow_manual_posting", "cash_flow_category"]:
         if field in data: setattr(acct, field, data[field])
     log_audit("ACCOUNT_UPDATE", "AccountingAccount", acct.id, user_id); return acct
 
@@ -146,11 +152,26 @@ def reverse_journal(entry, journal_date, reason, user_id=None):
     reversal = create_draft_journal(journal_date, f"Reversal: {reason}", [{"account_id": l.account_id, "debit": l.credit, "credit": l.debit, "customer_id": l.customer_id, "loan_id": l.loan_id, "payment_id": l.payment_id, "collection_id": l.collection_id, "description": l.description} for l in entry.lines], "REVERSAL", entry.id, "ACCOUNTING", user_id, f"REVERSAL:{entry.id}")
     reversal.reversal_of_id = entry.id; post_journal(reversal, user_id); entry.status = "REVERSED"; log_audit("JOURNAL_REVERSE", "AccountingJournalEntry", entry.id, user_id, reason); return reversal
 
-def post_loan_disbursement(loan, user_id=None, funding_key="BANK_ACCOUNT"):
+def validate_funding_account(account):
+    if not account:
+        raise AccountingError("Funding account not found")
+    if not account.is_active:
+        raise AccountingError("Funding account is inactive")
+    if account.account_type != "ASSET":
+        raise AccountingError("Funding account must be an ASSET account")
+    if account.cash_flow_category not in ("CASH", "BANK"):
+        raise AccountingError("Funding account must be configured as CASH or BANK")
+    if not account.allow_manual_posting:
+        raise AccountingError("Funding account does not allow posting")
+    return account
+
+def post_loan_disbursement(loan, user_id=None, funding_key="DEFAULT_DISBURSEMENT_ACCOUNT", funding_account=None, disbursement_date=None):
     amount = money(loan.principal_amount)
-    return post_journal(create_draft_journal(loan.start_date or date.today(), "Loan disbursement", [
+    funding_account = validate_funding_account(funding_account or resolve_system_account(funding_key))
+    journal_date = disbursement_date or loan.start_date or date.today()
+    return post_journal(create_draft_journal(journal_date, "Loan disbursement", [
         {"account_id": resolve_system_account("LOAN_RECEIVABLE_ACCOUNT").id, "debit": amount, "customer_id": loan.customer_id, "loan_id": loan.id},
-        {"account_id": resolve_system_account(funding_key).id, "credit": amount, "customer_id": loan.customer_id, "loan_id": loan.id},
+        {"account_id": funding_account.id, "credit": amount, "customer_id": loan.customer_id, "loan_id": loan.id},
     ], "LOAN_DISBURSEMENT", loan.id, "LOANS", user_id, f"LOAN_DISBURSEMENT:{loan.id}"), user_id)
 
 def allocate_payment(loan, amount, paid_date):
@@ -207,8 +228,22 @@ def ledger_csv(data):
 
 def reconciliation_issues():
     issues=[]
+    for app in LoanApplication.query.filter_by(status="DISBURSED").all():
+        loan = Loan.query.filter_by(customer_id=app.customer_id).order_by(Loan.id.desc()).first()
+        if not loan or not AccountingJournalEntry.query.filter_by(reference_type="LOAN_DISBURSEMENT", reference_id=str(loan.id)).first():
+            issues.append({"type":"DISBURSED_APPLICATION_WITHOUT_JOURNAL","application_id":app.id,"loan_id":loan.id if loan else None})
     for loan in Loan.query.filter(Loan.status.in_(["Active","ACTIVE"])).all():
-        if not AccountingJournalEntry.query.filter_by(reference_type="LOAN_DISBURSEMENT", reference_id=str(loan.id)).first(): issues.append({"type":"MISSING_LOAN_DISBURSEMENT_JOURNAL","loan_id":loan.id})
+        journals=AccountingJournalEntry.query.filter_by(reference_type="LOAN_DISBURSEMENT", reference_id=str(loan.id)).all()
+        if not journals:
+            issues.append({"type":"MISSING_LOAN_DISBURSEMENT_JOURNAL","loan_id":loan.id})
+        if len(journals)>1:
+            issues.append({"type":"DUPLICATE_LOAN_DISBURSEMENT_JOURNALS","loan_id":loan.id,"count":len(journals)})
+        for j in journals:
+            if money(j.total_debit) != money(loan.principal_amount) or money(j.total_credit) != money(loan.principal_amount):
+                issues.append({"type":"WRONG_LOAN_DISBURSEMENT_AMOUNT","loan_id":loan.id,"journal_id":j.id})
+            credits=[l for l in j.lines if money(l.credit)>0]
+            if len(credits)!=1 or credits[0].account.cash_flow_category not in ("CASH","BANK") or credits[0].account.account_type != "ASSET" or not credits[0].account.is_active or not credits[0].account.allow_manual_posting:
+                issues.append({"type":"INVALID_LOAN_DISBURSEMENT_FUNDING_ACCOUNT","loan_id":loan.id,"journal_id":j.id})
     for p in Payment.query.all():
         if not AccountingJournalEntry.query.filter_by(reference_type="LOAN_PAYMENT", reference_id=str(p.id)).first(): issues.append({"type":"MISSING_LOAN_PAYMENT_JOURNAL","payment_id":p.id})
     rows=db.session.query(AccountingJournalEntry.reference_type, AccountingJournalEntry.reference_id, func.count(AccountingJournalEntry.id)).filter(AccountingJournalEntry.reference_type.in_(["LOAN_DISBURSEMENT","LOAN_PAYMENT"])).group_by(AccountingJournalEntry.reference_type, AccountingJournalEntry.reference_id).having(func.count(AccountingJournalEntry.id)>1).all()

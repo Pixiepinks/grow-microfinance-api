@@ -141,6 +141,48 @@ def create_app():
             db.session.commit()
         print(summary)
 
+
+    @accounting_cli.command("backfill-disbursements")
+    @click.option("--dry-run/--commit", default=True, help="Preview without committing by default.")
+    @click.option("--loan-id", type=int, default=None, help="Backfill one loan disbursement.")
+    @click.option("--date-from", default=None, help="Only include loans starting on/after YYYY-MM-DD.")
+    @click.option("--date-to", default=None, help="Only include loans starting on/before YYYY-MM-DD.")
+    def accounting_backfill_disbursements(dry_run, loan_id, date_from, date_to):
+        from datetime import date as date_cls
+        from .models import Loan, AccountingJournalEntry
+        from .accounting import post_loan_disbursement, AccountingError, money
+
+        start = date_cls.fromisoformat(date_from) if date_from else None
+        end = date_cls.fromisoformat(date_to) if date_to else None
+        summary = {"created": 0, "skipped": 0, "failed": 0, "mismatched": 0}
+        query = Loan.query.filter(Loan.status.in_(["Active", "ACTIVE"]))
+        if loan_id:
+            query = query.filter_by(id=loan_id)
+        if start:
+            query = query.filter(Loan.start_date >= start)
+        if end:
+            query = query.filter(Loan.start_date <= end)
+        for loan in query.all():
+            existing = AccountingJournalEntry.query.filter_by(idempotency_key=f"LOAN_DISBURSEMENT:{loan.id}").first()
+            if existing:
+                if money(existing.total_debit) == money(loan.principal_amount) and money(existing.total_credit) == money(loan.principal_amount):
+                    summary["skipped"] += 1
+                else:
+                    summary["mismatched"] += 1
+                continue
+            try:
+                post_loan_disbursement(loan)
+                summary["created"] += 1
+            except AccountingError as exc:
+                current_app.logger.exception("Failed to backfill disbursement for loan %s", loan.id)
+                summary["failed"] += 1
+                click.echo({"loan_id": loan.id, "error": str(exc)})
+        if dry_run:
+            db.session.rollback()
+        else:
+            db.session.commit()
+        click.echo(summary)
+
     @app.route("/health", methods=["GET"])
     def health_check():
         return jsonify({"status": "ok"})

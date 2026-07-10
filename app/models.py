@@ -426,6 +426,7 @@ class AccountingAccount(db.Model):
     normal_balance = db.Column(db.String(10), nullable=False)
     parent_id = db.Column(db.Integer, db.ForeignKey("accounting_accounts.id"))
     description = db.Column(db.Text)
+    cash_flow_category = db.Column(db.String(20), nullable=False, default="NONE")
     is_system_account = db.Column(db.Boolean, nullable=False, default=False)
     is_active = db.Column(db.Boolean, nullable=False, default=True)
     allow_manual_posting = db.Column(db.Boolean, nullable=False, default=True)
