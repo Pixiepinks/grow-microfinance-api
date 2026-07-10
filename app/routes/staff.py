@@ -6,6 +6,8 @@ from flask_jwt_extended import get_jwt_identity
 from ..currency import CURRENCY_CODE, format_currency
 from ..extensions import db
 from ..models import Loan, LoanApplication, Payment, Customer
+from ..loan_ledger import generate_loan_ledger
+from ..accounting import AccountingError, allocate_payment, money, post_loan_payment
 from .loan_applications import (
     STATUS_STAFF_APPROVED,
     STATUS_SUBMITTED,
@@ -49,7 +51,7 @@ def record_payment():
         return jsonify({"message": "loan_id is required"}), 400
 
     try:
-        amount = Decimal(str(data.get("amount_collected", "0")))
+        amount = money(Decimal(str(data.get("amount_collected", "0"))))
     except Exception:
         return jsonify({"message": "amount_collected must be a valid number"}), 400
 
@@ -77,16 +79,30 @@ def record_payment():
             400,
         )
 
-    payment = Payment(
-        loan_id=loan_id,
-        amount_collected=amount,
-        collection_date=collection_date_value,
-        collected_by_id=int(get_jwt_identity()),
-        payment_method=payment_method,
-        remarks=remarks,
-    )
-    db.session.add(payment)
-    db.session.commit()
+    try:
+        if not loan.ledger_entries:
+            generate_loan_ledger(loan)
+            db.session.flush()
+        principal_paid, interest_paid, penalty_paid, other_fee_paid = allocate_payment(loan, amount, collection_date_value)
+        payment = Payment(
+            loan_id=loan_id,
+            amount_collected=amount,
+            principal_paid=principal_paid,
+            interest_paid=interest_paid,
+            penalty_paid=penalty_paid,
+            other_fee_paid=other_fee_paid,
+            collection_date=collection_date_value,
+            collected_by_id=int(get_jwt_identity()),
+            payment_method=payment_method,
+            remarks=remarks,
+        )
+        db.session.add(payment)
+        db.session.flush()
+        post_loan_payment(payment, int(get_jwt_identity()))
+        db.session.commit()
+    except AccountingError as exc:
+        db.session.rollback()
+        return jsonify({"message": str(exc)}), 400
 
     return jsonify({"message": "Payment recorded", "payment_id": payment.id})
 
