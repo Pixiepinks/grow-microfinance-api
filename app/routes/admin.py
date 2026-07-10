@@ -16,6 +16,7 @@ from ..models import (
     Payment,
     User,
 )
+from ..accounting import post_loan_disbursement, AccountingError
 from ..loan_ledger import (
     daily_interest_rate,
     generate_loan_ledger,
@@ -188,7 +189,12 @@ def create_loan():
     db.session.add(loan)
     db.session.flush()
     generate_loan_ledger(loan)
-    db.session.commit()
+    try:
+        post_loan_disbursement(loan, int(get_jwt_identity()))
+        db.session.commit()
+    except AccountingError as exc:
+        db.session.rollback()
+        return jsonify({"message": str(exc)}), 400
 
     return jsonify({"message": "Loan created", "loan_id": loan.id})
 

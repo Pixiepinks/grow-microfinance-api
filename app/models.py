@@ -393,6 +393,10 @@ class Payment(db.Model):
     loan_id = db.Column(db.Integer, db.ForeignKey("loans.id"), nullable=False)
     collection_date = db.Column(db.Date, default=date.today, nullable=False)
     amount_collected = db.Column(Numeric(12, 2), nullable=False)
+    principal_paid = db.Column(Numeric(12, 2), nullable=False, default=Decimal("0.00"))
+    interest_paid = db.Column(Numeric(12, 2), nullable=False, default=Decimal("0.00"))
+    penalty_paid = db.Column(Numeric(12, 2), nullable=False, default=Decimal("0.00"))
+    other_fee_paid = db.Column(Numeric(12, 2), nullable=False, default=Decimal("0.00"))
     collected_by_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
     payment_method = db.Column(db.String(50), default="Cash")
     remarks = db.Column(db.String(255))
@@ -402,3 +406,104 @@ class Payment(db.Model):
     collected_by = relationship(
         "User", back_populates="collected_payments", foreign_keys=[collected_by_id]
     )
+
+ACCOUNT_TYPES = ("ASSET", "LIABILITY", "EQUITY", "INCOME", "EXPENSE")
+NORMAL_BALANCES = ("DEBIT", "CREDIT")
+JOURNAL_STATUSES = ("DRAFT", "POSTED", "REVERSED")
+
+
+class AccountingAccount(db.Model):
+    __tablename__ = "accounting_accounts"
+    __table_args__ = (
+        db.CheckConstraint("account_type in ('ASSET','LIABILITY','EQUITY','INCOME','EXPENSE')", name="ck_accounting_accounts_type"),
+        db.CheckConstraint("normal_balance in ('DEBIT','CREDIT')", name="ck_accounting_accounts_normal_balance"),
+    )
+
+    id = db.Column(db.Integer, primary_key=True)
+    account_code = db.Column(db.String(32), unique=True, index=True, nullable=False)
+    account_name = db.Column(db.String(150), nullable=False)
+    account_type = db.Column(db.String(20), nullable=False)
+    normal_balance = db.Column(db.String(10), nullable=False)
+    parent_id = db.Column(db.Integer, db.ForeignKey("accounting_accounts.id"))
+    description = db.Column(db.Text)
+    is_system_account = db.Column(db.Boolean, nullable=False, default=False)
+    is_active = db.Column(db.Boolean, nullable=False, default=True)
+    allow_manual_posting = db.Column(db.Boolean, nullable=False, default=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    parent = relationship("AccountingAccount", remote_side=[id], backref="children")
+
+
+class AccountingJournalEntry(db.Model):
+    __tablename__ = "accounting_journal_entries"
+
+    id = db.Column(db.Integer, primary_key=True)
+    journal_no = db.Column(db.String(40), unique=True, index=True, nullable=False)
+    journal_date = db.Column(db.Date, index=True, nullable=False)
+    description = db.Column(db.Text, nullable=False)
+    reference_type = db.Column(db.String(50))
+    reference_id = db.Column(db.String(64))
+    source_module = db.Column(db.String(50))
+    status = db.Column(db.String(20), nullable=False, default="DRAFT")
+    posted_at = db.Column(db.DateTime)
+    posted_by_id = db.Column(db.Integer, db.ForeignKey("users.id"))
+    created_by_id = db.Column(db.Integer, db.ForeignKey("users.id"))
+    reversal_of_id = db.Column(db.Integer, db.ForeignKey("accounting_journal_entries.id"))
+    idempotency_key = db.Column(db.String(160), unique=True, index=True)
+    total_debit = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    total_credit = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    lines = relationship("AccountingJournalLine", back_populates="journal_entry", cascade="all, delete-orphan", order_by="AccountingJournalLine.line_no")
+    reversal_of = relationship("AccountingJournalEntry", remote_side=[id])
+
+
+class AccountingJournalLine(db.Model):
+    __tablename__ = "accounting_journal_lines"
+    __table_args__ = (
+        db.UniqueConstraint("journal_entry_id", "line_no", name="uq_accounting_journal_line_no"),
+        db.CheckConstraint("debit >= 0", name="ck_accounting_journal_lines_debit_nonnegative"),
+        db.CheckConstraint("credit >= 0", name="ck_accounting_journal_lines_credit_nonnegative"),
+        db.CheckConstraint("(debit > 0 and credit = 0) or (credit > 0 and debit = 0)", name="ck_accounting_journal_lines_one_sided"),
+    )
+
+    id = db.Column(db.Integer, primary_key=True)
+    journal_entry_id = db.Column(db.Integer, db.ForeignKey("accounting_journal_entries.id"), nullable=False, index=True)
+    line_no = db.Column(db.Integer, nullable=False)
+    account_id = db.Column(db.Integer, db.ForeignKey("accounting_accounts.id"), nullable=False, index=True)
+    debit = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    credit = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    customer_id = db.Column(db.Integer, db.ForeignKey("customers.id"))
+    loan_id = db.Column(db.Integer, db.ForeignKey("loans.id"))
+    payment_id = db.Column(db.Integer, db.ForeignKey("payments.id"))
+    collection_id = db.Column(db.Integer)
+    description = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    journal_entry = relationship("AccountingJournalEntry", back_populates="lines")
+    account = relationship("AccountingAccount")
+
+
+class AccountingSetting(db.Model):
+    __tablename__ = "accounting_settings"
+
+    id = db.Column(db.Integer, primary_key=True)
+    setting_key = db.Column(db.String(80), unique=True, nullable=False)
+    setting_value = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
+class AccountingAuditLog(db.Model):
+    __tablename__ = "accounting_audit_logs"
+
+    id = db.Column(db.Integer, primary_key=True)
+    action = db.Column(db.String(80), nullable=False)
+    entity_type = db.Column(db.String(80), nullable=False)
+    entity_id = db.Column(db.String(64))
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"))
+    details = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
