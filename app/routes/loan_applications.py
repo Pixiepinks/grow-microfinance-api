@@ -18,6 +18,8 @@ from ..currency import CURRENCY_CODE, format_currency
 from ..extensions import db
 from ..models import Customer, Loan, LoanApplication, LoanApplicationDocument
 from ..loan_ledger import generate_loan_ledger
+from ..accounting import AccountingError, post_loan_disbursement, validate_funding_account
+from ..models import AccountingAccount
 from .utils import role_required
 
 loan_app_bp = Blueprint("loan_applications", __name__, url_prefix="/loan-applications")
@@ -979,14 +981,30 @@ def disburse_application(application_id):
             400,
         )
 
+    data = request.get_json(silent=True) or {}
+    funding_account = None
+    if data.get("funding_account_id") is not None:
+        try:
+            funding_account = validate_funding_account(
+                AccountingAccount.query.get(int(data["funding_account_id"]))
+            )
+        except (TypeError, ValueError):
+            return jsonify({"message": "funding_account_id must be a valid account id"}), 400
+        except AccountingError as exc:
+            return jsonify({"message": str(exc)}), 400
+    else:
+        current_app.logger.warning(
+            "Legacy disbursement request for application %s did not include funding_account_id; using DEFAULT_DISBURSEMENT_ACCOUNT",
+            application.id,
+        )
+
     principal = application.approved_amount or application.applied_amount
     tenure_months = application.approved_tenure or application.tenure_months
     interest_rate = application.interest_rate or Decimal("0")
     total_days = max(int(tenure_months or 0) * 30, 1)
-    payment_interval_days = int(
-        (request.get_json(silent=True) or {}).get("payment_interval_days", 7) or 7
-    )
-    start_date = date.today()
+    payment_interval_days = int(data.get("payment_interval_days", 7) or 7)
+    disbursement_date = date.fromisoformat(data.get("disbursement_date")) if data.get("disbursement_date") else date.today()
+    start_date = disbursement_date
     end_date = start_date + timedelta(days=total_days - 1)
     total_payable = Decimal(principal) + (
         Decimal(principal) * (Decimal(interest_rate) / Decimal("100"))
@@ -1014,6 +1032,12 @@ def disburse_application(application_id):
         application.status = STATUS_DISBURSED
         if hasattr(application, "disbursed_at"):
             application.disbursed_at = datetime.utcnow()
+        post_loan_disbursement(
+            loan,
+            int(get_jwt_identity()),
+            funding_account=funding_account,
+            disbursement_date=disbursement_date,
+        )
         db.session.commit()
         current_app.logger.info(
             "Application %s disbursed into loan %s by user_id=%s",
@@ -1032,6 +1056,12 @@ def disburse_application(application_id):
             ),
             201,
         )
+    except AccountingError as exc:
+        db.session.rollback()
+        current_app.logger.exception(
+            "Accounting posting failed while disbursing application %s", application.id
+        )
+        return jsonify({"message": "Accounting posting failed", "error": str(exc)}), 400
     except Exception as exc:  # pragma: no cover - defensive logging
         db.session.rollback()
         current_app.logger.exception(

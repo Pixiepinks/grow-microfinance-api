@@ -43,7 +43,7 @@ def list_accounts():
     if request.args.get("parent_id"): q=q.filter_by(parent_id=request.args.get("parent_id"))
     if request.args.get("search"):
         s=f"%{request.args['search']}%"; q=q.filter((AccountingAccount.account_code.ilike(s)) | (AccountingAccount.account_name.ilike(s)))
-    return jsonify([{"id":a.id,"account_code":a.account_code,"account_name":a.account_name,"account_type":a.account_type,"normal_balance":a.normal_balance,"parent_id":a.parent_id,"description":a.description,"is_system_account":a.is_system_account,"is_active":a.is_active,"allow_manual_posting":a.allow_manual_posting} for a in q.order_by(AccountingAccount.account_code).all()])
+    return jsonify([{"id":a.id,"account_code":a.account_code,"account_name":a.account_name,"account_type":a.account_type,"normal_balance":a.normal_balance,"parent_id":a.parent_id,"description":a.description,"is_system_account":a.is_system_account,"is_active":a.is_active,"allow_manual_posting":a.allow_manual_posting,"cash_flow_category":a.cash_flow_category} for a in q.order_by(AccountingAccount.account_code).all()])
 
 @accounting_bp.route("/accounts", methods=["POST"])
 @role_required(["admin"])
