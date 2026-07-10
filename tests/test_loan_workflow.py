@@ -1,10 +1,11 @@
 from datetime import date
 from decimal import Decimal
+from io import BytesIO
 
 from flask_jwt_extended import create_access_token
 
 from app.extensions import db
-from app.models import Customer, Loan, LoanApplication, User
+from app.models import Customer, Loan, LoanApplication, LoanApplicationDocument, User
 from app.routes.loan_applications import (
     STATUS_APPROVED,
     STATUS_REJECTED,
@@ -799,3 +800,142 @@ def test_disbursement_creates_ledger_automatically(app, client):
     loan = Loan.query.get(response.get_json()["loan_id"])
     assert len(loan.ledger_entries) == 5
     assert [entry.period_days for entry in loan.ledger_entries] == [7, 7, 7, 7, 2]
+
+
+def _draft_application(customer: Customer, number: str = "APP-DOCS") -> LoanApplication:
+    application = LoanApplication(
+        application_number=number,
+        customer_id=customer.id,
+        loan_type="GROW_PERSONAL",
+        status="DRAFT",
+        applied_amount=Decimal("7000"),
+        tenure_months=5,
+        full_name=customer.full_name,
+        nic_number="123456789V",
+        mobile_number="0700000000",
+        monthly_income=Decimal("45000"),
+        monthly_expenses=Decimal("12000"),
+        extra_data={
+            "employment_type": "salaried",
+            "net_monthly_salary": "45000",
+            "employer_name": "Acme Ltd",
+        },
+    )
+    db.session.add(application)
+    db.session.commit()
+    return application
+
+
+def _multipart_file(filename: str = "nic-front.png"):
+    return (BytesIO(b"fake-image-bytes"), filename)
+
+
+def test_document_upload_storage_unavailable_returns_json_without_document_row(app, client, monkeypatch):
+    for key in ("SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"):
+        monkeypatch.delenv(key, raising=False)
+    customer_user = _create_user("customer", "Docs Customer", "docs-customer@example.com")
+    customer = _customer_profile(customer_user, code="CUST-DOCS")
+    application = _draft_application(customer, "APP-DOCS-STORAGE")
+
+    response = client.post(
+        f"/loan-applications/{application.id}/documents",
+        headers=_auth_headers(app, customer_user),
+        data={"document_type": "NIC_FRONT", "file": _multipart_file()},
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 500
+    body = response.get_json()
+    assert body["success"] is False
+    assert body["message"] == "Document upload failed"
+    assert "SUPABASE" in body["error"]
+    assert LoanApplicationDocument.query.filter_by(loan_application_id=application.id).count() == 0
+
+
+def test_document_upload_invalid_document_type(app, client):
+    customer_user = _create_user("customer", "Invalid Doc", "invalid-doc@example.com")
+    customer = _customer_profile(customer_user, code="CUST-BAD-DOC")
+    application = _draft_application(customer, "APP-DOCS-INVALID")
+
+    response = client.post(
+        f"/loan-applications/{application.id}/documents",
+        headers=_auth_headers(app, customer_user),
+        data={"document_type": "NOT_ALLOWED", "file": _multipart_file()},
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 400
+    assert response.get_json()["message"] == "Invalid document_type"
+    assert LoanApplicationDocument.query.filter_by(loan_application_id=application.id).count() == 0
+
+
+def test_document_upload_missing_file(app, client):
+    customer_user = _create_user("customer", "Missing File", "missing-file@example.com")
+    customer = _customer_profile(customer_user, code="CUST-NO-FILE")
+    application = _draft_application(customer, "APP-DOCS-MISSING")
+
+    response = client.post(
+        f"/loan-applications/{application.id}/documents",
+        headers=_auth_headers(app, customer_user),
+        data={"document_type": "NIC_FRONT"},
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 400
+    assert response.get_json()["message"] == "file is required"
+    assert LoanApplicationDocument.query.filter_by(loan_application_id=application.id).count() == 0
+
+
+def test_document_upload_success(app, client, monkeypatch):
+    customer_user = _create_user("customer", "Upload Success", "upload-success@example.com")
+    customer = _customer_profile(customer_user, code="CUST-UPLOAD")
+    application = _draft_application(customer, "APP-DOCS-SUCCESS")
+
+    def fake_upload(application_id, document_type, uploaded_file):
+        assert application_id == application.id
+        assert document_type == "NIC_FRONT"
+        assert uploaded_file.filename == "nic-front.png"
+        return f"loan_documents/{application_id}/NIC_FRONT_test.png"
+
+    monkeypatch.setattr("app.routes.loan_applications.upload_document_to_supabase", fake_upload)
+
+    response = client.post(
+        f"/loan-applications/{application.id}/documents",
+        headers=_auth_headers(app, customer_user),
+        data={"document_type": "nic_front", "file": _multipart_file()},
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 201
+    body = response.get_json()
+    assert body["message"] == "Document uploaded"
+    assert body["file_path"] == f"loan_documents/{application.id}/NIC_FRONT_test.png"
+    document = LoanApplicationDocument.query.get(body["document_id"])
+    assert document.document_type == "NIC_FRONT"
+    assert document.file_path == body["file_path"]
+
+
+def test_document_upload_unhandled_exception_returns_structured_json(app, client, monkeypatch):
+    customer_user = _create_user("customer", "Upload Error", "upload-error@example.com")
+    customer = _customer_profile(customer_user, code="CUST-UPLOAD-ERR")
+    application = _draft_application(customer, "APP-DOCS-ERROR")
+
+    def fake_upload(*_args, **_kwargs):
+        raise RuntimeError("storage service unavailable")
+
+    monkeypatch.setattr("app.routes.loan_applications.upload_document_to_supabase", fake_upload)
+
+    response = client.post(
+        f"/loan-applications/{application.id}/documents",
+        headers=_auth_headers(app, customer_user),
+        data={"document_type": "NIC_FRONT", "file": _multipart_file()},
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 500
+    assert response.get_json() == {
+        "success": False,
+        "message": "Document upload failed",
+        "error": "storage service unavailable",
+    }
+    assert LoanApplicationDocument.query.filter_by(loan_application_id=application.id).count() == 0

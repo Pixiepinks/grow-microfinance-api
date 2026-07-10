@@ -118,6 +118,10 @@ TYPE_DOCUMENT_REQUIREMENTS = {
     "GROW_TEAM": {"MEMBER_LIST", "GROUP_PHOTO"},
 }
 
+ALLOWED_DOCUMENT_TYPES = COMMON_REQUIRED_DOCUMENTS | set().union(
+    *TYPE_DOCUMENT_REQUIREMENTS.values()
+)
+
 
 NIC_REGEX = re.compile(r"^(?:[0-9]{9}[VvXx]|[0-9]{12})$")
 
@@ -1061,36 +1065,107 @@ def upload_document_to_supabase(
     return object_path
 
 
+def _file_size(file_storage) -> int | None:
+    stream = getattr(file_storage, "stream", None)
+    if not stream or not hasattr(stream, "tell") or not hasattr(stream, "seek"):
+        return None
+
+    try:
+        current_position = stream.tell()
+        stream.seek(0, os.SEEK_END)
+        size = stream.tell()
+        stream.seek(current_position)
+        return size
+    except Exception:  # pragma: no cover - best-effort logging context only
+        return None
+
+
+def _storage_configuration_status() -> dict:
+    return {
+        "supabase_url_configured": bool(os.environ.get("SUPABASE_URL")),
+        "supabase_service_role_key_configured": bool(
+            os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+        ),
+        "storage_bucket_configured": bool(
+            os.environ.get("SUPABASE_BUCKET_KYC") or os.environ.get("SUPABASE_BUCKET")
+        ),
+        "upload_prefix_configured": bool(os.environ.get("SUPABASE_UPLOAD_FOLDER")),
+    }
+
+
+def _safe_exception_message(exc: Exception) -> str:
+    message = str(exc) or exc.__class__.__name__
+    if isinstance(exc, KeyError):
+        message = f"Missing required storage configuration: {exc.args[0]}"
+    return message
+
+
 @loan_app_bp.route("/<int:application_id>/documents", methods=["POST"])
 @role_required(["customer", "admin", "staff"])
 def upload_document(application_id):
-    application = LoanApplication.query.get_or_404(application_id)
-    access_error = assert_application_access(application)
-    if access_error:
-        return access_error
+    document_type = None
+    file = None
+    try:
+        application = LoanApplication.query.get_or_404(application_id)
+        access_error = assert_application_access(application)
+        if access_error:
+            return access_error
 
-    document_type = request.form.get("document_type")
-    file = request.files.get("file")
-    if not document_type or not file:
-        return jsonify({"message": "document_type and file are required"}), 400
+        document_type = request.form.get("document_type")
+        file = request.files.get("file")
+        if not document_type:
+            return jsonify({"message": "document_type is required"}), 400
+        if not file or not file.filename:
+            return jsonify({"message": "file is required"}), 400
 
-    object_path = upload_document_to_supabase(application_id, document_type, file)
+        document_type = document_type.strip().upper()
+        if document_type not in ALLOWED_DOCUMENT_TYPES:
+            return jsonify({"message": "Invalid document_type"}), 400
 
-    document = LoanApplicationDocument(
-        loan_application_id=application_id,
-        document_type=document_type,
-        file_path=object_path,
-    )
-    db.session.add(document)
-    db.session.commit()
+        object_path = upload_document_to_supabase(application_id, document_type, file)
 
-    return (
-        jsonify(
+        document = LoanApplicationDocument(
+            loan_application_id=application_id,
+            document_type=document_type,
+            file_path=object_path,
+        )
+        db.session.add(document)
+        db.session.commit()
+
+        return (
+            jsonify(
+                {
+                    "message": "Document uploaded",
+                    "document_id": document.id,
+                    "file_path": document.file_path,
+                }
+            ),
+            201,
+        )
+    except Exception as exc:
+        db.session.rollback()
+        current_app.logger.info(
+            "Document upload request context: %s",
             {
-                "message": "Document uploaded",
-                "document_id": document.id,
-                "file_path": document.file_path,
-            }
-        ),
-        201,
-    )
+                "application_id": application_id,
+                "document_type": document_type,
+                "uploaded_filename": getattr(file, "filename", None),
+                "content_type": getattr(file, "mimetype", None),
+                "file_size": _file_size(file) if file else None,
+                "storage_configuration": _storage_configuration_status(),
+            },
+        )
+        current_app.logger.exception(
+            "Document upload failed for loan application %s",
+            application_id,
+        )
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "message": "Document upload failed",
+                    "error": _safe_exception_message(exc),
+                }
+            ),
+            500,
+        )
