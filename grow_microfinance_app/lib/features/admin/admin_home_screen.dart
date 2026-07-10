@@ -51,8 +51,8 @@ class _AdminHomeScreenState extends State<AdminHomeScreen> {
                     children: [
                       Text('Total customers: ${_dashboard?['total_customers'] ?? 0}'),
                       Text('Active loans: ${_dashboard?['total_active_loans'] ?? 0}'),
-                      Text('Outstanding: LKR ${_dashboard?['total_outstanding'] ?? 0}'),
-                      Text("Today's collection: LKR ${_dashboard?['todays_collection'] ?? 0}"),
+                      Text('Outstanding: Rs. ${_dashboard?['total_outstanding'] ?? 0}'),
+                      Text("Today's collection: Rs. ${_dashboard?['todays_collection'] ?? 0}"),
                       const SizedBox(height: 20),
                       const Text('Navigation'),
                       Wrap(

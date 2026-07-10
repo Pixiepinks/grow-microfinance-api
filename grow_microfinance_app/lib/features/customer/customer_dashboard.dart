@@ -101,13 +101,13 @@ class _CustomerDashboardState extends State<CustomerDashboard> {
                           Expanded(
                             child: SummaryCard(
                               title: 'Outstanding',
-                              value: 'LKR ${(_summary?['total_outstanding'] ?? 0).toString()}',
+                              value: 'Rs. ${(_summary?['total_outstanding'] ?? 0).toString()}',
                             ),
                           ),
                           Expanded(
                             child: SummaryCard(
                               title: 'Arrears',
-                              value: 'LKR ${(_summary?['total_arrears'] ?? 0).toString()}',
+                              value: 'Rs. ${(_summary?['total_arrears'] ?? 0).toString()}',
                               valueColor: Colors.red,
                             ),
                           ),
@@ -117,7 +117,7 @@ class _CustomerDashboardState extends State<CustomerDashboard> {
                       ..._loans.map((loan) => Card(
                             child: ListTile(
                               title: Text('Loan #${loan['loan_number']}'),
-                              subtitle: Text('Outstanding: LKR ${loan['outstanding']}'),
+                              subtitle: Text('Outstanding: Rs. ${loan['outstanding']}'),
                               trailing: Column(
                                 crossAxisAlignment: CrossAxisAlignment.end,
                                 mainAxisAlignment: MainAxisAlignment.center,

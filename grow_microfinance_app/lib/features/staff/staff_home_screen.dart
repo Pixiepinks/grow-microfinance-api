@@ -105,7 +105,7 @@ class _StaffHomeScreenState extends State<StaffHomeScreen> {
                           itemBuilder: (context, index) {
                             final p = _payments[index];
                             return ListTile(
-                              title: Text('LKR ${p['amount_collected']}'),
+                              title: Text('Rs. ${p['amount_collected']}'),
                               subtitle: Text('Loan ${p['loan_id']} - ${p['payment_method']}'),
                               trailing: Text(p['collection_date']),
                             );

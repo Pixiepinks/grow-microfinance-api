@@ -14,6 +14,7 @@ from app.supabase_client import (
     get_supabase_client,
     get_upload_prefix,
 )
+from ..currency import CURRENCY_CODE, format_currency
 from ..extensions import db
 from ..models import Customer, Loan, LoanApplication, LoanApplicationDocument
 from ..loan_ledger import generate_loan_ledger
@@ -298,8 +299,14 @@ def build_application_response(application: LoanApplication) -> dict:
         "customer_code": customer.customer_code if customer else None,
         "loan_type": application.loan_type,
         "status": application.status,
+        "currency": CURRENCY_CODE,
         "applied_amount": (
             float(application.applied_amount)
+            if application.applied_amount is not None
+            else None
+        ),
+        "applied_amount_formatted": (
+            format_currency(application.applied_amount)
             if application.applied_amount is not None
             else None
         ),
@@ -311,6 +318,11 @@ def build_application_response(application: LoanApplication) -> dict:
         ),
         "approved_amount": (
             float(application.approved_amount)
+            if application.approved_amount is not None
+            else None
+        ),
+        "approved_amount_formatted": (
+            format_currency(application.approved_amount)
             if application.approved_amount is not None
             else None
         ),
@@ -340,8 +352,18 @@ def build_application_response(application: LoanApplication) -> dict:
             if application.monthly_income is not None
             else None
         ),
+        "monthly_income_formatted": (
+            format_currency(application.monthly_income)
+            if application.monthly_income is not None
+            else None
+        ),
         "monthly_expenses": (
             float(application.monthly_expenses)
+            if application.monthly_expenses is not None
+            else None
+        ),
+        "monthly_expenses_formatted": (
+            format_currency(application.monthly_expenses)
             if application.monthly_expenses is not None
             else None
         ),

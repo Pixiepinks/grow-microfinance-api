@@ -5,6 +5,7 @@ from flask_jwt_extended import get_jwt_identity
 
 from app.supabase_client import build_public_url
 
+from ..currency import CURRENCY_CODE, format_currency
 from ..extensions import db
 from ..models import (
     Customer,
@@ -209,10 +210,15 @@ def list_loans():
             "loan_number": l.loan_number,
             "customer_id": l.customer_id,
             "status": l.status,
+            "currency": CURRENCY_CODE,
             "principal_amount": float(l.principal_amount),
+            "principal_amount_formatted": format_currency(l.principal_amount),
             "total_payable": float(l.total_payable),
+            "total_payable_formatted": format_currency(l.total_payable),
             "total_paid": float(l.total_paid),
+            "total_paid_formatted": format_currency(l.total_paid),
             "outstanding": float(l.outstanding),
+            "outstanding_formatted": format_currency(l.outstanding),
         }
         for l in loans
     ]
@@ -224,7 +230,9 @@ def _loan_to_dict(loan: Loan) -> dict:
         "id": loan.id,
         "loan_number": loan.loan_number,
         "customer_id": loan.customer_id,
+        "currency": CURRENCY_CODE,
         "principal_amount": float(loan.principal_amount),
+        "principal_amount_formatted": format_currency(loan.principal_amount),
         "interest_rate": float(loan.interest_rate),
         "total_days": loan.total_days,
         "payment_interval_days": loan.payment_interval_days,
@@ -244,15 +252,23 @@ def _ledger_to_dict(entry: LoanLedger) -> dict:
         ),
         "due_date": entry.due_date.isoformat() if entry.due_date else None,
         "period_days": entry.period_days,
+        "currency": CURRENCY_CODE,
         "opening_balance": float(entry.opening_balance),
+        "opening_balance_formatted": format_currency(entry.opening_balance),
         "interest_amount": float(entry.interest_amount),
+        "interest_amount_formatted": format_currency(entry.interest_amount),
         "principal_amount": float(entry.principal_amount),
+        "principal_amount_formatted": format_currency(entry.principal_amount),
         "installment_amount": float(entry.installment_amount),
+        "installment_amount_formatted": format_currency(entry.installment_amount),
         "closing_balance": float(entry.closing_balance),
+        "closing_balance_formatted": format_currency(entry.closing_balance),
         "paid_amount": float(entry.paid_amount or 0),
+        "paid_amount_formatted": format_currency(entry.paid_amount or 0),
         "paid_date": entry.paid_date.isoformat() if entry.paid_date else None,
         "delay_days": entry.delay_days or 0,
         "delay_interest": float(entry.delay_interest or 0),
+        "delay_interest_formatted": format_currency(entry.delay_interest or 0),
         "status": entry.status,
     }
 
@@ -327,8 +343,11 @@ def dashboard():
         {
             "total_customers": total_customers,
             "total_active_loans": total_active_loans,
+            "currency": CURRENCY_CODE,
             "total_outstanding": float(total_outstanding),
+            "total_outstanding_formatted": format_currency(total_outstanding),
             "todays_collection": float(todays_collection),
+            "todays_collection_formatted": format_currency(todays_collection),
         }
     )
 
