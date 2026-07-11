@@ -3,8 +3,8 @@ import click
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-from flask_migrate import stamp, upgrade
-from sqlalchemy import inspect, text
+from sqlalchemy import text
+from werkzeug.exceptions import HTTPException
 
 from .extensions import db, migrate, jwt, init_jwt_handlers
 from .routes.auth import auth_bp
@@ -31,6 +31,7 @@ def create_app():
     migrate.init_app(app, db)
     jwt.init_app(app)
     init_jwt_handlers(app)
+    _warn_on_weak_jwt_secret(app)
 
     configured_origins = app.config.get("CORS_ORIGINS", [])
     if isinstance(configured_origins, str):
@@ -48,6 +49,31 @@ def create_app():
     def handle_preflight_requests():
         if request.method == "OPTIONS":
             return "", 204
+
+    @app.errorhandler(HTTPException)
+    def handle_http_exception(exc):
+        return (
+            jsonify(
+                {
+                    "error": exc.name.lower().replace(" ", "_"),
+                    "message": exc.description,
+                }
+            ),
+            exc.code,
+        )
+
+    @app.errorhandler(Exception)
+    def handle_unexpected_exception(exc):
+        db.session.rollback()
+        app.logger.exception(
+            "Unhandled API error during %s %s", request.method, request.path
+        )
+        message = (
+            "Unable to submit loan application."
+            if request.path.startswith("/loan-applications")
+            else "An unexpected error occurred."
+        )
+        return jsonify({"error": "internal_server_error", "message": message}), 500
 
     app.register_blueprint(auth_bp)
     app.register_blueprint(admin_bp)
@@ -235,25 +261,12 @@ def create_app():
     def health_check():
         return jsonify({"status": "ok"})
 
-    # Ensure database schema is present even when the deployment start command
-    # skips the entrypoint migration step (e.g., running `gunicorn wsgi:app`).
-    # If migrations have already run, `upgrade()` is a no-op. Allow skipping
-    # this auto-run via environment variable so CLI migration commands do not
-    # execute twice.
-    if os.getenv("SKIP_AUTO_MIGRATIONS") != "1":
-        with app.app_context():
-            try:
-                upgrade()
-            except Exception as exc:  # pragma: no cover - defensive logging
-                app.logger.warning("Skipping automatic migrations: %s", exc)
-                try:
-                    inspector = inspect(db.engine)
-                    if not inspector.has_table("alembic_version"):
-                        stamp()
-                        app.logger.info(
-                            "Database stamped to current migration head after failed upgrade"
-                        )
-                except Exception as stamp_exc:  # pragma: no cover - defensive logging
-                    app.logger.error("Failed to stamp database after migration error: %s", stamp_exc)
-
     return app
+
+
+def _warn_on_weak_jwt_secret(app):
+    secret = app.config.get("JWT_SECRET_KEY") or ""
+    if len(secret.encode("utf-8")) < 32:
+        app.logger.warning(
+            "JWT_SECRET_KEY is shorter than 32 bytes; set a strong random secret for production."
+        )

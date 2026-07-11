@@ -1,14 +1,14 @@
 """Add flexible approved loan terms.
 
-Revision ID: 0023_flexible_approved_loan_terms
-Revises: 0022_mark_core_accounting_system_accounts
+Revision ID: 0023_flexible_loan_terms
+Revises: 0022_core_accounts
 Create Date: 2026-07-11
 """
 from alembic import op
 import sqlalchemy as sa
 
-revision = "0023_flexible_approved_loan_terms"
-down_revision = "0022_mark_core_accounting_system_accounts"
+revision = "0023_flexible_loan_terms"
+down_revision = "0022_core_accounts"
 branch_labels = None
 depends_on = None
 
@@ -38,6 +38,11 @@ def upgrade():
     _add_column_if_missing("loans", sa.Column("interest_type", sa.String(length=20), nullable=True))
     _add_column_if_missing("loans", sa.Column("maturity_date", sa.Date(), nullable=True))
     _add_column_if_missing("loans", sa.Column("final_installment_due_date", sa.Date(), nullable=True))
+
+    op.execute("UPDATE loans SET loan_days = total_days WHERE loan_days IS NULL AND total_days IS NOT NULL")
+    op.execute("UPDATE loans SET total_repayment = total_payable WHERE total_repayment IS NULL AND total_payable IS NOT NULL")
+    op.execute("UPDATE loans SET installment_amount = daily_installment WHERE installment_amount IS NULL AND daily_installment IS NOT NULL")
+    op.execute("UPDATE loans SET maturity_date = end_date WHERE maturity_date IS NULL AND end_date IS NOT NULL")
 
 
 def downgrade():

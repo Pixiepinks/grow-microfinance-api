@@ -44,15 +44,19 @@ scripts/seed_data.py # Optional demo data
    ```bash
    export FLASK_ENV=development
    export DATABASE_URL=postgresql+psycopg2://USER:PASSWORD@HOST:PORT/DBNAME
-   export JWT_SECRET_KEY=super-secret-key
+   export JWT_SECRET_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(48))')"
    ```
 5. Initialize the database (Postgres recommended; SQLite used if DATABASE_URL is not set)
    ```bash
    flask --app app:create_app db upgrade
    ```
-6. (Optional) Seed demo data with an admin/staff/customer, a sample loan, and a payment
+6. Seed essential users, or explicitly enable demo data with an admin/staff/customer, a sample loan, and a payment
    ```bash
+   # Essential users only (default; safe for production startup)
    python scripts/seed_data.py
+
+   # Demo/sample loan data, for development only
+   SEED_DEMO_DATA=true python scripts/seed_data.py
    ```
    Or seed through the public API (uses Flask's test client, no server needed):
    ```bash
@@ -75,8 +79,9 @@ scripts/seed_data.py # Optional demo data
 3. Set environment variables in Railway → Variables:
    - `FLASK_ENV=production`
    - `DATABASE_URL` (from the Postgres addon)
-   - `JWT_SECRET_KEY` (choose a strong value)
-4. Set start command: `./entrypoint.sh` (runs migrations + seeds before gunicorn)
+   - `JWT_SECRET_KEY` (at least 32 random bytes; do not reuse the example above)
+   - `SEED_DEMO_DATA=false` (default; only set `true` for non-production demo environments)
+4. Set start command: `./entrypoint.sh` (runs migrations once, stops if they fail, seeds only after successful migrations, then starts gunicorn)
 5. Deploy. Use the public Railway URL as the API base for the Flutter app.
 
 ### API highlights
@@ -97,7 +102,7 @@ flask --app app:create_app db upgrade
 ### Creating the first admin manually
 You can either call the bootstrap endpoint or seed script:
 - API: `POST /auth/register-admin` with `{ "email": "admin@example.com", "password": "StrongPass!", "name": "Admin" }`
-- Script: `python scripts/seed_data.py` (creates admin/staff/customer + sample loan/payment)
+- Script: `python scripts/seed_data.py` (creates essential users only by default; set `SEED_DEMO_DATA=true` for sample customer/loan/payment data)
 
 ## 2) Mobile app (Flutter)
 
