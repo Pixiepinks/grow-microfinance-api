@@ -1,4 +1,5 @@
 from datetime import date, timedelta
+import os
 from pathlib import Path
 import sys
 
@@ -9,6 +10,10 @@ if str(BASE_DIR) not in sys.path:
 from app import create_app
 from app.extensions import db
 from app.models import Customer, Loan, Payment, User
+
+
+def demo_data_enabled() -> bool:
+    return os.getenv("SEED_DEMO_DATA", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def ensure_user(email: str, password: str, name: str, role: str) -> User:
@@ -48,6 +53,11 @@ with app.app_context():
         name="Sunil Perera",
         role="customer",
     )
+
+    if not demo_data_enabled():
+        db.session.commit()
+        print("Essential seed data ensured. Demo data disabled; set SEED_DEMO_DATA=true to create sample customer/loan/payment.")
+        raise SystemExit(0)
 
     customer = Customer.query.filter_by(customer_code="CUST001").first()
     if customer is None:
