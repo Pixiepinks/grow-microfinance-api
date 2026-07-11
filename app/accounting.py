@@ -319,33 +319,64 @@ def general_ledger(account_id=None, date_from=None, date_to=None, customer_id=No
 def ledger_csv(data):
     out=StringIO(); w=csv.DictWriter(out, fieldnames=["journal_date","journal_no","description","reference_type","reference_id","debit","credit","running_balance","customer_id","loan_id"]); w.writeheader(); w.writerows(data["transactions"]); return out.getvalue()
 
+def _issue(issue_type, severity, source_type, source_id, source_reference, description, route_type=None, route_id=None, **extra):
+    if not issue_type or not severity or not source_type or source_id is None or not description:
+        return None
+    detected_at = datetime.utcnow().replace(microsecond=0).isoformat() + "+00:00"
+    legacy_type = {"MISSING_PAYMENT_JOURNAL":"MISSING_LOAN_PAYMENT_JOURNAL", "MISSING_DISBURSEMENT_JOURNAL":"MISSING_LOAN_DISBURSEMENT_JOURNAL"}.get(issue_type, issue_type)
+    payload = {
+        "id": f"{issue_type}:{source_type}:{source_id}:{extra.get('journal_id') or extra.get('payment_id') or ''}",
+        "type": legacy_type,
+        "issue_type": issue_type,
+        "severity": severity,
+        "source_type": source_type,
+        "source_id": source_id,
+        "source_reference": source_reference,
+        "description": description,
+        "detected_at": detected_at,
+        "action": {"route_type": route_type or source_type, "route_id": route_id if route_id is not None else source_id},
+    }
+    payload.update({k: v for k, v in extra.items() if v is not None})
+    return payload
+
 def reconciliation_issues():
     issues=[]
-    for app in LoanApplication.query.filter_by(status="DISBURSED").all():
-        loan = Loan.query.filter_by(customer_id=app.customer_id).order_by(Loan.id.desc()).first()
-        if not loan or not AccountingJournalEntry.query.filter_by(reference_type="LOAN_DISBURSEMENT", reference_id=str(loan.id)).first():
-            issues.append({"type":"DISBURSED_APPLICATION_WITHOUT_JOURNAL","application_id":app.id,"loan_id":loan.id if loan else None})
     for loan in Loan.query.filter(Loan.status.in_(["Active","ACTIVE"])).all():
         journals=AccountingJournalEntry.query.filter_by(reference_type="LOAN_DISBURSEMENT", reference_id=str(loan.id)).all()
         if not journals:
-            issues.append({"type":"MISSING_LOAN_DISBURSEMENT_JOURNAL","loan_id":loan.id})
+            item=_issue("MISSING_DISBURSEMENT_JOURNAL", "WARNING", "LOAN", loan.id, loan.loan_number, "Active loan has no posted disbursement journal.", "LOAN", loan.id)
+            if item: issues.append(item)
         if len(journals)>1:
-            issues.append({"type":"DUPLICATE_LOAN_DISBURSEMENT_JOURNALS","loan_id":loan.id,"count":len(journals)})
+            item=_issue("DUPLICATE_DISBURSEMENT_JOURNAL", "ERROR", "LOAN", loan.id, loan.loan_number, "Loan has more than one disbursement journal.", "LOAN", loan.id, count=len(journals))
+            if item: issues.append(item)
         for j in journals:
             if money(j.total_debit) != money(loan.principal_amount) or money(j.total_credit) != money(loan.principal_amount):
-                issues.append({"type":"WRONG_LOAN_DISBURSEMENT_AMOUNT","loan_id":loan.id,"journal_id":j.id})
+                item=_issue("JOURNAL_TOTAL_MISMATCH", "ERROR", "LOAN", loan.id, loan.loan_number, "Loan disbursement journal amount does not match loan principal.", "JOURNAL", j.id, journal_id=j.id)
+                if item: issues.append(item)
             credits=[l for l in j.lines if money(l.credit)>0]
             if len(credits)!=1 or credits[0].account.cash_flow_category not in ("CASH","BANK") or credits[0].account.account_type != "ASSET" or not credits[0].account.is_active or not credits[0].account.allow_manual_posting:
-                issues.append({"type":"INVALID_LOAN_DISBURSEMENT_FUNDING_ACCOUNT","loan_id":loan.id,"journal_id":j.id})
+                item=_issue("INVALID_DISBURSEMENT_FUNDING_ACCOUNT", "ERROR", "LOAN", loan.id, loan.loan_number, "Loan disbursement journal uses an invalid funding account.", "JOURNAL", j.id, journal_id=j.id)
+                if item: issues.append(item)
     for p in Payment.query.all():
-        if not AccountingJournalEntry.query.filter_by(reference_type="LOAN_PAYMENT", reference_id=str(p.id)).first(): issues.append({"type":"MISSING_LOAN_PAYMENT_JOURNAL","payment_id":p.id})
-    rows=db.session.query(AccountingJournalEntry.reference_type, AccountingJournalEntry.reference_id, func.count(AccountingJournalEntry.id)).filter(AccountingJournalEntry.reference_type.in_(["LOAN_DISBURSEMENT","LOAN_PAYMENT"])).group_by(AccountingJournalEntry.reference_type, AccountingJournalEntry.reference_id).having(func.count(AccountingJournalEntry.id)>1).all()
-    for r in rows: issues.append({"type":"DUPLICATE_SOURCE_JOURNALS","reference_type":r[0],"reference_id":r[1],"count":r[2]})
+        if not AccountingJournalEntry.query.filter_by(reference_type="LOAN_PAYMENT", reference_id=str(p.id)).first():
+            loan = p.loan
+            item=_issue("MISSING_PAYMENT_JOURNAL", "WARNING", "PAYMENT", p.id, getattr(loan, "loan_number", None), "Payment has no posted accounting journal.", "PAYMENT", p.id, payment_id=p.id)
+            if item: issues.append(item)
     for e in AccountingJournalEntry.query.all():
         td=sum((money(l.debit) for l in e.lines), Decimal("0.00")); tc=sum((money(l.credit) for l in e.lines), Decimal("0.00"))
-        if td != tc: issues.append({"type":"UNBALANCED_JOURNAL","journal_id":e.id})
-        if money(e.total_debit)!=td or money(e.total_credit)!=tc: issues.append({"type":"JOURNAL_TOTAL_MISMATCH","journal_id":e.id})
+        if td != tc or money(e.total_debit)!=td or money(e.total_credit)!=tc:
+            item=_issue("JOURNAL_TOTAL_MISMATCH", "ERROR", "JOURNAL", e.id, e.journal_no, "Journal line totals do not match header totals or are unbalanced.", "JOURNAL", e.id, journal_id=e.id)
+            if item: issues.append(item)
     return issues
+
+def reconciliation_summary():
+    issues = reconciliation_issues()
+    counts_by_severity = {}
+    counts_by_type = {}
+    for issue in issues:
+        counts_by_severity[issue["severity"]] = counts_by_severity.get(issue["severity"], 0) + 1
+        counts_by_type[issue["issue_type"]] = counts_by_type.get(issue["issue_type"], 0) + 1
+    return {"issues": issues, "total": len(issues), "counts_by_severity": counts_by_severity, "counts_by_type": counts_by_type}
 
 # Accounting improvement package helpers (phase 1.5)
 def account_subtype(account):
@@ -589,9 +620,20 @@ def _sum_by_account(date_to=None, date_from=None, account_types=None):
     if account_types: q = q.join(AccountingAccount).filter(AccountingAccount.account_type.in_(account_types))
     return {r[0]: (money(r[1]), money(r[2])) for r in q.group_by(AccountingJournalLine.account_id).all()}
 
-def _warnings():
+def _warnings(extra_issues=None):
     issues = reconciliation_issues()
-    return [{"code":"INCOMPLETE_ACCOUNTING_HISTORY","message":"Some operational transactions have no accounting journals."}] if any("MISSING" in i.get("type", "") for i in issues) else []
+    warnings=[]
+    if any(i.get("issue_type") in ("MISSING_DISBURSEMENT_JOURNAL", "MISSING_PAYMENT_JOURNAL") for i in issues):
+        warnings.append({"code":"INCOMPLETE_ACCOUNTING_HISTORY","message":"Some operational transactions have no accounting journals."})
+    for issue in extra_issues or []:
+        code = issue.get("type") or issue.get("issue_type")
+        if code in ("UNCLASSIFIED_ACCOUNT", "UNBALANCED_TRIAL_BALANCE", "UNBALANCED_FINANCIAL_POSITION", "JOURNAL_TOTAL_MISMATCH"):
+            warnings.append({"code": code, "message": code.replace("_", " ").title()})
+    seen=set(); out=[]
+    for w in warnings:
+        if w["code"] not in seen:
+            seen.add(w["code"]); out.append(w)
+    return out
 
 def _validate_posted_journals():
     issues=[]
@@ -621,7 +663,7 @@ def trial_balance_report(as_of_date=None, date_from=None, include_zero_balances=
         rows.append({"account_id":a.id,"account_code":a.account_code,"account_name":a.account_name,"account_type":a.account_type,"account_subtype":account_subtype(a),"normal_balance":a.normal_balance,"opening_debit":_fmt(opening_debit),"opening_credit":_fmt(opening_credit),"period_debit":_fmt(pd),"period_credit":_fmt(pc),"closing_debit":_fmt(closing_debit),"closing_credit":_fmt(closing_credit),"net_balance":_fmt(closing_signed),"balance_side":side,"comparative_net_balance": _fmt(comp) if comparative_as_of_date else None,"is_parent":bool(a.children),"depth":_account_depth(a),"parent_id":a.parent_id,"display_order":a.financial_statement_order,"parent_totals_included":False,"drilldown":{"account_id":a.id,"date_from":date_from.isoformat() if date_from else None,"date_to":as_of_date.isoformat()}})
     diff=money(totals['closing_debit']-totals['closing_credit']); issues=_validate_posted_journals()
     if diff != 0: issues.append({"type":"UNBALANCED_TRIAL_BALANCE","difference":_fmt(diff)})
-    return {"report":"TRIAL_BALANCE","as_of_date":as_of_date.isoformat(),"date_from":date_from.isoformat() if date_from else None,"accounts":rows,"totals":{f"total_{k}":_fmt(v) for k,v in totals.items()} | {"difference":_fmt(diff),"is_balanced":diff==0},"validation":{"is_valid":not issues,"difference":_fmt(diff),"issues":issues},"warnings":_warnings()}
+    return {"report":"TRIAL_BALANCE","as_of_date":as_of_date.isoformat(),"date_from":date_from.isoformat() if date_from else None,"accounts":rows,"totals":{f"total_{k}":_fmt(v) for k,v in totals.items()} | {"difference":_fmt(diff),"is_balanced":diff==0},"validation":{"is_valid":not issues,"difference":_fmt(diff),"issues":issues},"warnings":_warnings(issues),"has_activity":bool(rows),"is_empty":not bool(rows)}
 
 def _account_amounts(types, date_from=None, date_to=None): return _sum_by_account(date_from=date_from, date_to=date_to, account_types=types)
 
@@ -647,32 +689,46 @@ def income_statement_report(date_from, date_to, comparative_date_from=None, comp
             if group == 'TAX_EXPENSE': tax += amount
     def pack(sections): return [{"section_name":k,"accounts":v,"total":_fmt(sum(Decimal(x['amount']) for x in v))} for k,v in sections.items()]
     net=money(total_i-total_e); diff=money(total_i-total_e-net)
-    return {"report":"INCOME_STATEMENT","date_from":date_from.isoformat(),"date_to":date_to.isoformat(),"income":{"sections":pack(sections_i),"total_income":_fmt(total_i)},"expenses":{"sections":pack(sections_e),"total_expenses":_fmt(total_e)},"profit_before_tax":_fmt(total_i-total_e+tax),"tax_expense":_fmt(tax),"net_profit":_fmt(net),"validation":{"is_valid":diff==0 and not issues,"difference":_fmt(diff),"issues":issues},"warnings":_warnings()}
+    return {"report":"INCOME_STATEMENT","date_from":date_from.isoformat(),"date_to":date_to.isoformat(),"income":{"sections":pack(sections_i),"total_income":_fmt(total_i)},"expenses":{"sections":pack(sections_e),"total_expenses":_fmt(total_e)},"profit_before_tax":_fmt(total_i-total_e+tax),"tax_expense":_fmt(tax),"net_profit":_fmt(net),"net_profit_loss":_fmt(net),"validation":{"is_valid":diff==0 and not issues,"difference":_fmt(diff),"issues":issues},"warnings":_warnings(issues),"has_activity":bool(sections_i or sections_e),"is_empty":not bool(sections_i or sections_e)}
 
 def _balance_sheet_account_rows(types, as_of_date, comparative_as_of_date=None, include_zero_balances=False):
     data=_sum_by_account(date_to=as_of_date, account_types=types); comp=_sum_by_account(date_to=comparative_as_of_date, account_types=types) if comparative_as_of_date else {}; rows=[]
     for a in AccountingAccount.query.filter(AccountingAccount.account_type.in_(types)).order_by(AccountingAccount.financial_statement_order, AccountingAccount.account_code).all():
         d,c=data.get(a.id,(Decimal('0.00'),Decimal('0.00'))); amount=_signed_balance(a,d,c)
         cd,cc=comp.get(a.id,(Decimal('0.00'),Decimal('0.00'))); camount=_signed_balance(a,cd,cc)
+        has_activity = bool(d or c or cd or cc)
         if not include_zero_balances and amount==0 and camount==0: continue
-        rows.append({"account_id":a.id,"account_code":a.account_code,"account_name":a.account_name,"account_type":a.account_type,"financial_statement_group":a.financial_statement_group,"amount":_fmt(amount),"comparative_amount":_fmt(camount) if comparative_as_of_date else None,"drilldown":{"account_id":a.id,"date_from":None,"date_to":as_of_date.isoformat()}})
+        rows.append({"account_id":a.id,"account_code":a.account_code,"account_name":a.account_name,"account_type":a.account_type,"account_subtype":account_subtype(a),"financial_statement_group":a.financial_statement_group,"amount":_fmt(amount),"debit":_fmt(d),"credit":_fmt(c),"has_activity":has_activity,"comparative_amount":_fmt(camount) if comparative_as_of_date else None,"drilldown":{"account_id":a.id,"date_from":None,"date_to":as_of_date.isoformat()}})
     return rows
 
 def statement_of_financial_position_report(as_of_date=None, comparative_as_of_date=None, include_zero_balances=False):
     seed_default_report_classifications(); as_of_date=as_of_date or _today(); rows=_balance_sheet_account_rows(['ASSET','LIABILITY','EQUITY'], as_of_date, comparative_as_of_date, include_zero_balances)
-    ca=[r for r in rows if r['financial_statement_group'] in (None,'CURRENT_ASSET') and r['account_type']=='ASSET']; nca=[r for r in rows if r['financial_statement_group']=='NON_CURRENT_ASSET']
-    cl=[r for r in rows if r['financial_statement_group'] in (None,'CURRENT_LIABILITY') and r['account_type']=='LIABILITY']; ncl=[r for r in rows if r['financial_statement_group']=='NON_CURRENT_LIABILITY']
-    eq=[r for r in rows if r['account_type']=='EQUITY']
+    ca=[]; nca=[]; cl=[]; ncl=[]; eq=[]
+    for r in rows:
+        amount=Decimal(r['amount']); group=r['financial_statement_group']
+        if r['account_type']=='ASSET' and r.get('account_subtype')=='BANK' and amount < 0:
+            adj=dict(r); adj['amount']=_fmt(abs(amount)); adj['presentation_adjustment']='BANK_OVERDRAFT_RECLASSIFICATION'; adj['financial_statement_group']='CURRENT_LIABILITY'; cl.append(adj)
+        elif r['account_type']=='ASSET' and group=='NON_CURRENT_ASSET': nca.append(r)
+        elif r['account_type']=='ASSET': ca.append(r)
+        elif r['account_type']=='LIABILITY' and group=='NON_CURRENT_LIABILITY': ncl.append(r)
+        elif r['account_type']=='LIABILITY': cl.append(r)
+        elif r['account_type']=='EQUITY': eq.append(r)
     pl=income_statement_report(date(1900,1,1), as_of_date)['net_profit']; pl_dec=Decimal(pl)
     ta=sum(Decimal(r['amount']) for r in ca+nca); tl=sum(Decimal(r['amount']) for r in cl+ncl); eq_accounts=sum(Decimal(r['amount']) for r in eq); te=money(eq_accounts+pl_dec); diff=money(ta-(tl+te)); issues=[]
-    if diff != 0: issues.append({"type":"UNBALANCED_STATEMENT_OF_FINANCIAL_POSITION","difference":_fmt(diff)})
-    return {"report":"STATEMENT_OF_FINANCIAL_POSITION","as_of_date":as_of_date.isoformat(),"assets":{"current_assets":{"accounts":ca,"total":_fmt(sum(Decimal(r['amount']) for r in ca))},"non_current_assets":{"accounts":nca,"total":_fmt(sum(Decimal(r['amount']) for r in nca))},"total_assets":_fmt(ta)},"liabilities":{"current_liabilities":{"accounts":cl,"total":_fmt(sum(Decimal(r['amount']) for r in cl))},"non_current_liabilities":{"accounts":ncl,"total":_fmt(sum(Decimal(r['amount']) for r in ncl))},"total_liabilities":_fmt(tl)},"equity":{"accounts":eq,"retained_earnings":"0.00","current_period_profit_loss":_fmt(pl_dec),"total_equity":_fmt(te),"policy":"Current period profit/loss is cumulative posted income less expenses through the as-of date until year-end closing is implemented; retained earnings account balance remains in equity accounts."},"total_liabilities_and_equity":_fmt(tl+te),"difference":_fmt(diff),"is_balanced":diff==0,"validation":{"is_valid":not issues,"difference":_fmt(diff),"issues":issues},"warnings":_warnings()}
+    if diff != 0: issues.append({"type":"UNBALANCED_FINANCIAL_POSITION","difference":_fmt(diff)})
+    has_activity=any(r.get('has_activity') for r in rows)
+    return {"report":"STATEMENT_OF_FINANCIAL_POSITION","as_of_date":as_of_date.isoformat(),"assets":{"current_assets":{"accounts":ca,"total":_fmt(sum(Decimal(r['amount']) for r in ca))},"non_current_assets":{"accounts":nca,"total":_fmt(sum(Decimal(r['amount']) for r in nca))},"total_assets":_fmt(ta)},"liabilities":{"current_liabilities":{"accounts":cl,"total":_fmt(sum(Decimal(r['amount']) for r in cl))},"non_current_liabilities":{"accounts":ncl,"total":_fmt(sum(Decimal(r['amount']) for r in ncl))},"total_liabilities":_fmt(tl)},"equity":{"accounts":eq,"retained_earnings":"0.00","current_period_profit_loss":_fmt(pl_dec),"total_equity":_fmt(te),"policy":"BANK accounts with credit balances are presented as current liability bank overdrafts using BANK_OVERDRAFT_RECLASSIFICATION; current period profit/loss is cumulative posted income less expenses through the as-of date until year-end closing is implemented."},"total_liabilities_and_equity":_fmt(tl+te),"difference":_fmt(diff),"is_balanced":diff==0,"financial_position_balanced":diff==0,"validation":{"is_valid":not issues,"difference":_fmt(diff),"issues":issues},"warnings":_warnings(issues),"has_activity":has_activity,"is_empty":not has_activity}
 
 def reports_summary(date_from=None, date_to=None, as_of_date=None):
     as_of_date=as_of_date or date_to or _today(); date_from=date_from or date(as_of_date.year,1,1); date_to=date_to or as_of_date
-    isr=income_statement_report(date_from,date_to); sfp=statement_of_financial_position_report(as_of_date); tb=trial_balance_report(as_of_date)
+    try:
+        isr=income_statement_report(date_from,date_to); sfp=statement_of_financial_position_report(as_of_date); tb=trial_balance_report(as_of_date)
+    except Exception as exc:
+        current_app.logger.exception("accounting reports summary failed")
+        return {"success":False,"message":"Financial reports summary is unavailable.","error_code":"ACCOUNTING_REPORT_SUMMARY_UNAVAILABLE"}
     unclassified=AccountingAccount.query.filter(AccountingAccount.account_type.in_(['INCOME','EXPENSE','ASSET','LIABILITY','EQUITY']), AccountingAccount.financial_statement_group.is_(None)).count()
-    return {"total_assets":sfp['assets']['total_assets'],"total_liabilities":sfp['liabilities']['total_liabilities'],"total_equity":sfp['equity']['total_equity'],"total_income":isr['income']['total_income'],"total_expenses":isr['expenses']['total_expenses'],"net_profit":isr['net_profit'],"trial_balance_difference":tb['totals']['difference'],"statement_of_financial_position_difference":sfp['difference'],"unclassified_account_count":unclassified}
+    warnings=_warnings((tb.get('validation') or {}).get('issues', []) + (sfp.get('validation') or {}).get('issues', []) + (isr.get('validation') or {}).get('issues', []))
+    return {"date_from":date_from.isoformat(),"date_to":date_to.isoformat(),"as_of_date":as_of_date.isoformat(),"total_assets":sfp['assets']['total_assets'],"total_liabilities":sfp['liabilities']['total_liabilities'],"total_equity":sfp['equity']['total_equity'],"total_income":isr['income']['total_income'],"total_expenses":isr['expenses']['total_expenses'],"net_profit_loss":isr['net_profit_loss'],"net_profit":isr['net_profit'],"trial_balance_difference":tb['totals']['difference'],"trial_balance_balanced":Decimal(tb['totals']['difference']) == Decimal('0.00'),"financial_position_difference":sfp['difference'],"statement_of_financial_position_difference":sfp['difference'],"financial_position_balanced":Decimal(sfp['difference']) == Decimal('0.00'),"unclassified_account_count":unclassified,"incomplete_accounting_history":any(w['code']=='INCOMPLETE_ACCOUNTING_HISTORY' for w in warnings),"warnings":warnings,"has_activity":bool(tb.get('accounts')),"is_empty":not bool(tb.get('accounts')), "validation":{"is_valid":tb['validation']['is_valid'] and sfp['validation']['is_valid'] and isr['validation']['is_valid'],"issues":tb['validation']['issues']+sfp['validation']['issues']+isr['validation']['issues']}}
 
 def report_csv(data, generated_by=None):
     out=StringIO(); w=csv.writer(out); w.writerow([data.get('report','REPORT')]); w.writerow(['Generated At', datetime.utcnow().isoformat(), 'Generated By', generated_by or 'system'])
