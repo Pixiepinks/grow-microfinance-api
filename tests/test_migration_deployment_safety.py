@@ -130,6 +130,27 @@ def test_entrypoint_exits_before_seed_when_migration_fails(tmp_path):
     assert calls.read_text() == "flask\n"
 
 
+def test_entrypoint_uses_module_schema_validation_before_gunicorn():
+    source = (ROOT / "entrypoint.sh").read_text()
+    assert "flask --app app:create_app db upgrade" in source
+    assert "python -m scripts.validate_schema" in source
+    assert "python scripts/validate_schema.py" not in source
+    assert '"app:create_app()"' in source
+    assert source.index("python -m scripts.validate_schema") < source.index("exec gunicorn")
+
+
+def test_validate_schema_module_importable():
+    result = subprocess.run(
+        [sys.executable, "-c", "from app import create_app; from scripts.validate_schema import main; print(create_app); print(main)"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    assert "create_app" in result.stdout
+    assert "main" in result.stdout
+
+
 def test_seed_script_demo_data_disabled_does_not_query_loans(monkeypatch):
     source = (ROOT / "scripts" / "seed_data.py").read_text()
     disabled_branch = source.split("if not demo_data_enabled():", 1)[1].split("customer = Customer.query", 1)[0]
