@@ -2,6 +2,7 @@ from datetime import date
 from decimal import Decimal
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import get_jwt_identity
+from sqlalchemy.orm import joinedload
 
 from app.supabase_client import build_public_url
 
@@ -204,7 +205,7 @@ def create_loan():
 def list_loans():
     status = request.args.get("status")
     customer_id = request.args.get("customer_id")
-    query = Loan.query
+    query = Loan.query.options(joinedload(Loan.customer))
     if status:
         query = query.filter_by(status=status)
     if customer_id:
@@ -215,6 +216,7 @@ def list_loans():
             "id": l.id,
             "loan_number": l.loan_number,
             "customer_id": l.customer_id,
+            "customer": _loan_customer_to_dict(l.customer),
             "status": l.status,
             "currency": CURRENCY_CODE,
             "principal_amount": float(l.principal_amount),
@@ -231,11 +233,30 @@ def list_loans():
     return jsonify(results)
 
 
+def _loan_customer_to_dict(customer: Customer | None) -> dict | None:
+    if customer is None:
+        return None
+    return {
+        "id": customer.id,
+        "full_name": customer.full_name,
+        "mobile": customer.mobile,
+        "nic": customer.nic_number,
+    }
+
+
+@admin_bp.route("/loans/<int:loan_id>", methods=["GET"])
+@role_required(["admin"])
+def get_loan(loan_id):
+    loan = Loan.query.options(joinedload(Loan.customer)).get_or_404(loan_id)
+    return jsonify(_loan_to_dict(loan))
+
+
 def _loan_to_dict(loan: Loan) -> dict:
     return {
         "id": loan.id,
         "loan_number": loan.loan_number,
         "customer_id": loan.customer_id,
+        "customer": _loan_customer_to_dict(loan.customer),
         "currency": CURRENCY_CODE,
         "principal_amount": float(loan.principal_amount),
         "principal_amount_formatted": format_currency(loan.principal_amount),
@@ -247,12 +268,24 @@ def _loan_to_dict(loan: Loan) -> dict:
         "loan_days": loan.loan_days,
         "repayment_frequency": loan.repayment_frequency,
         "number_of_installments": loan.number_of_installments,
-        "installment_amount": float(loan.installment_amount) if loan.installment_amount is not None else None,
-        "total_repayment": float(loan.total_repayment) if loan.total_repayment is not None else None,
-        "total_interest": float(loan.total_interest) if loan.total_interest is not None else None,
+        "installment_amount": (
+            float(loan.installment_amount)
+            if loan.installment_amount is not None
+            else None
+        ),
+        "total_repayment": (
+            float(loan.total_repayment) if loan.total_repayment is not None else None
+        ),
+        "total_interest": (
+            float(loan.total_interest) if loan.total_interest is not None else None
+        ),
         "interest_type": loan.interest_type,
         "maturity_date": loan.maturity_date.isoformat() if loan.maturity_date else None,
-        "final_installment_due_date": loan.final_installment_due_date.isoformat() if loan.final_installment_due_date else None,
+        "final_installment_due_date": (
+            loan.final_installment_due_date.isoformat()
+            if loan.final_installment_due_date
+            else None
+        ),
         "status": loan.status,
     }
 
@@ -291,7 +324,9 @@ def _ledger_to_dict(entry: LoanLedger) -> dict:
 @admin_bp.route("/loans/<int:loan_id>/ledger", methods=["GET"])
 @role_required(["admin"])
 def get_loan_ledger(loan_id):
-    loan = Loan.query.get_or_404(loan_id)
+    loan = Loan.query.options(
+        joinedload(Loan.customer), joinedload(Loan.ledger_entries)
+    ).get_or_404(loan_id)
     if not loan.ledger_entries:
         generate_loan_ledger(loan)
         db.session.commit()
