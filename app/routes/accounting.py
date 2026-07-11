@@ -1,5 +1,5 @@
 from datetime import date
-from flask import Blueprint, Response, jsonify, request
+from flask import Blueprint, Response, jsonify, request, current_app
 from flask_jwt_extended import get_jwt_identity
 
 from ..extensions import db
@@ -12,6 +12,7 @@ from ..accounting import (
     ledger_csv,
     post_journal,
     reconciliation_issues,
+    reconciliation_summary,
     reverse_journal,
     seed_default_accounts,
     serialize_journal,
@@ -38,7 +39,8 @@ def _uid():
 
 def _error(exc):
     db.session.rollback()
-    return jsonify({"message": str(exc)}), 400
+    current_app.logger.exception("Accounting API error")
+    return jsonify({"success": False, "message": str(exc), "error_code": "ACCOUNTING_ERROR"}), 400
 
 @accounting_bp.before_request
 def _ensure_seeded():
@@ -276,4 +278,4 @@ def export_gl():
 @accounting_bp.route("/reconciliation/issues", methods=["GET"])
 @role_required(["admin"])
 def issues():
-    return jsonify({"issues": reconciliation_issues()})
+    return jsonify(reconciliation_summary())

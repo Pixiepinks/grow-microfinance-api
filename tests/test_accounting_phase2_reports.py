@@ -86,3 +86,77 @@ def test_income_statement_and_financial_position_summary_drilldown(app, client):
 def test_report_exports_reject_unauthorized(app, client):
     resp = client.get("/admin/accounting/reports/trial-balance/export.csv?as_of_date=2026-07-31")
     assert resp.status_code in (401, 422)
+
+
+def test_phase2_disbursement_report_contracts_and_overdraft_presentation(app, client):
+    from app.accounting import post_loan_disbursement
+    from app.models import Customer, Loan
+
+    admin = _user(); headers = _headers(app, admin); seed_default_accounts(); db.session.commit()
+    cu = User(email="phase2-customer@example.com", name="Phase2 Customer", role="customer")
+    cu.set_password("password")
+    db.session.add(cu); db.session.commit()
+    customer = Customer(user_id=cu.id, customer_code="C-P2", full_name="Phase Two Customer")
+    db.session.add(customer); db.session.commit()
+    loan = Loan(loan_number="GROW-LOAN-20260710-0001", customer_id=customer.id, principal_amount=Decimal("50000.00"), interest_rate=Decimal("12.00"), total_days=30, payment_interval_days=30, daily_installment=Decimal("0.00"), total_payable=Decimal("50000.00"), start_date=date(2026, 7, 10), end_date=date(2026, 8, 9), status="Active", created_by_id=admin.id)
+    db.session.add(loan); db.session.commit()
+    post_loan_disbursement(loan, admin.id, disbursement_date=date(2026, 7, 10)); db.session.commit()
+
+    receivable = _acct("1100")
+    gl = client.get(f"/admin/accounting/general-ledger?account_id={receivable.id}&date_from=&date_to=&customer_id=&loan_id=", headers=headers)
+    assert gl.status_code == 200
+    gl_body = gl.get_json()
+    assert gl_body["total_debit"] == "50000.00"
+    assert gl_body["total_credit"] == "0.00"
+    assert gl_body["closing_balance"] == gl_body["transactions"][-1]["running_balance"] == "50000.00"
+    assert gl_body["transactions"][0]["customer_name"] == "Phase Two Customer"
+    assert gl_body["transactions"][0]["loan_number"] == "GROW-LOAN-20260710-0001"
+
+    sfp = client.get("/admin/accounting/reports/statement-of-financial-position?as_of_date=2026-07-31", headers=headers)
+    assert sfp.status_code == 200
+    sfp_body = sfp.get_json()
+    current_assets = sfp_body["assets"]["current_assets"]["accounts"]
+    current_liabilities = sfp_body["liabilities"]["current_liabilities"]["accounts"]
+    assert any(a["account_code"] == "1100" and a["amount"] == "50000.00" for a in current_assets)
+    assert any(a["account_code"] == "1010" and a["amount"] == "50000.00" and a["presentation_adjustment"] == "BANK_OVERDRAFT_RECLASSIFICATION" for a in current_liabilities)
+    assert sfp_body["has_activity"] is True
+    assert sfp_body["is_empty"] is False
+    assert sfp_body["financial_position_balanced"] is True
+
+    summary = client.get("/admin/accounting/reports/summary?date_from=2026-07-01&date_to=2026-07-31&as_of_date=2026-07-31", headers=headers)
+    assert summary.status_code == 200
+    summary_body = summary.get_json()
+    assert summary_body["trial_balance_difference"] == "0.00"
+    assert summary_body["trial_balance_balanced"] is True
+    assert summary_body["financial_position_balanced"] is True
+    assert summary_body["net_profit_loss"] == "0.00"
+
+
+def test_reconciliation_schema_counts_and_warning_consistency(app, client):
+    from app.models import Customer, Loan, Payment
+
+    admin = _user(); headers = _headers(app, admin); seed_default_accounts(); db.session.commit()
+    cu = User(email="phase2-missing@example.com", name="Missing Journal Customer", role="customer")
+    cu.set_password("password")
+    db.session.add(cu); db.session.commit()
+    customer = Customer(user_id=cu.id, customer_code="C-MISS", full_name="Missing Journal Customer")
+    db.session.add(customer); db.session.commit()
+    loan = Loan(loan_number="LN-MISSING", customer_id=customer.id, principal_amount=Decimal("100.00"), interest_rate=Decimal("12.00"), total_days=30, payment_interval_days=30, daily_installment=Decimal("0.00"), total_payable=Decimal("100.00"), start_date=date(2026, 7, 10), end_date=date(2026, 8, 9), status="Active", created_by_id=admin.id)
+    db.session.add(loan); db.session.commit()
+    payment = Payment(loan_id=loan.id, amount_collected=Decimal("10.00"), collection_date=date(2026, 7, 11), collected_by_id=admin.id)
+    db.session.add(payment); db.session.commit()
+
+    resp = client.get("/admin/accounting/reconciliation/issues", headers=headers)
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["total"] == len(body["issues"])
+    assert body["counts_by_severity"]["WARNING"] >= 2
+    issue = next(i for i in body["issues"] if i["issue_type"] == "MISSING_DISBURSEMENT_JOURNAL")
+    for field in ["id", "issue_type", "severity", "source_type", "source_id", "source_reference", "description", "detected_at", "action"]:
+        assert issue[field]
+    assert not any(not i.get("issue_type") or not i.get("source_type") or i.get("source_id") is None for i in body["issues"])
+
+    summary = client.get("/admin/accounting/reports/summary?date_from=2026-07-01&date_to=2026-07-31&as_of_date=2026-07-31", headers=headers)
+    assert summary.status_code == 200
+    assert summary.get_json()["incomplete_accounting_history"] is True
+    assert any(w["code"] == "INCOMPLETE_ACCOUNTING_HISTORY" for w in summary.get_json()["warnings"])
