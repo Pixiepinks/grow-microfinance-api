@@ -1113,17 +1113,17 @@ def test_admin_ledger_currency_fields_are_lkr_formatted_without_changing_numbers
 def _approved_terms_payload(**overrides):
     payload = {
         "approved_amount": "15000",
-        "loan_days": 63,
+        "term_type": "DAYS",
+        "term_value": 63,
         "repayment_frequency": "WEEKLY",
-        "number_of_installments": 8,
-        "installment_amount": "2400",
-        "interest_type": "FLAT",
+        "interest_rate": "26",
+        "interest_rate_basis": "FLAT_TERM",
     }
     payload.update(overrides)
     return payload
 
 
-def test_flexible_terms_approval_and_disbursement_create_eight_weekly_rows(app, client):
+def test_flexible_terms_approval_and_disbursement_create_nine_weekly_rows(app, client):
     from app.models import AccountingJournalEntry, Payment
 
     admin_user = _create_user("admin", "Flexible Admin", "flex-admin@example.com")
@@ -1148,9 +1148,15 @@ def test_flexible_terms_approval_and_disbursement_create_eight_weekly_rows(app, 
     body = approval.get_json()
     assert body["status"] == STATUS_APPROVED
     assert body["approved_amount"] == 15000.0
-    assert body["total_repayment"] == 19200.0
-    assert body["total_interest"] == 4200.0
-    assert body["interest_rate"] == 28.0
+    assert body["term_type"] == "DAYS"
+    assert body["term_value"] == 63
+    assert body["loan_days"] == 63
+    assert body["number_of_installments"] == 9
+    assert body["installment_count"] == 9
+    assert body["total_repayment"] == 18900.0
+    assert body["total_interest"] == 3900.0
+    assert body["interest_rate"] == 26.0
+    assert body["interest_rate_basis"] == "FLAT_TERM"
     assert AccountingJournalEntry.query.count() == before_journals
 
     disbursed = client.post(f"/loan-applications/{application.id}/disburse", headers=_auth_headers(app, admin_user), json={"disbursement_date": "2026-01-01"})
@@ -1159,18 +1165,18 @@ def test_flexible_terms_approval_and_disbursement_create_eight_weekly_rows(app, 
     assert loan.principal_amount == Decimal("15000.00")
     assert loan.loan_days == 63
     assert loan.maturity_date == date(2026, 3, 5)
-    assert len(loan.ledger_entries) == 8
+    assert loan.final_installment_due_date == date(2026, 3, 5)
+    assert len(loan.ledger_entries) == 9
     assert sum((entry.principal_amount for entry in loan.ledger_entries), Decimal("0")) == Decimal("15000.00")
-    assert sum((entry.interest_amount for entry in loan.ledger_entries), Decimal("0")) == Decimal("4200.00")
-    assert sum((entry.installment_amount for entry in loan.ledger_entries), Decimal("0")) == Decimal("19200.00")
-    assert loan.ledger_entries[0].principal_amount == Decimal("1875.00")
-    assert loan.ledger_entries[0].interest_amount == Decimal("525.00")
+    assert sum((entry.interest_amount for entry in loan.ledger_entries), Decimal("0")) == Decimal("3900.00")
+    assert sum((entry.installment_amount for entry in loan.ledger_entries), Decimal("0")) == Decimal("18900.00")
+    assert loan.ledger_entries[0].installment_amount == Decimal("2100.00")
 
-    pay = client.post("/staff/payments", headers=_auth_headers(app, admin_user), json={"loan_id": loan.id, "amount_collected": "2400", "collection_date": "2026-01-07", "payment_method": "Cash"})
+    pay = client.post("/staff/payments", headers=_auth_headers(app, admin_user), json={"loan_id": loan.id, "amount_collected": "2100", "collection_date": "2026-01-07", "payment_method": "Cash"})
     assert pay.status_code == 200
     payment = Payment.query.get(pay.get_json()["payment_id"])
-    assert payment.principal_paid == Decimal("1875.00")
-    assert payment.interest_paid == Decimal("525.00")
+    assert payment.principal_paid == loan.ledger_entries[0].principal_amount
+    assert payment.interest_paid == loan.ledger_entries[0].interest_amount
     journals = AccountingJournalEntry.query.filter_by(status="POSTED").all()
     assert all(j.total_debit == j.total_credit for j in journals)
 
@@ -1180,11 +1186,11 @@ def test_flexible_terms_validation_rejects_bad_payloads(app, client):
     customer_user = _create_user("customer", "Bad Flex Customer", "bad-flex-customer@example.com")
     customer = _customer_profile(customer_user, code="CUST-BAD-FLEX")
     for idx, overrides in enumerate([
-        {"installment_amount": "1000"},
+        {"interest_rate": "-1"},
         {"approved_amount": "0"},
-        {"loan_days": -1},
+        {"term_value": 0},
         {"repayment_frequency": "YEARLY"},
-        {"number_of_installments": 0},
+        {"term_type": "YEARS"},
     ]):
         application = LoanApplication(application_number=f"APP-BAD-FLEX-{idx}", customer_id=customer.id, loan_type="GROW_BUSINESS", status=STATUS_SUBMITTED, applied_amount=Decimal("15000"), tenure_months=3, full_name="Bad Flex Customer", nic_number="123456789V", mobile_number="0700000000")
         db.session.add(application); db.session.commit()
@@ -1202,3 +1208,31 @@ def test_legacy_loan_with_null_flexible_fields_still_loads(app, client):
     response = client.get(f"/admin/loans/{loan.id}/ledger", headers=_auth_headers(app, admin_user))
     assert response.status_code == 200
     assert response.get_json()["loan"]["loan_days"] is None
+
+
+def test_resolve_loan_term_days_weekly_stub_and_months():
+    from app.loan_terms import resolve_loan_term, calculate_flat_term_amounts
+
+    resolved = resolve_loan_term(date(2026, 1, 1), "DAYS", 63, "WEEKLY")
+    assert resolved.total_days == 63
+    assert resolved.installment_count == 9
+    assert resolved.maturity_date == date(2026, 3, 5)
+    assert resolved.installment_periods[-1].days_in_period == 7
+    interest, total, installment = calculate_flat_term_amounts(Decimal("15000"), Decimal("26"), resolved.installment_count)
+    assert interest == Decimal("3900.00")
+    assert total == Decimal("18900.00")
+    assert installment == Decimal("2100.00")
+
+    assert resolve_loan_term(date(2026, 1, 1), "DAYS", 56, "WEEKLY").installment_count == 8
+    stub = resolve_loan_term(date(2026, 1, 1), "DAYS", 65, "WEEKLY")
+    assert stub.installment_count == 10
+    assert stub.installment_periods[-1].days_in_period == 2
+
+    monthly = resolve_loan_term(date(2026, 1, 31), "MONTHS", 3, "MONTHLY")
+    assert monthly.installment_count == 3
+    assert monthly.maturity_date == date(2026, 4, 30)
+
+    weekly = resolve_loan_term(date(2026, 1, 1), "MONTHS", 3, "WEEKLY")
+    assert weekly.maturity_date == date(2026, 4, 1)
+    assert weekly.installment_periods[-1].due_date == weekly.maturity_date
+    assert weekly.installment_periods[-1].days_in_period <= 7

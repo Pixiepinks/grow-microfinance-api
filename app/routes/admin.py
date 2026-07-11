@@ -265,9 +265,13 @@ def _loan_to_dict(loan: Loan) -> dict:
         "payment_interval_days": loan.payment_interval_days,
         "start_date": loan.start_date.isoformat() if loan.start_date else None,
         "end_date": loan.end_date.isoformat() if loan.end_date else None,
+        "term_type": loan.term_type,
+        "term_value": loan.term_value,
         "loan_days": loan.loan_days,
+        "tenure_months": loan.tenure_months,
         "repayment_frequency": loan.repayment_frequency,
         "number_of_installments": loan.number_of_installments,
+        "installment_count": loan.installment_count,
         "installment_amount": (
             float(loan.installment_amount)
             if loan.installment_amount is not None
@@ -280,6 +284,7 @@ def _loan_to_dict(loan: Loan) -> dict:
             float(loan.total_interest) if loan.total_interest is not None else None
         ),
         "interest_type": loan.interest_type,
+        "interest_rate_basis": loan.interest_rate_basis,
         "maturity_date": loan.maturity_date.isoformat() if loan.maturity_date else None,
         "final_installment_due_date": (
             loan.final_installment_due_date.isoformat()

@@ -18,6 +18,7 @@ from ..currency import CURRENCY_CODE, format_currency
 from ..extensions import db
 from ..models import Customer, Loan, LoanApplication, LoanApplicationDocument
 from ..loan_ledger import generate_loan_ledger, money
+from ..loan_terms import calculate_flat_term_amounts, resolve_loan_term
 from ..accounting import AccountingError, post_loan_disbursement, validate_funding_account
 from ..models import AccountingAccount
 from .utils import role_required
@@ -43,6 +44,7 @@ STATUS_DISBURSED = "DISBURSED"
 
 SUPPORTED_REPAYMENT_FREQUENCIES = {"DAILY", "WEEKLY", "MONTHLY"}
 SUPPORTED_INTEREST_TYPES = {"FLAT"}
+SUPPORTED_INTEREST_RATE_BASIS = {"FLAT_TERM", "MONTHLY", "ANNUAL"}
 RATE_QUANT = Decimal("0.0001")
 
 
@@ -50,45 +52,61 @@ def _decimal_to_float(value):
     return float(value) if value is not None else None
 
 
-def _validate_and_calculate_terms(data: dict, *, allow_legacy: bool = False):
+def _validate_and_calculate_terms(data: dict, *, allow_legacy: bool = False, start_date: date | None = None):
     errors = []
     approved_amount = parse_decimal(data.get("approved_amount"))
+    term_type = (data.get("term_type") or "").upper()
+    term_value = parse_int(data.get("term_value"))
     loan_days = parse_int(data.get("loan_days"))
+    if not term_type and allow_legacy:
+        if loan_days:
+            term_type, term_value = "DAYS", loan_days
+        elif parse_int(data.get("tenure_months")):
+            term_type, term_value = "MONTHS", parse_int(data.get("tenure_months"))
     repayment_frequency = (data.get("repayment_frequency") or "").upper()
-    number_of_installments = parse_int(data.get("number_of_installments"))
-    installment_amount = parse_decimal(data.get("installment_amount"))
-    interest_type = (data.get("interest_type") or "FLAT").upper()
+    interest_rate = parse_decimal(data.get("interest_rate"))
+    interest_rate_basis = (data.get("interest_rate_basis") or data.get("interest_type") or "FLAT_TERM").upper()
+    if interest_rate_basis == "FLAT":
+        interest_rate_basis = "FLAT_TERM"
 
     if approved_amount is None: errors.append("approved_amount is required")
     elif approved_amount <= 0: errors.append("approved_amount must be greater than zero")
-    if loan_days is None: errors.append("loan_days is required")
-    elif loan_days <= 0: errors.append("loan_days must be greater than zero")
+    if not term_type: errors.append("term_type is required")
+    elif term_type not in {"DAYS", "MONTHS"}: errors.append("term_type must be DAYS or MONTHS")
+    if term_value is None: errors.append("term_value is required")
+    elif term_value <= 0: errors.append("term_value must be greater than zero")
     if not repayment_frequency: errors.append("repayment_frequency is required")
     elif repayment_frequency not in SUPPORTED_REPAYMENT_FREQUENCIES: errors.append("repayment_frequency is unsupported")
-    if number_of_installments is None: errors.append("number_of_installments is required")
-    elif number_of_installments <= 0: errors.append("number_of_installments must be greater than zero")
-    if installment_amount is None: errors.append("installment_amount is required")
-    elif installment_amount <= 0: errors.append("installment_amount must be greater than zero")
-    if interest_type not in SUPPORTED_INTEREST_TYPES: errors.append("interest_type is unsupported")
+    if interest_rate is None: errors.append("interest_rate is required")
+    elif interest_rate < 0: errors.append("interest_rate must not be negative")
+    if interest_rate_basis not in SUPPORTED_INTEREST_RATE_BASIS: errors.append("interest_rate_basis is unsupported")
     if errors:
         return None, errors
 
+    try:
+        resolved = resolve_loan_term(start_date or date.today(), term_type, term_value, repayment_frequency)
+    except ValueError as exc:
+        return None, [str(exc)]
     approved_amount = money(approved_amount)
-    installment_amount = money(installment_amount)
-    total_repayment = money(installment_amount * Decimal(number_of_installments))
-    total_interest = money(total_repayment - approved_amount)
-    if total_repayment < approved_amount:
-        return None, ["total_repayment cannot be below approved_amount"]
-    interest_rate = (total_interest / approved_amount * Decimal("100")).quantize(RATE_QUANT, rounding=ROUND_HALF_UP)
-    return {"approved_amount": approved_amount, "loan_days": loan_days, "repayment_frequency": repayment_frequency, "number_of_installments": number_of_installments, "installment_amount": installment_amount, "total_repayment": total_repayment, "total_interest": total_interest, "interest_rate": interest_rate, "interest_type": interest_type}, []
-
+    if interest_rate_basis != "FLAT_TERM":
+        return None, ["Only FLAT_TERM interest_rate_basis is currently supported for new GROW loans"]
+    total_interest, total_repayment, installment_amount = calculate_flat_term_amounts(approved_amount, interest_rate, resolved.installment_count)
+    tenure_months = term_value if term_type == "MONTHS" else None
+    return {"approved_amount": approved_amount, "term_type": term_type, "term_value": term_value,
+            "loan_days": resolved.total_days if term_type == "DAYS" else None, "tenure_months": tenure_months,
+            "repayment_frequency": repayment_frequency, "number_of_installments": resolved.installment_count,
+            "installment_count": resolved.installment_count, "installment_amount": installment_amount,
+            "total_repayment": total_repayment, "total_payable": total_repayment, "total_interest": total_interest,
+            "interest_rate": Decimal(str(interest_rate)).quantize(RATE_QUANT, rounding=ROUND_HALF_UP),
+            "interest_type": "FLAT", "interest_rate_basis": interest_rate_basis,
+            "total_days": resolved.total_days, "maturity_date": resolved.maturity_date}, []
 
 def _application_terms(application):
-    return {k: getattr(application, k, None) for k in ["approved_amount", "loan_days", "repayment_frequency", "number_of_installments", "installment_amount", "total_repayment", "total_interest", "interest_rate", "interest_type"]}
+    return {k: getattr(application, k, None) for k in ["approved_amount", "term_type", "term_value", "loan_days", "tenure_months", "repayment_frequency", "number_of_installments", "installment_amount", "total_repayment", "total_interest", "interest_rate", "interest_type", "interest_rate_basis"]}
 
 
 def _terms_complete(application):
-    return all(getattr(application, f, None) is not None for f in ["approved_amount", "loan_days", "repayment_frequency", "number_of_installments", "installment_amount", "total_repayment", "total_interest", "interest_rate", "interest_type"])
+    return all(getattr(application, f, None) is not None for f in ["approved_amount", "term_type", "term_value", "repayment_frequency", "number_of_installments", "installment_amount", "total_repayment", "total_interest", "interest_rate", "interest_rate_basis"])
 
 STATUS_TRANSITIONS = {
     "staff": {
@@ -379,13 +397,17 @@ def build_application_response(application: LoanApplication) -> dict:
             else None
         ),
         "approved_tenure": application.approved_tenure,
+        "term_type": application.term_type,
+        "term_value": application.term_value,
         "loan_days": application.loan_days,
         "repayment_frequency": application.repayment_frequency,
         "number_of_installments": application.number_of_installments,
+        "installment_count": application.installment_count,
         "installment_amount": _decimal_to_float(application.installment_amount),
         "total_repayment": _decimal_to_float(application.total_repayment),
         "total_interest": _decimal_to_float(application.total_interest),
         "interest_type": application.interest_type,
+        "interest_rate_basis": application.interest_rate_basis,
         "review_notes": application.review_notes,
         "reject_reason": application.reject_reason,
         "submitted_at": (
@@ -967,7 +989,7 @@ def approve_application(application_id):
         return transition_error
 
     if target_status == STATUS_APPROVED:
-        legacy_payload = not any(k in data for k in ["loan_days", "repayment_frequency", "number_of_installments", "installment_amount", "interest_type"])
+        legacy_payload = not any(k in data for k in ["term_type", "term_value", "loan_days", "repayment_frequency", "number_of_installments", "installment_amount", "interest_rate", "interest_rate_basis", "interest_type"])
         if legacy_payload:
             approved_amount = parse_decimal(data.get("approved_amount", application.approved_amount or application.applied_amount))
             approved_tenure = parse_int(data.get("approved_tenure", application.approved_tenure or application.tenure_months))
@@ -980,7 +1002,8 @@ def approve_application(application_id):
             if errors:
                 return jsonify({"message": "Validation failed", "errors": errors}), 400
             for field, value in terms.items():
-                setattr(application, field if field != "interest_rate" else "interest_rate", value)
+                if field not in {"total_payable", "total_days", "maturity_date"} and not (field == "tenure_months" and value is None):
+                    setattr(application, field, value)
             application.approved_tenure = parse_int(data.get("approved_tenure"), application.approved_tenure or application.tenure_months)
     else:
         approved_amount = parse_decimal(data.get("approved_amount", application.approved_amount or application.applied_amount))
@@ -1029,25 +1052,30 @@ def disburse_application(application_id):
     disbursement_date = date.fromisoformat(data.get("disbursement_date")) if data.get("disbursement_date") else date.today()
     use_flexible_terms = _terms_complete(application)
     if use_flexible_terms:
-        terms, errors = _validate_and_calculate_terms(_application_terms(application))
+        terms, errors = _validate_and_calculate_terms(_application_terms(application), start_date=disbursement_date)
         if errors:
             return jsonify({"message": "Approved commercial terms are incomplete or invalid", "errors": errors}), 400
         principal = terms["approved_amount"]
-        loan_days = terms["loan_days"]
+        resolved = resolve_loan_term(disbursement_date, terms["term_type"], terms["term_value"], terms["repayment_frequency"])
+        loan_days = resolved.total_days if terms["term_type"] == "DAYS" else None
         start_date = disbursement_date
-        maturity_date = start_date + timedelta(days=loan_days)
+        maturity_date = resolved.maturity_date
         end_date = maturity_date
         total_payable = terms["total_repayment"]
-        daily_installment = money(total_payable / Decimal(loan_days))
+        daily_installment = money(total_payable / Decimal(resolved.total_days))
         loan_kwargs = {
-            "loan_days": loan_days, "repayment_frequency": terms["repayment_frequency"],
-            "number_of_installments": terms["number_of_installments"], "installment_amount": terms["installment_amount"],
+            "term_type": terms["term_type"], "term_value": terms["term_value"],
+            "loan_days": loan_days, "tenure_months": terms["term_value"] if terms["term_type"] == "MONTHS" else None,
+            "repayment_frequency": terms["repayment_frequency"],
+            "number_of_installments": resolved.installment_count, "installment_count": resolved.installment_count,
+            "installment_amount": terms["installment_amount"],
             "total_repayment": terms["total_repayment"], "total_interest": terms["total_interest"],
-            "interest_type": terms["interest_type"], "maturity_date": maturity_date,
+            "interest_type": terms["interest_type"], "interest_rate_basis": terms["interest_rate_basis"],
+            "maturity_date": maturity_date,
         }
         interest_rate = terms["interest_rate"]
         payment_interval_days = {"DAILY": 1, "WEEKLY": 7, "MONTHLY": 30}[terms["repayment_frequency"]]
-        total_days = loan_days
+        total_days = resolved.total_days
     else:
         principal = application.approved_amount or application.applied_amount
         tenure_months = application.approved_tenure or application.tenure_months
@@ -1068,7 +1096,7 @@ def disburse_application(application_id):
         application.status = STATUS_DISBURSED
         post_loan_disbursement(loan, int(get_jwt_identity()), funding_account=funding_account, disbursement_date=disbursement_date)
         db.session.commit()
-        return jsonify({"message": "Loan disbursed", "loan_id": loan.id, "loan_number": loan.loan_number, "loan": {"principal_amount": float(loan.principal_amount), "loan_days": loan.loan_days, "repayment_frequency": loan.repayment_frequency, "number_of_installments": loan.number_of_installments, "installment_amount": _decimal_to_float(loan.installment_amount), "total_repayment": _decimal_to_float(loan.total_repayment), "total_interest": _decimal_to_float(loan.total_interest), "interest_rate": float(loan.interest_rate), "interest_type": loan.interest_type, "start_date": loan.start_date.isoformat(), "maturity_date": loan.maturity_date.isoformat() if loan.maturity_date else None, "final_installment_due_date": loan.final_installment_due_date.isoformat() if loan.final_installment_due_date else None}, "application": build_application_response(application)}), 201
+        return jsonify({"message": "Loan disbursed", "loan_id": loan.id, "loan_number": loan.loan_number, "loan": {"principal_amount": float(loan.principal_amount), "term_type": loan.term_type, "term_value": loan.term_value, "loan_days": loan.loan_days, "tenure_months": loan.tenure_months, "repayment_frequency": loan.repayment_frequency, "number_of_installments": loan.number_of_installments, "installment_count": loan.installment_count, "installment_amount": _decimal_to_float(loan.installment_amount), "total_repayment": _decimal_to_float(loan.total_repayment), "total_interest": _decimal_to_float(loan.total_interest), "interest_rate": float(loan.interest_rate), "interest_type": loan.interest_type, "interest_rate_basis": loan.interest_rate_basis, "start_date": loan.start_date.isoformat(), "maturity_date": loan.maturity_date.isoformat() if loan.maturity_date else None, "final_installment_due_date": loan.final_installment_due_date.isoformat() if loan.final_installment_due_date else None}, "application": build_application_response(application)}), 201
     except AccountingError as exc:
         db.session.rollback(); return jsonify({"message": "Accounting posting failed", "error": str(exc)}), 400
     except Exception as exc:

@@ -5,6 +5,7 @@ import calendar
 from .currency import CURRENCY_CODE, format_currency
 from .extensions import db
 from .models import Loan, LoanLedger
+from .loan_terms import resolve_loan_term
 
 CENT = Decimal("0.01")
 
@@ -38,7 +39,7 @@ def _next_due_date(start_date, frequency, installment_no):
 
 
 def _generate_fixed_terms_ledger(loan: Loan):
-    count = int(loan.number_of_installments or 0)
+    count = int(loan.installment_count or loan.number_of_installments or 0)
     if count <= 0:
         return []
     principal = money(loan.principal_amount)
@@ -46,38 +47,47 @@ def _generate_fixed_terms_ledger(loan: Loan):
     total_repayment = money(loan.total_repayment or (principal + total_interest))
     frequency = (loan.repayment_frequency or "").upper()
 
+    term_type = getattr(loan, "term_type", None) or ("DAYS" if loan.loan_days else None) or ("MONTHS" if getattr(loan, "tenure_months", None) else None)
+    term_value = getattr(loan, "term_value", None) or loan.loan_days or getattr(loan, "tenure_months", None)
+    resolved = resolve_loan_term(loan.start_date, term_type, term_value, frequency)
+    periods = resolved.installment_periods
+    count = resolved.installment_count
+
     principal_regular = money(principal / Decimal(count))
     interest_regular = money(total_interest / Decimal(count))
+    installment_regular = money(total_repayment / Decimal(count))
     opening_balance = principal
-    period_start = loan.start_date
     principal_allocated = Decimal("0.00")
     interest_allocated = Decimal("0.00")
+    installment_allocated = Decimal("0.00")
     entries = []
 
-    for index in range(1, count + 1):
-        is_last = index == count
+    for period in periods:
+        is_last = period.installment_no == count
         principal_amount = money(principal - principal_allocated) if is_last else principal_regular
         interest_amount = money(total_interest - interest_allocated) if is_last else interest_regular
-        installment_amount = money(total_repayment - sum((e.installment_amount for e in entries), Decimal("0.00"))) if is_last else money(principal_amount + interest_amount)
-        due_date = _next_due_date(loan.start_date, frequency, index)
-        period_days = max((due_date - period_start).days + 1, 1) if due_date else 1
+        installment_amount = money(total_repayment - installment_allocated) if is_last else installment_regular
         closing_balance = money(opening_balance - principal_amount)
         if is_last:
             closing_balance = Decimal("0.00")
         entry = LoanLedger(
-            loan_id=loan.id, installment_no=index, period_start_date=period_start,
-            due_date=due_date, period_days=period_days, opening_balance=opening_balance,
+            loan_id=loan.id, installment_no=period.installment_no, period_start_date=period.period_start,
+            due_date=period.due_date, period_days=period.days_in_period, opening_balance=opening_balance,
             interest_amount=interest_amount, principal_amount=principal_amount,
             installment_amount=installment_amount, closing_balance=closing_balance,
             paid_amount=Decimal("0.00"), delay_days=0, delay_interest=Decimal("0.00"), status="PENDING")
         db.session.add(entry); entries.append(entry)
-        principal_allocated += principal_amount; interest_allocated += interest_amount
-        opening_balance = closing_balance; period_start = due_date + timedelta(days=1)
+        principal_allocated += principal_amount; interest_allocated += interest_amount; installment_allocated += installment_amount
+        opening_balance = closing_balance
     loan.final_installment_due_date = entries[-1].due_date if entries else None
+    loan.maturity_date = resolved.maturity_date
+    loan.end_date = resolved.maturity_date
+    loan.total_days = resolved.total_days
+    loan.number_of_installments = count
+    loan.installment_count = count
     loan.total_payable = total_repayment
-    loan.daily_installment = money(total_repayment / Decimal(max(int(loan.total_days or loan.loan_days or count), 1)))
+    loan.daily_installment = money(total_repayment / Decimal(max(int(loan.total_days or count), 1)))
     return entries
-
 
 def generate_loan_ledger(loan: Loan):
     """Create repayment ledger rows for a loan if they do not already exist."""
