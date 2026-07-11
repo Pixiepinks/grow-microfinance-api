@@ -660,6 +660,95 @@ def test_admin_can_disburse_approved_application_into_active_loan(app, client):
     }
 
 
+
+def test_admin_loan_endpoints_include_customer_details(app, client):
+    admin_user = _create_user(
+        "admin", "Admin Loan Customer", "admin-loan-customer@example.com"
+    )
+    customer_user = _create_user("customer", "Kasun Perera", "kasun@example.com")
+    customer = _customer_profile(customer_user, code="CUST-KASUN")
+    customer.full_name = "Kasun Perera"
+    customer.mobile = "0771234567"
+    customer.nic_number = "901234567V"
+
+    loan = Loan(
+        loan_number="LN-CUSTOMER-DETAILS",
+        customer_id=customer.id,
+        principal_amount=Decimal("10000.00"),
+        interest_rate=Decimal("10.00"),
+        total_days=30,
+        payment_interval_days=30,
+        daily_installment=Decimal("366.67"),
+        total_payable=Decimal("11000.00"),
+        start_date=date(2026, 1, 1),
+        end_date=date(2026, 1, 30),
+        status="Active",
+        created_by_id=admin_user.id,
+    )
+    db.session.add(loan)
+    db.session.commit()
+
+    headers = _auth_headers(app, admin_user)
+    expected_customer = {
+        "id": customer.id,
+        "full_name": "Kasun Perera",
+        "mobile": "0771234567",
+        "nic": "901234567V",
+    }
+
+    list_response = client.get("/admin/loans", headers=headers)
+    assert list_response.status_code == 200
+    list_loan = next(item for item in list_response.get_json() if item["id"] == loan.id)
+    assert list_loan["customer_id"] == customer.id
+    assert list_loan["customer"] == expected_customer
+
+    detail_response = client.get(f"/admin/loans/{loan.id}", headers=headers)
+    assert detail_response.status_code == 200
+    detail_body = detail_response.get_json()
+    assert detail_body["customer_id"] == customer.id
+    assert detail_body["customer"] == expected_customer
+
+    ledger_response = client.get(f"/admin/loans/{loan.id}/ledger", headers=headers)
+    assert ledger_response.status_code == 200
+    ledger_loan = ledger_response.get_json()["loan"]
+    assert ledger_loan["customer_id"] == customer.id
+    assert ledger_loan["customer"] == expected_customer
+
+
+def test_admin_loan_customer_is_null_when_customer_record_missing(app, client):
+    admin_user = _create_user(
+        "admin", "Admin Missing Customer", "admin-missing-customer@example.com"
+    )
+    missing_customer_id = 999
+    loan = Loan(
+        loan_number="LN-MISSING-CUSTOMER",
+        customer_id=missing_customer_id,
+        principal_amount=Decimal("10000.00"),
+        interest_rate=Decimal("10.00"),
+        total_days=30,
+        payment_interval_days=30,
+        daily_installment=Decimal("366.67"),
+        total_payable=Decimal("11000.00"),
+        start_date=date(2026, 1, 1),
+        end_date=date(2026, 1, 30),
+        status="Active",
+        created_by_id=admin_user.id,
+    )
+    db.session.add(loan)
+    db.session.commit()
+
+    headers = _auth_headers(app, admin_user)
+
+    detail_response = client.get(f"/admin/loans/{loan.id}", headers=headers)
+    assert detail_response.status_code == 200
+    detail_body = detail_response.get_json()
+    assert detail_body["customer_id"] == missing_customer_id
+    assert detail_body["customer"] is None
+
+    ledger_response = client.get(f"/admin/loans/{loan.id}/ledger", headers=headers)
+    assert ledger_response.status_code == 200
+    assert ledger_response.get_json()["loan"]["customer"] is None
+
 def test_admin_loan_creation_generates_63_day_weekly_ledger(app, client):
     admin_user = _create_user("admin", "Ledger Admin", "ledger-admin@example.com")
     customer_user = _create_user(
