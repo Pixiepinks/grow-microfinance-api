@@ -15,17 +15,22 @@ from .models import (
     AccountingJournalEntry,
     AccountingJournalLine,
     AccountingSetting,
+    Customer,
     Loan,
     LoanLedger,
     Payment,
     LoanApplication,
+    User,
 )
 
 CENT = Decimal("0.01")
 ACCOUNT_TYPES = {"ASSET", "LIABILITY", "EQUITY", "INCOME", "EXPENSE"}
 NORMAL_BALANCES = {"DEBIT", "CREDIT"}
+ACCOUNT_SUBTYPES = {"CASH", "BANK", "LOAN_RECEIVABLE", "INTEREST_RECEIVABLE", "PENALTY_RECEIVABLE", "OTHER_CURRENT_ASSET", "FIXED_ASSET", "ACCOUNTS_PAYABLE", "BORROWING", "CAPITAL", "RETAINED_EARNINGS", "INTEREST_INCOME", "PENALTY_INCOME", "FEE_INCOME", "OPERATING_EXPENSE", "WRITE_OFF_EXPENSE", "SUSPENSE", "OTHER"}
 SYSTEM_MAPPINGS = {
     "DEFAULT_DISBURSEMENT_ACCOUNT": "1010",
+    "DEFAULT_CASH_COLLECTION_ACCOUNT": "1000",
+    "DEFAULT_BANK_COLLECTION_ACCOUNT": "1010",
     "CASH_ACCOUNT": "1000",
     "BANK_ACCOUNT": "1010",
     "LOAN_RECEIVABLE_ACCOUNT": "1100",
@@ -33,27 +38,47 @@ SYSTEM_MAPPINGS = {
     "PENALTY_RECEIVABLE_ACCOUNT": "1120",
     "INTEREST_INCOME_ACCOUNT": "4000",
     "PENALTY_INCOME_ACCOUNT": "4010",
+    "PROCESSING_FEE_INCOME_ACCOUNT": "4020",
     "OTHER_FEE_INCOME_ACCOUNT": "4020",
+    "LOAN_WRITE_OFF_EXPENSE_ACCOUNT": "5050",
+    "SUSPENSE_ACCOUNT": "1990",
+    "RETAINED_EARNINGS_ACCOUNT": "3100",
 }
 DEFAULT_ACCOUNTS = [
     ("1000", "Cash on Hand", "ASSET", "DEBIT", True, "CASH"),
     ("1010", "Main Bank Account", "ASSET", "DEBIT", True, "BANK"),
-    ("1100", "Loan Principal Receivable", "ASSET", "DEBIT", True, "RECEIVABLE"),
-    ("1110", "Interest Receivable", "ASSET", "DEBIT", True, "RECEIVABLE"),
-    ("1120", "Penalty Receivable", "ASSET", "DEBIT", True, "RECEIVABLE"),
-    ("2000", "Accounts Payable", "LIABILITY", "CREDIT", False, "NONE"),
-    ("2100", "Borrowings", "LIABILITY", "CREDIT", False, "NONE"),
-    ("3000", "Owner's Capital", "EQUITY", "CREDIT", False, "NONE"),
-    ("3100", "Retained Earnings", "EQUITY", "CREDIT", False, "NONE"),
-    ("4000", "Interest Income", "INCOME", "CREDIT", True, "NONE"),
-    ("4010", "Penalty Income", "INCOME", "CREDIT", True, "NONE"),
-    ("4020", "Processing Fee Income", "INCOME", "CREDIT", False, "NONE"),
-    ("5000", "Salary Expense", "EXPENSE", "DEBIT", False, "NONE"),
-    ("5010", "Rent Expense", "EXPENSE", "DEBIT", False, "NONE"),
-    ("5020", "Utilities Expense", "EXPENSE", "DEBIT", False, "NONE"),
-    ("5030", "Transport Expense", "EXPENSE", "DEBIT", False, "NONE"),
-    ("5040", "Office Expense", "EXPENSE", "DEBIT", False, "NONE"),
+    ("1100", "Loan Principal Receivable", "ASSET", "DEBIT", True, "LOAN_RECEIVABLE"),
+    ("1110", "Interest Receivable", "ASSET", "DEBIT", True, "INTEREST_RECEIVABLE"),
+    ("1120", "Penalty Receivable", "ASSET", "DEBIT", True, "PENALTY_RECEIVABLE"),
+    ("2000", "Accounts Payable", "LIABILITY", "CREDIT", False, "ACCOUNTS_PAYABLE"),
+    ("2100", "Borrowings", "LIABILITY", "CREDIT", False, "BORROWING"),
+    ("3000", "Owner's Capital", "EQUITY", "CREDIT", False, "CAPITAL"),
+    ("3100", "Retained Earnings", "EQUITY", "CREDIT", True, "RETAINED_EARNINGS"),
+    ("4000", "Interest Income", "INCOME", "CREDIT", True, "INTEREST_INCOME"),
+    ("4010", "Penalty Income", "INCOME", "CREDIT", True, "PENALTY_INCOME"),
+    ("4020", "Processing Fee Income", "INCOME", "CREDIT", True, "FEE_INCOME"),
+    ("5000", "Salary Expense", "EXPENSE", "DEBIT", False, "OPERATING_EXPENSE"),
+    ("5010", "Rent Expense", "EXPENSE", "DEBIT", False, "OPERATING_EXPENSE"),
+    ("5020", "Utilities Expense", "EXPENSE", "DEBIT", False, "OPERATING_EXPENSE"),
+    ("5030", "Transport Expense", "EXPENSE", "DEBIT", False, "OPERATING_EXPENSE"),
+    ("5040", "Office Expense", "EXPENSE", "DEBIT", False, "OPERATING_EXPENSE"),
+    ("5050", "Loan Write-off Expense", "EXPENSE", "DEBIT", True, "WRITE_OFF_EXPENSE"),
+    ("1990", "Suspense Account", "ASSET", "DEBIT", True, "SUSPENSE"),
 ]
+SETTING_VALIDATION = {
+    "DEFAULT_DISBURSEMENT_ACCOUNT": ({"ASSET"}, {"CASH", "BANK"}),
+    "DEFAULT_CASH_COLLECTION_ACCOUNT": ({"ASSET"}, {"CASH"}),
+    "DEFAULT_BANK_COLLECTION_ACCOUNT": ({"ASSET"}, {"BANK"}),
+    "LOAN_RECEIVABLE_ACCOUNT": ({"ASSET"}, {"LOAN_RECEIVABLE"}),
+    "INTEREST_RECEIVABLE_ACCOUNT": ({"ASSET"}, {"INTEREST_RECEIVABLE"}),
+    "PENALTY_RECEIVABLE_ACCOUNT": ({"ASSET"}, {"PENALTY_RECEIVABLE"}),
+    "INTEREST_INCOME_ACCOUNT": ({"INCOME"}, {"INTEREST_INCOME", "FEE_INCOME", "OTHER"}),
+    "PENALTY_INCOME_ACCOUNT": ({"INCOME"}, {"PENALTY_INCOME", "FEE_INCOME", "OTHER"}),
+    "PROCESSING_FEE_INCOME_ACCOUNT": ({"INCOME"}, {"FEE_INCOME", "OTHER"}),
+    "LOAN_WRITE_OFF_EXPENSE_ACCOUNT": ({"EXPENSE"}, {"WRITE_OFF_EXPENSE", "OPERATING_EXPENSE", "OTHER"}),
+    "SUSPENSE_ACCOUNT": ({"ASSET", "LIABILITY"}, {"SUSPENSE", "OTHER_CURRENT_ASSET", "OTHER"}),
+    "RETAINED_EARNINGS_ACCOUNT": ({"EQUITY"}, {"RETAINED_EARNINGS"}),
+}
 
 class AccountingError(ValueError):
     pass
@@ -62,17 +87,21 @@ def money(value) -> Decimal:
     return Decimal(str(value or "0")).quantize(CENT, rounding=ROUND_HALF_UP)
 
 def log_audit(action, entity_type, entity_id=None, user_id=None, details=None):
-    db.session.add(AccountingAuditLog(action=action, entity_type=entity_type, entity_id=str(entity_id) if entity_id else None, user_id=user_id, details=details))
+    db.session.add(AccountingAuditLog(action=action, entity_type=entity_type, entity_id=str(entity_id) if entity_id else None, user_id=user_id, details=str(details) if details is not None else None))
 
 def seed_default_accounts():
     for code, name, typ, normal, system, category in DEFAULT_ACCOUNTS:
         acct = AccountingAccount.query.filter_by(account_code=code).first()
         if not acct:
-            db.session.add(AccountingAccount(account_code=code, account_name=name, account_type=typ, normal_balance=normal, is_system_account=system, cash_flow_category=category))
+            db.session.add(AccountingAccount(account_code=code, account_name=name, account_type=typ, normal_balance=normal, is_system_account=system, cash_flow_category=("RECEIVABLE" if "RECEIVABLE" in category else category), account_subtype=category))
         else:
             acct.is_system_account = bool(system) or acct.is_system_account
+            acct.account_type = typ
+            acct.normal_balance = normal
+            if hasattr(acct, "account_subtype"):
+                acct.account_subtype = category
             if getattr(acct, "cash_flow_category", None) in (None, "NONE") and category != "NONE":
-                acct.cash_flow_category = category
+                acct.cash_flow_category = "RECEIVABLE" if "RECEIVABLE" in category else category
     db.session.flush()
     for key, code in SYSTEM_MAPPINGS.items():
         setting = AccountingSetting.query.filter_by(setting_key=key).first()
@@ -317,3 +346,185 @@ def reconciliation_issues():
         if td != tc: issues.append({"type":"UNBALANCED_JOURNAL","journal_id":e.id})
         if money(e.total_debit)!=td or money(e.total_credit)!=tc: issues.append({"type":"JOURNAL_TOTAL_MISMATCH","journal_id":e.id})
     return issues
+
+# Accounting improvement package helpers (phase 1.5)
+def account_subtype(account):
+    return getattr(account, "account_subtype", None) or ({"CASH": "CASH", "BANK": "BANK", "RECEIVABLE": "LOAN_RECEIVABLE"}.get(getattr(account, "cash_flow_category", None), "OTHER"))
+
+def serialize_account(account):
+    return None if not account else {"account_id": account.id, "account_code": account.account_code, "account_name": account.account_name, "account_type": account.account_type, "account_subtype": account_subtype(account), "is_active": account.is_active}
+
+def validate_setting_account(key, account):
+    if key not in SETTING_VALIDATION:
+        raise AccountingError(f"Unsupported accounting setting: {key}")
+    if not account:
+        raise AccountingError("Account not found")
+    if not account.is_active:
+        raise AccountingError("Account is inactive")
+    if not account.allow_manual_posting:
+        raise AccountingError("Account does not allow posting")
+    valid_types, valid_subtypes = SETTING_VALIDATION[key]
+    if account.account_type not in valid_types:
+        raise AccountingError(f"Account type must be one of {sorted(valid_types)}")
+    if account_subtype(account) not in valid_subtypes:
+        raise AccountingError(f"Account subtype must be one of {sorted(valid_subtypes)}")
+    return account
+
+def _account_from_setting_value(value):
+    if value is None:
+        return None
+    text_value = str(value)
+    account = AccountingAccount.query.get(int(text_value)) if text_value.isdigit() else None
+    return account or AccountingAccount.query.filter_by(account_code=text_value).first()
+
+def resolve_system_account(key):
+    seed_default_accounts()
+    setting = AccountingSetting.query.filter_by(setting_key=key).first()
+    account = _account_from_setting_value(setting.setting_value) if setting else None
+    if not account and key in SYSTEM_MAPPINGS:
+        current_app.logger.warning("Accounting setting %s used fallback account code %s", key, SYSTEM_MAPPINGS[key])
+        account = AccountingAccount.query.filter_by(account_code=SYSTEM_MAPPINGS[key]).first()
+        log_audit("ACCOUNTING_SETTING_FALLBACK_USED", "AccountingSetting", key, None, {"fallback_code": SYSTEM_MAPPINGS[key]})
+    if not account:
+        raise AccountingError(f"System account {key} is not configured")
+    return account
+
+def accounting_settings_payload():
+    seed_default_accounts()
+    payload = {}
+    for key in SETTING_VALIDATION:
+        try:
+            payload[key] = serialize_account(resolve_system_account(key))
+        except AccountingError:
+            payload[key] = None
+    return payload
+
+def update_accounting_settings(data, user_id=None):
+    errors = {}
+    updates = {}
+    for key, raw_id in (data or {}).items():
+        if key not in SETTING_VALIDATION:
+            errors[key] = "Unsupported setting"
+            continue
+        try:
+            account = AccountingAccount.query.get(int(raw_id))
+            validate_setting_account(key, account)
+            updates[key] = account
+        except Exception as exc:
+            errors[key] = str(exc)
+    if errors:
+        raise AccountingError(errors)
+    for key, account in updates.items():
+        setting = AccountingSetting.query.filter_by(setting_key=key).first()
+        old = setting.setting_value if setting else None
+        if not setting:
+            setting = AccountingSetting(setting_key=key, setting_value=str(account.id))
+            db.session.add(setting)
+        else:
+            setting.setting_value = str(account.id)
+        log_audit("ACCOUNTING_SETTING_CHANGED", "AccountingSetting", key, user_id, {"old_value": old, "new_value": account.id, "account_code": account.account_code})
+    return accounting_settings_payload()
+
+def account_has_activity(acct):
+    return db.session.query(AccountingJournalLine.id).filter_by(account_id=acct.id).first() is not None
+
+def account_is_mapped(acct):
+    for setting in AccountingSetting.query.all():
+        if _account_from_setting_value(setting.setting_value) and _account_from_setting_value(setting.setting_value).id == acct.id:
+            return True
+    return False
+
+def create_account(data, user_id=None):
+    typ = data.get("account_type"); normal = data.get("normal_balance"); subtype = data.get("account_subtype", "OTHER")
+    if typ not in ACCOUNT_TYPES or normal not in NORMAL_BALANCES or subtype not in ACCOUNT_SUBTYPES:
+        raise AccountingError("Invalid account type, normal balance, or subtype")
+    acct = AccountingAccount(account_code=data["account_code"], account_name=data["account_name"], account_type=typ, normal_balance=normal, parent_id=data.get("parent_id"), description=data.get("description"), is_active=data.get("is_active", True), allow_manual_posting=data.get("allow_manual_posting", True), cash_flow_category=data.get("cash_flow_category", subtype if subtype in ("CASH", "BANK") else "NONE"), account_subtype=subtype)
+    db.session.add(acct); db.session.flush(); log_audit("ACCOUNT_CREATE", "AccountingAccount", acct.id, user_id); return acct
+
+def update_account(acct, data, user_id=None):
+    if acct.is_system_account and data.get("_delete"):
+        log_audit("PROTECTED_ACCOUNT_UPDATE_ATTEMPTED", "AccountingAccount", acct.id, user_id, data); raise AccountingError("System accounts cannot be deleted")
+    if account_has_activity(acct):
+        for f in ("account_code", "account_type", "normal_balance"):
+            if f in data and data[f] != getattr(acct, f):
+                log_audit("PROTECTED_ACCOUNT_UPDATE_ATTEMPTED", "AccountingAccount", acct.id, user_id, {"field": f}); raise AccountingError(f"{f} cannot be changed after journal activity exists")
+    if "is_active" in data and data["is_active"] is False and account_is_mapped(acct):
+        log_audit("PROTECTED_ACCOUNT_UPDATE_ATTEMPTED", "AccountingAccount", acct.id, user_id, {"field": "is_active"}); raise AccountingError("Mapped accounts cannot be deactivated")
+    for field in ["account_name", "description", "is_active", "allow_manual_posting", "cash_flow_category", "account_subtype"]:
+        if field in data: setattr(acct, field, data[field])
+    log_audit("ACCOUNT_ACTIVATION_CHANGED" if "is_active" in data else "ACCOUNT_UPDATE", "AccountingAccount", acct.id, user_id, data); return acct
+
+def validate_funding_account(account, method=None):
+    if not account: raise AccountingError("Funding account not found")
+    if not account.is_active: raise AccountingError("Funding account is inactive")
+    if account.account_type != "ASSET": raise AccountingError("Funding account must be an ASSET account")
+    if account_subtype(account) not in ("CASH", "BANK"): raise AccountingError("Funding account must be CASH or BANK")
+    if method in ("CASH", "Cash") and account_subtype(account) != "CASH": raise AccountingError("Cash transactions require a CASH account")
+    if str(method).upper() in ("BANK_TRANSFER", "CHEQUE") and account_subtype(account) != "BANK": raise AccountingError("Bank and cheque transactions require a BANK account")
+    if not account.allow_manual_posting: raise AccountingError("Funding account does not allow posting")
+    return account
+
+def _method_key(method):
+    method = str(method or "CASH").upper().replace(" ", "_")
+    return "DEFAULT_CASH_COLLECTION_ACCOUNT" if method == "CASH" else "DEFAULT_BANK_COLLECTION_ACCOUNT" if method in ("BANK_TRANSFER", "BANK", "DEPOSIT", "CHEQUE") else None
+
+def post_loan_disbursement(loan, user_id=None, funding_key="DEFAULT_DISBURSEMENT_ACCOUNT", funding_account=None, disbursement_date=None):
+    amount = money(loan.principal_amount)
+    if funding_account is None:
+        funding_account = resolve_system_account(funding_key); log_audit("DEFAULT_DISBURSEMENT_ACCOUNT_USED", "Loan", loan.id, user_id, {"account_id": funding_account.id, "account_code": funding_account.account_code})
+    else:
+        log_audit("EXPLICIT_FUNDING_ACCOUNT_SELECTED", "Loan", loan.id, user_id, {"account_id": funding_account.id, "account_code": funding_account.account_code})
+    funding_account = validate_funding_account(funding_account)
+    journal_date = disbursement_date or loan.start_date or date.today()
+    return post_journal(create_draft_journal(journal_date, "Loan disbursement", [{"account_id": resolve_system_account("LOAN_RECEIVABLE_ACCOUNT").id, "debit": amount, "customer_id": loan.customer_id, "loan_id": loan.id}, {"account_id": funding_account.id, "credit": amount, "customer_id": loan.customer_id, "loan_id": loan.id}], "LOAN_DISBURSEMENT", loan.id, "LOANS", user_id, f"LOAN_DISBURSEMENT:{loan.id}"), user_id)
+
+def post_loan_payment(payment, user_id=None, receipt_account=None):
+    existing = AccountingJournalEntry.query.filter_by(idempotency_key=f"LOAN_PAYMENT:{payment.id}").first()
+    if existing: return existing
+    total = money(payment.amount_collected); principal=money(payment.principal_paid); interest=money(payment.interest_paid); penalty=money(payment.penalty_paid); other=money(payment.other_fee_paid)
+    if money(principal+interest+penalty+other) != total: raise AccountingError("Payment allocation does not match amount collected")
+    key = _method_key(payment.payment_method)
+    if receipt_account is None:
+        if not key: raise AccountingError("receipt_account_id is required for OTHER payment methods")
+        receipt_account = resolve_system_account(key); log_audit("DEFAULT_RECEIPT_ACCOUNT_USED", "Payment", payment.id, user_id, {"account_id": receipt_account.id, "account_code": receipt_account.account_code})
+    else:
+        log_audit("EXPLICIT_RECEIPT_ACCOUNT_SELECTED", "Payment", payment.id, user_id, {"account_id": receipt_account.id, "account_code": receipt_account.account_code})
+    receipt_account = validate_funding_account(receipt_account, payment.payment_method)
+    loan = payment.loan
+    lines=[{"account_id": receipt_account.id, "debit": total, "customer_id": loan.customer_id, "loan_id": loan.id, "payment_id": payment.id}]
+    for key, amt in [("LOAN_RECEIVABLE_ACCOUNT", principal), ("INTEREST_INCOME_ACCOUNT", interest), ("PENALTY_INCOME_ACCOUNT", penalty), ("PROCESSING_FEE_INCOME_ACCOUNT", other)]:
+        if amt > 0: lines.append({"account_id": resolve_system_account(key).id, "credit": amt, "customer_id": loan.customer_id, "loan_id": loan.id, "payment_id": payment.id})
+    return post_journal(create_draft_journal(payment.collection_date, "Loan payment", lines, "LOAN_PAYMENT", payment.id, "PAYMENTS", user_id, f"LOAN_PAYMENT:{payment.id}"), user_id)
+
+def _line_context(line):
+    return {"customer_id": line.customer_id, "customer_number": line.customer.customer_code if line.customer else None, "customer_name": line.customer.full_name if line.customer else None, "loan_id": line.loan_id, "loan_number": line.loan.loan_number if line.loan else None, "payment_id": line.payment_id, "collection_id": line.collection_id}
+
+def serialize_journal(entry):
+    source_line = next((l for l in entry.lines if l.customer_id or l.loan_id or l.payment_id), None)
+    ctx = _line_context(source_line) if source_line else {}
+    reversal = entry.reversal_journals[0] if getattr(entry, "reversal_journals", None) else None
+    return {"id": entry.id, "journal_no": entry.journal_no, "journal_date": entry.journal_date.isoformat(), "description": entry.description, "reference_type": entry.reference_type, "reference_id": entry.reference_id, "source_module": entry.source_module, "status": entry.status, "total_debit": f"{money(entry.total_debit):.2f}", "total_credit": f"{money(entry.total_credit):.2f}", "posted_at": entry.posted_at.isoformat() if entry.posted_at else None, "created_by_name": entry.created_by.name if entry.created_by else None, "posted_by_name": entry.posted_by.name if entry.posted_by else None, "customer_id": ctx.get("customer_id"), "customer_number": ctx.get("customer_number"), "customer_name": ctx.get("customer_name"), "loan_id": ctx.get("loan_id"), "loan_number": ctx.get("loan_number"), "payment_id": ctx.get("payment_id"), "collection_id": ctx.get("collection_id"), "original_journal_no": entry.reversal_of.journal_no if entry.reversal_of else None, "reversal_journal_no": reversal.journal_no if reversal else None, "is_reversal": bool(entry.reversal_of_id), "lines": [{"id": l.id, "line_no": l.line_no, "account_id": l.account_id, "account_code": l.account.account_code, "account_name": l.account.account_name, "account_type": l.account.account_type, "account_subtype": account_subtype(l.account), "debit": f"{money(l.debit):.2f}", "credit": f"{money(l.credit):.2f}", **_line_context(l), "description": l.description} for l in entry.lines]}
+
+def general_ledger(account_id=None, date_from=None, date_to=None, customer_id=None, loan_id=None, account_code=None, query_params=None):
+    account = _resolve_ledger_account(account_id, account_code)
+    customer_id = _int_filter(customer_id, "customer_id"); loan_id = _int_filter(loan_id, "loan_id")
+    filters=[AccountingJournalLine.account_id == account.id, func.upper(AccountingJournalEntry.status).in_(["POSTED", "REVERSED"])]
+    if customer_id is not None: filters.append(AccountingJournalLine.customer_id == customer_id)
+    if loan_id is not None: filters.append(AccountingJournalLine.loan_id == loan_id)
+    q=(AccountingJournalLine.query.join(AccountingJournalEntry).outerjoin(Customer, AccountingJournalLine.customer_id == Customer.id).outerjoin(Loan, AccountingJournalLine.loan_id == Loan.id).outerjoin(Payment, AccountingJournalLine.payment_id == Payment.id).filter(*filters))
+    before=q; tx_query=q
+    if date_from: before=before.filter(AccountingJournalEntry.journal_date < date_from); tx_query=tx_query.filter(AccountingJournalEntry.journal_date >= date_from)
+    if date_to: tx_query=tx_query.filter(AccountingJournalEntry.journal_date <= date_to)
+    def signed(line): return money(line.debit-line.credit) if account.normal_balance=="DEBIT" else money(line.credit-line.debit)
+    opening=sum((signed(l) for l in before.all()), Decimal("0.00")) if date_from else Decimal("0.00")
+    running=money(opening); tx=[]; td=tc=Decimal("0.00")
+    rows=tx_query.order_by(AccountingJournalEntry.journal_date, AccountingJournalEntry.journal_no, AccountingJournalLine.line_no).all()
+    current_app.logger.info("general_ledger query", extra={"query_params": query_params or {}, "resolved_account_id": account.id, "journal_lines_found": len(rows)})
+    for l in rows:
+        running=money(running+signed(l)); td+=money(l.debit); tc+=money(l.credit); e=l.journal_entry; ctx=_line_context(l)
+        tx.append({"journal_entry_id": e.id, "journal_date": e.journal_date.isoformat(), "journal_no": e.journal_no, "description": e.description, "reference_type": e.reference_type, "reference_id": e.reference_id, "source_module": e.source_module, "debit": f"{money(l.debit):.2f}", "credit": f"{money(l.credit):.2f}", "running_balance": f"{running:.2f}", **ctx})
+    return {"account": {"id": account.id, "account_code": account.account_code, "account_name": account.account_name, "account_type": account.account_type, "account_subtype": account_subtype(account), "normal_balance": account.normal_balance}, "opening_balance": f"{money(opening):.2f}", "transactions": tx, "running_balance": f"{running:.2f}", "closing_balance": f"{running:.2f}", "total_debit": f"{money(td):.2f}", "total_credit": f"{money(tc):.2f}"}
+
+def ledger_csv(data):
+    fields=["journal_entry_id","journal_date","journal_no","description","reference_type","reference_id","source_module","debit","credit","running_balance","customer_id","customer_number","customer_name","loan_id","loan_number","payment_id","collection_id"]
+    out=StringIO(); w=csv.DictWriter(out, fieldnames=fields, extrasaction="ignore"); w.writeheader(); w.writerows(data["transactions"]); return out.getvalue()

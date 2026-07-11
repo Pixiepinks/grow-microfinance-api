@@ -399,6 +399,8 @@ class Payment(db.Model):
     other_fee_paid = db.Column(Numeric(12, 2), nullable=False, default=Decimal("0.00"))
     collected_by_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
     payment_method = db.Column(db.String(50), default="Cash")
+    transaction_reference = db.Column(db.String(120))
+    receipt_account_id = db.Column(db.Integer, db.ForeignKey("accounting_accounts.id"))
     remarks = db.Column(db.String(255))
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
@@ -408,6 +410,7 @@ class Payment(db.Model):
     )
 
 ACCOUNT_TYPES = ("ASSET", "LIABILITY", "EQUITY", "INCOME", "EXPENSE")
+ACCOUNT_SUBTYPES = ("CASH", "BANK", "LOAN_RECEIVABLE", "INTEREST_RECEIVABLE", "PENALTY_RECEIVABLE", "OTHER_CURRENT_ASSET", "FIXED_ASSET", "ACCOUNTS_PAYABLE", "BORROWING", "CAPITAL", "RETAINED_EARNINGS", "INTEREST_INCOME", "PENALTY_INCOME", "FEE_INCOME", "OPERATING_EXPENSE", "WRITE_OFF_EXPENSE", "SUSPENSE", "OTHER")
 NORMAL_BALANCES = ("DEBIT", "CREDIT")
 JOURNAL_STATUSES = ("DRAFT", "POSTED", "REVERSED")
 
@@ -417,6 +420,7 @@ class AccountingAccount(db.Model):
     __table_args__ = (
         db.CheckConstraint("account_type in ('ASSET','LIABILITY','EQUITY','INCOME','EXPENSE')", name="ck_accounting_accounts_type"),
         db.CheckConstraint("normal_balance in ('DEBIT','CREDIT')", name="ck_accounting_accounts_normal_balance"),
+        db.CheckConstraint("account_subtype in ('CASH','BANK','LOAN_RECEIVABLE','INTEREST_RECEIVABLE','PENALTY_RECEIVABLE','OTHER_CURRENT_ASSET','FIXED_ASSET','ACCOUNTS_PAYABLE','BORROWING','CAPITAL','RETAINED_EARNINGS','INTEREST_INCOME','PENALTY_INCOME','FEE_INCOME','OPERATING_EXPENSE','WRITE_OFF_EXPENSE','SUSPENSE','OTHER')", name="ck_accounting_accounts_subtype"),
     )
 
     id = db.Column(db.Integer, primary_key=True)
@@ -427,6 +431,7 @@ class AccountingAccount(db.Model):
     parent_id = db.Column(db.Integer, db.ForeignKey("accounting_accounts.id"))
     description = db.Column(db.Text)
     cash_flow_category = db.Column(db.String(20), nullable=False, default="NONE")
+    account_subtype = db.Column(db.String(40), nullable=False, default="OTHER")
     is_system_account = db.Column(db.Boolean, nullable=False, default=False)
     is_active = db.Column(db.Boolean, nullable=False, default=True)
     allow_manual_posting = db.Column(db.Boolean, nullable=False, default=True)
@@ -458,7 +463,9 @@ class AccountingJournalEntry(db.Model):
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
     lines = relationship("AccountingJournalLine", back_populates="journal_entry", cascade="all, delete-orphan", order_by="AccountingJournalLine.line_no")
-    reversal_of = relationship("AccountingJournalEntry", remote_side=[id])
+    reversal_of = relationship("AccountingJournalEntry", remote_side=[id], backref="reversal_journals")
+    created_by = relationship("User", foreign_keys=[created_by_id])
+    posted_by = relationship("User", foreign_keys=[posted_by_id])
 
 
 class AccountingJournalLine(db.Model):
@@ -486,6 +493,9 @@ class AccountingJournalLine(db.Model):
 
     journal_entry = relationship("AccountingJournalEntry", back_populates="lines")
     account = relationship("AccountingAccount")
+    customer = relationship("Customer")
+    loan = relationship("Loan")
+    payment = relationship("Payment")
 
 
 class AccountingSetting(db.Model):
