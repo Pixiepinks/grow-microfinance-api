@@ -626,7 +626,18 @@ def test_admin_can_disburse_approved_application_into_active_loan(app, client):
         approved_amount=Decimal("9000"),
         tenure_months=6,
         approved_tenure=3,
-        interest_rate=Decimal("10"),
+        loan_days=63,
+        term_type="DAYS",
+        term_value=63,
+        repayment_frequency="WEEKLY",
+        number_of_installments=9,
+        installment_count=9,
+        installment_amount=Decimal("1300.00"),
+        total_repayment=Decimal("11700.00"),
+        total_interest=Decimal("2700.00"),
+        interest_rate=Decimal("30"),
+        interest_type="FLAT",
+        interest_rate_basis="FLAT_TERM",
         full_name="Disburse Customer",
         nic_number="123456789V",
         mobile_number="0700000000",
@@ -649,8 +660,10 @@ def test_admin_can_disburse_approved_application_into_active_loan(app, client):
     assert loan is not None
     assert loan.customer_id == customer.id
     assert loan.principal_amount == Decimal("9000.00")
-    assert loan.interest_rate == Decimal("10.00")
-    assert loan.total_days == 90
+    assert loan.interest_rate == Decimal("30.0000")
+    assert loan.total_days == 63
+    assert loan.installment_count == 9
+    assert loan.total_payable == Decimal("11700.00")
     assert loan.status == "ACTIVE"
 
     loans_response = client.get("/admin/loans", headers=_auth_headers(app, admin_user))
@@ -871,7 +884,18 @@ def test_disbursement_creates_ledger_automatically(app, client):
         approved_amount=Decimal("7000"),
         tenure_months=1,
         approved_tenure=1,
+        loan_days=30,
+        term_type="DAYS",
+        term_value=30,
+        repayment_frequency="WEEKLY",
+        number_of_installments=5,
+        installment_count=5,
+        installment_amount=Decimal("1442.00"),
+        total_repayment=Decimal("7210.00"),
+        total_interest=Decimal("210.00"),
         interest_rate=Decimal("3"),
+        interest_type="FLAT",
+        interest_rate_basis="FLAT_TERM",
         full_name="Auto Customer",
         nic_number="123456789V",
         mobile_number="0700000000",
@@ -889,6 +913,7 @@ def test_disbursement_creates_ledger_automatically(app, client):
     loan = Loan.query.get(response.get_json()["loan_id"])
     assert len(loan.ledger_entries) == 5
     assert [entry.period_days for entry in loan.ledger_entries] == [7, 7, 7, 7, 2]
+    assert [entry.due_date for entry in loan.ledger_entries] == [date(2026, 7, 18), date(2026, 7, 25), date(2026, 8, 1), date(2026, 8, 8), date(2026, 8, 10)]
 
 
 def _draft_application(customer: Customer, number: str = "APP-DOCS") -> LoanApplication:
@@ -1236,3 +1261,52 @@ def test_resolve_loan_term_days_weekly_stub_and_months():
     assert weekly.maturity_date == date(2026, 4, 1)
     assert weekly.installment_periods[-1].due_date == weekly.maturity_date
     assert weekly.installment_periods[-1].days_in_period <= 7
+
+
+def test_disbursement_rejects_missing_term_type_without_creating_loan_or_ledger(app, client):
+    admin_user = _create_user("admin", "Missing Term Admin", "missing-term@example.com")
+    customer = _customer_profile(_create_user("customer", "Missing Term Customer", "missing-term-customer@example.com"), code="CUST-MISS-TERM")
+    application = LoanApplication(application_number="APP-MISSING-TERM", customer_id=customer.id, loan_type="GROW_BUSINESS", status=STATUS_APPROVED, applied_amount=Decimal("15000"), approved_amount=Decimal("15000"), tenure_months=3, term_value=63, repayment_frequency="WEEKLY", interest_rate=Decimal("26"), interest_rate_basis="FLAT_TERM", full_name="Missing Term Customer", nic_number="123456789V", mobile_number="0700000000")
+    db.session.add(application); db.session.commit()
+
+    response = client.post(f"/loan-applications/{application.id}/disburse", headers=_auth_headers(app, admin_user), json={"disbursement_date": "2026-01-01"})
+
+    assert response.status_code == 422
+    assert response.get_json()["error"] == "Loan term information is incomplete"
+    assert "term_type" in response.get_json()["missing_fields"]
+    assert Loan.query.count() == 0
+
+
+def test_disbursement_rejects_missing_repayment_frequency(app, client):
+    admin_user = _create_user("admin", "Missing Frequency Admin", "missing-frequency@example.com")
+    customer = _customer_profile(_create_user("customer", "Missing Frequency Customer", "missing-frequency-customer@example.com"), code="CUST-MISS-FREQ")
+    application = LoanApplication(application_number="APP-MISSING-FREQ", customer_id=customer.id, loan_type="GROW_BUSINESS", status=STATUS_APPROVED, applied_amount=Decimal("15000"), approved_amount=Decimal("15000"), tenure_months=3, term_type="DAYS", term_value=63, interest_rate=Decimal("26"), interest_rate_basis="FLAT_TERM", full_name="Missing Frequency Customer", nic_number="123456789V", mobile_number="0700000000")
+    db.session.add(application); db.session.commit()
+
+    response = client.post(f"/loan-applications/{application.id}/disburse", headers=_auth_headers(app, admin_user), json={"disbursement_date": "2026-01-01"})
+
+    assert response.status_code == 422
+    assert "repayment_frequency" in response.get_json()["missing_fields"]
+
+
+def test_safe_repair_replaces_unpaid_defective_one_row_loan(app, client):
+    from app.loan_repair import repair_unpaid_defective_loan
+    from app.models import AccountingAuditLog
+
+    admin_user = _create_user("admin", "Repair Admin", "repair-admin@example.com")
+    customer = _customer_profile(_create_user("customer", "Repair Customer", "repair-customer@example.com"), code="CUST-REPAIR")
+    application = LoanApplication(application_number="APP-REPAIR", customer_id=customer.id, loan_type="GROW_BUSINESS", status="DISBURSED", applied_amount=Decimal("15000"), approved_amount=Decimal("15000"), tenure_months=3, loan_days=63, term_type="DAYS", term_value=63, repayment_frequency="WEEKLY", number_of_installments=9, installment_count=9, installment_amount=Decimal("2100.00"), total_repayment=Decimal("18900.00"), total_interest=Decimal("3900.00"), interest_rate=Decimal("26"), interest_type="FLAT", interest_rate_basis="FLAT_TERM", full_name="Repair Customer", nic_number="123456789V", mobile_number="0700000000")
+    loan = Loan(loan_number="LN-DEFECTIVE", customer_id=customer.id, principal_amount=Decimal("15000.00"), interest_rate=Decimal("0.8667"), total_days=1, payment_interval_days=7, daily_installment=Decimal("15130.00"), total_payable=Decimal("15130.00"), start_date=date(2026, 1, 1), end_date=date(2026, 1, 1), status="ACTIVE", created_by_id=admin_user.id)
+    db.session.add_all([application, loan]); db.session.flush()
+    from app.models import LoanLedger
+    db.session.add(LoanLedger(loan_id=loan.id, installment_no=1, period_start_date=date(2026, 1, 1), due_date=date(2026, 1, 1), period_days=1, opening_balance=Decimal("15000.00"), principal_amount=Decimal("15000.00"), interest_amount=Decimal("130.00"), installment_amount=Decimal("15130.00"), closing_balance=Decimal("0.00"), paid_amount=Decimal("0.00"), status="PENDING"))
+    db.session.commit()
+
+    summary = repair_unpaid_defective_loan(loan.id, user_id=admin_user.id, apply_changes=True)
+
+    db.session.refresh(loan)
+    assert summary["installment_count"] == 9
+    assert len(loan.ledger_entries) == 9
+    assert loan.total_payable == Decimal("18900.00")
+    assert sum((entry.interest_amount for entry in loan.ledger_entries), Decimal("0")) == Decimal("3900.00")
+    assert AccountingAuditLog.query.filter_by(action="LOAN_TERM_LEDGER_REPAIR", entity_id=str(loan.id)).count() == 1

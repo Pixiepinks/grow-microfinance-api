@@ -105,8 +105,13 @@ def _application_terms(application):
     return {k: getattr(application, k, None) for k in ["approved_amount", "term_type", "term_value", "loan_days", "tenure_months", "repayment_frequency", "number_of_installments", "installment_amount", "total_repayment", "total_interest", "interest_rate", "interest_type", "interest_rate_basis"]}
 
 
+def _missing_disbursement_term_fields(application):
+    required = ["approved_amount", "term_type", "term_value", "repayment_frequency", "interest_rate", "interest_rate_basis"]
+    return [field for field in required if getattr(application, field, None) is None]
+
+
 def _terms_complete(application):
-    return all(getattr(application, f, None) is not None for f in ["approved_amount", "term_type", "term_value", "repayment_frequency", "number_of_installments", "installment_amount", "total_repayment", "total_interest", "interest_rate", "interest_rate_basis"])
+    return not _missing_disbursement_term_fields(application)
 
 STATUS_TRANSITIONS = {
     "staff": {
@@ -1050,44 +1055,41 @@ def disburse_application(application_id):
             return jsonify({"message": str(exc)}), 400
 
     disbursement_date = date.fromisoformat(data.get("disbursement_date")) if data.get("disbursement_date") else date.today()
-    use_flexible_terms = _terms_complete(application)
-    if use_flexible_terms:
-        terms, errors = _validate_and_calculate_terms(_application_terms(application), start_date=disbursement_date)
-        if errors:
-            return jsonify({"message": "Approved commercial terms are incomplete or invalid", "errors": errors}), 400
-        principal = terms["approved_amount"]
-        resolved = resolve_loan_term(disbursement_date, terms["term_type"], terms["term_value"], terms["repayment_frequency"])
-        loan_days = resolved.total_days if terms["term_type"] == "DAYS" else None
-        start_date = disbursement_date
-        maturity_date = resolved.maturity_date
-        end_date = maturity_date
-        total_payable = terms["total_repayment"]
-        daily_installment = money(total_payable / Decimal(resolved.total_days))
-        loan_kwargs = {
-            "term_type": terms["term_type"], "term_value": terms["term_value"],
-            "loan_days": loan_days, "tenure_months": terms["term_value"] if terms["term_type"] == "MONTHS" else None,
-            "repayment_frequency": terms["repayment_frequency"],
-            "number_of_installments": resolved.installment_count, "installment_count": resolved.installment_count,
-            "installment_amount": terms["installment_amount"],
-            "total_repayment": terms["total_repayment"], "total_interest": terms["total_interest"],
-            "interest_type": terms["interest_type"], "interest_rate_basis": terms["interest_rate_basis"],
-            "maturity_date": maturity_date,
-        }
-        interest_rate = terms["interest_rate"]
-        payment_interval_days = {"DAILY": 1, "WEEKLY": 7, "MONTHLY": 30}[terms["repayment_frequency"]]
-        total_days = resolved.total_days
-    else:
-        principal = application.approved_amount or application.applied_amount
-        tenure_months = application.approved_tenure or application.tenure_months
-        interest_rate = application.interest_rate or Decimal("0")
-        total_days = max(int(tenure_months or 0) * 30, 1)
-        payment_interval_days = int(data.get("payment_interval_days", 7) or 7)
-        start_date = disbursement_date
-        end_date = start_date + timedelta(days=total_days - 1)
-        maturity_date = end_date
-        total_payable = money(Decimal(principal) + (Decimal(principal) * (Decimal(interest_rate) / Decimal("100"))))
-        daily_installment = money(total_payable / Decimal(total_days))
-        loan_kwargs = {"maturity_date": maturity_date}
+    missing_fields = _missing_disbursement_term_fields(application)
+    if missing_fields:
+        return jsonify({"error": "Loan term information is incomplete", "missing_fields": missing_fields}), 422
+
+    terms, errors = _validate_and_calculate_terms(_application_terms(application), start_date=disbursement_date)
+    if errors:
+        return jsonify({"error": "Loan term information is incomplete", "missing_fields": missing_fields, "errors": errors}), 422
+
+    principal = terms["approved_amount"]
+    resolved = resolve_loan_term(disbursement_date, terms["term_type"], terms["term_value"], terms["repayment_frequency"])
+    loan_days = resolved.total_days if terms["term_type"] == "DAYS" else None
+    start_date = disbursement_date
+    maturity_date = resolved.maturity_date
+    end_date = maturity_date
+    total_payable = terms["total_repayment"]
+    daily_installment = money(total_payable / Decimal(resolved.total_days))
+    interest_rate = terms["interest_rate"]
+    payment_interval_days = {"DAILY": 1, "WEEKLY": 7, "MONTHLY": 30}[terms["repayment_frequency"]]
+    total_days = resolved.total_days
+    loan_kwargs = {
+        "term_type": terms["term_type"],
+        "term_value": terms["term_value"],
+        "loan_days": loan_days,
+        "tenure_months": application.tenure_months if terms["term_type"] == "MONTHS" else None,
+        "repayment_frequency": terms["repayment_frequency"],
+        "number_of_installments": terms["installment_count"],
+        "installment_count": terms["installment_count"],
+        "installment_amount": terms["installment_amount"],
+        "total_interest": terms["total_interest"],
+        "total_repayment": terms["total_repayment"],
+        "interest_type": terms["interest_type"],
+        "interest_rate_basis": terms["interest_rate_basis"],
+        "maturity_date": maturity_date,
+        "final_installment_due_date": maturity_date,
+    }
 
     loan = Loan(loan_number=generate_loan_number(), customer_id=application.customer_id, principal_amount=principal, interest_rate=interest_rate, total_days=total_days, payment_interval_days=payment_interval_days, daily_installment=daily_installment, total_payable=total_payable, start_date=start_date, end_date=end_date, status="ACTIVE", created_by_id=int(get_jwt_identity()), **loan_kwargs)
 

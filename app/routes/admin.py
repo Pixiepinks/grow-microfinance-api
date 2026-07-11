@@ -270,6 +270,7 @@ def _loan_to_dict(loan: Loan) -> dict:
         "loan_days": loan.loan_days,
         "tenure_months": loan.tenure_months,
         "repayment_frequency": loan.repayment_frequency,
+        "term_display": (f"{loan.term_value} days" if loan.term_type == "DAYS" and loan.term_value is not None else (f"{loan.term_value} months" if loan.term_type == "MONTHS" and loan.term_value is not None else None)),
         "number_of_installments": loan.number_of_installments,
         "installment_count": loan.installment_count,
         "installment_amount": (
@@ -280,6 +281,7 @@ def _loan_to_dict(loan: Loan) -> dict:
         "total_repayment": (
             float(loan.total_repayment) if loan.total_repayment is not None else None
         ),
+        "total_payable": float(loan.total_payable) if loan.total_payable is not None else None,
         "total_interest": (
             float(loan.total_interest) if loan.total_interest is not None else None
         ),
