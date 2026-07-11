@@ -168,6 +168,19 @@ def create_app():
         print(summary)
 
 
+
+    @accounting_cli.command("repair-defective-loan")
+    @click.argument("loan_id", type=int)
+    @click.option("--apply", "apply_changes", is_flag=True, default=False, help="Persist repair. Dry-run is the default.")
+    def accounting_repair_defective_loan(loan_id, apply_changes):
+        from .loan_repair import repair_unpaid_defective_loan, LoanRepairError
+        try:
+            summary = repair_unpaid_defective_loan(loan_id, apply_changes=apply_changes)
+        except LoanRepairError as exc:
+            db.session.rollback()
+            raise click.ClickException(str(exc))
+        click.echo(summary)
+
     @accounting_cli.command("backfill-disbursements")
     @click.option("--apply", "apply_changes", is_flag=True, default=False, help="Persist journals. Dry-run is the default.")
     @click.option("--loan-id", type=int, default=None, help="Backfill one loan disbursement.")
