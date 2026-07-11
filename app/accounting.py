@@ -187,7 +187,7 @@ def reverse_journal(entry, journal_date, reason, user_id=None):
     reversal = create_draft_journal(journal_date, f"Reversal: {reason}", [{"account_id": l.account_id, "debit": l.credit, "credit": l.debit, "customer_id": l.customer_id, "loan_id": l.loan_id, "payment_id": l.payment_id, "collection_id": l.collection_id, "description": l.description} for l in entry.lines], "REVERSAL", entry.id, "ACCOUNTING", user_id, f"REVERSAL:{entry.id}")
     reversal.reversal_of_id = entry.id; post_journal(reversal, user_id); entry.status = "REVERSED"; log_audit("JOURNAL_REVERSE", "AccountingJournalEntry", entry.id, user_id, reason); return reversal
 
-def validate_funding_account(account):
+def validate_funding_account(account, *_args):
     if not account:
         raise AccountingError("Funding account not found")
     if not account.is_active:
@@ -227,13 +227,13 @@ def allocate_payment(loan, amount, paid_date):
     if remaining > 0: principal += remaining
     return money(principal), money(interest), money(penalty), Decimal("0.00")
 
-def post_loan_payment(payment, user_id=None):
+def post_loan_payment(payment, user_id=None, receipt_account=None):
     if AccountingJournalEntry.query.filter_by(idempotency_key=f"LOAN_PAYMENT:{payment.id}").first():
         return AccountingJournalEntry.query.filter_by(idempotency_key=f"LOAN_PAYMENT:{payment.id}").first()
     total = money(payment.amount_collected); principal=money(payment.principal_paid); interest=money(payment.interest_paid); penalty=money(payment.penalty_paid); other=money(payment.other_fee_paid)
     if money(principal+interest+penalty+other) != total: raise AccountingError("Payment allocation does not match amount collected")
     loan = payment.loan
-    lines=[{"account_id": resolve_system_account("CASH_ACCOUNT" if str(payment.payment_method).lower()=="cash" else "BANK_ACCOUNT").id, "debit": total, "customer_id": loan.customer_id, "loan_id": loan.id, "payment_id": payment.id}]
+    lines=[{"account_id": (receipt_account or resolve_system_account("CASH_ACCOUNT" if str(payment.payment_method).lower()=="cash" else "BANK_ACCOUNT")).id, "debit": total, "customer_id": loan.customer_id, "loan_id": loan.id, "payment_id": payment.id}]
     for key, amt in [("LOAN_RECEIVABLE_ACCOUNT", principal), ("INTEREST_INCOME_ACCOUNT", interest), ("PENALTY_INCOME_ACCOUNT", penalty), ("OTHER_FEE_INCOME_ACCOUNT", other)]:
         if amt > 0: lines.append({"account_id": resolve_system_account(key).id, "credit": amt, "customer_id": loan.customer_id, "loan_id": loan.id, "payment_id": payment.id})
     return post_journal(create_draft_journal(payment.collection_date, "Loan payment", lines, "LOAN_PAYMENT", payment.id, "PAYMENTS", user_id, f"LOAN_PAYMENT:{payment.id}"), user_id)

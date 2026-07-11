@@ -1,7 +1,7 @@
 import os
 import re
 from datetime import date, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Dict, List, Optional
 
 from flask import Blueprint, current_app, jsonify, request
@@ -17,7 +17,7 @@ from app.supabase_client import (
 from ..currency import CURRENCY_CODE, format_currency
 from ..extensions import db
 from ..models import Customer, Loan, LoanApplication, LoanApplicationDocument
-from ..loan_ledger import generate_loan_ledger
+from ..loan_ledger import generate_loan_ledger, money
 from ..accounting import AccountingError, post_loan_disbursement, validate_funding_account
 from ..models import AccountingAccount
 from .utils import role_required
@@ -39,6 +39,56 @@ STATUS_STAFF_APPROVED = "STAFF_APPROVED"
 STATUS_APPROVED = "APPROVED"
 STATUS_REJECTED = "REJECTED"
 STATUS_DISBURSED = "DISBURSED"
+
+
+SUPPORTED_REPAYMENT_FREQUENCIES = {"DAILY", "WEEKLY", "MONTHLY"}
+SUPPORTED_INTEREST_TYPES = {"FLAT"}
+RATE_QUANT = Decimal("0.0001")
+
+
+def _decimal_to_float(value):
+    return float(value) if value is not None else None
+
+
+def _validate_and_calculate_terms(data: dict, *, allow_legacy: bool = False):
+    errors = []
+    approved_amount = parse_decimal(data.get("approved_amount"))
+    loan_days = parse_int(data.get("loan_days"))
+    repayment_frequency = (data.get("repayment_frequency") or "").upper()
+    number_of_installments = parse_int(data.get("number_of_installments"))
+    installment_amount = parse_decimal(data.get("installment_amount"))
+    interest_type = (data.get("interest_type") or "FLAT").upper()
+
+    if approved_amount is None: errors.append("approved_amount is required")
+    elif approved_amount <= 0: errors.append("approved_amount must be greater than zero")
+    if loan_days is None: errors.append("loan_days is required")
+    elif loan_days <= 0: errors.append("loan_days must be greater than zero")
+    if not repayment_frequency: errors.append("repayment_frequency is required")
+    elif repayment_frequency not in SUPPORTED_REPAYMENT_FREQUENCIES: errors.append("repayment_frequency is unsupported")
+    if number_of_installments is None: errors.append("number_of_installments is required")
+    elif number_of_installments <= 0: errors.append("number_of_installments must be greater than zero")
+    if installment_amount is None: errors.append("installment_amount is required")
+    elif installment_amount <= 0: errors.append("installment_amount must be greater than zero")
+    if interest_type not in SUPPORTED_INTEREST_TYPES: errors.append("interest_type is unsupported")
+    if errors:
+        return None, errors
+
+    approved_amount = money(approved_amount)
+    installment_amount = money(installment_amount)
+    total_repayment = money(installment_amount * Decimal(number_of_installments))
+    total_interest = money(total_repayment - approved_amount)
+    if total_repayment < approved_amount:
+        return None, ["total_repayment cannot be below approved_amount"]
+    interest_rate = (total_interest / approved_amount * Decimal("100")).quantize(RATE_QUANT, rounding=ROUND_HALF_UP)
+    return {"approved_amount": approved_amount, "loan_days": loan_days, "repayment_frequency": repayment_frequency, "number_of_installments": number_of_installments, "installment_amount": installment_amount, "total_repayment": total_repayment, "total_interest": total_interest, "interest_rate": interest_rate, "interest_type": interest_type}, []
+
+
+def _application_terms(application):
+    return {k: getattr(application, k, None) for k in ["approved_amount", "loan_days", "repayment_frequency", "number_of_installments", "installment_amount", "total_repayment", "total_interest", "interest_rate", "interest_type"]}
+
+
+def _terms_complete(application):
+    return all(getattr(application, f, None) is not None for f in ["approved_amount", "loan_days", "repayment_frequency", "number_of_installments", "installment_amount", "total_repayment", "total_interest", "interest_rate", "interest_type"])
 
 STATUS_TRANSITIONS = {
     "staff": {
@@ -329,6 +379,13 @@ def build_application_response(application: LoanApplication) -> dict:
             else None
         ),
         "approved_tenure": application.approved_tenure,
+        "loan_days": application.loan_days,
+        "repayment_frequency": application.repayment_frequency,
+        "number_of_installments": application.number_of_installments,
+        "installment_amount": _decimal_to_float(application.installment_amount),
+        "total_repayment": _decimal_to_float(application.total_repayment),
+        "total_interest": _decimal_to_float(application.total_interest),
+        "interest_type": application.interest_type,
         "review_notes": application.review_notes,
         "reject_reason": application.reject_reason,
         "submitted_at": (
@@ -901,59 +958,45 @@ def get_application(application_id):
 def approve_application(application_id):
     application = LoanApplication.query.get_or_404(application_id)
     data = request.get_json() or {}
-
     claims = get_jwt()
     role = claims.get("role")
     target_status = STATUS_APPROVED if role == "admin" else STATUS_STAFF_APPROVED
-    approved_amount = data.get(
-        "approved_amount", application.approved_amount or application.applied_amount
-    )
-    approved_tenure = data.get(
-        "approved_tenure", application.approved_tenure or application.tenure_months
-    )
-
-    approved_amount = parse_decimal(approved_amount)
-    approved_tenure = parse_int(approved_tenure)
-    if approved_amount is None or approved_tenure is None:
-        return (
-            jsonify({"message": "approved_amount and approved_tenure must be valid"}),
-            400,
-        )
 
     transition_error = apply_status_transition(application, target_status)
     if transition_error:
         return transition_error
-    if approved_amount is not None:
-        application.approved_amount = approved_amount
-    if approved_tenure is not None:
-        application.approved_tenure = approved_tenure
-    application.review_notes = data.get("review_notes")
 
     if target_status == STATUS_APPROVED:
+        legacy_payload = not any(k in data for k in ["loan_days", "repayment_frequency", "number_of_installments", "installment_amount", "interest_type"])
+        if legacy_payload:
+            approved_amount = parse_decimal(data.get("approved_amount", application.approved_amount or application.applied_amount))
+            approved_tenure = parse_int(data.get("approved_tenure", application.approved_tenure or application.tenure_months))
+            if approved_amount is None or approved_tenure is None:
+                return jsonify({"message": "approved_amount and approved_tenure must be valid"}), 400
+            application.approved_amount = money(approved_amount)
+            application.approved_tenure = approved_tenure
+        else:
+            terms, errors = _validate_and_calculate_terms(data)
+            if errors:
+                return jsonify({"message": "Validation failed", "errors": errors}), 400
+            for field, value in terms.items():
+                setattr(application, field if field != "interest_rate" else "interest_rate", value)
+            application.approved_tenure = parse_int(data.get("approved_tenure"), application.approved_tenure or application.tenure_months)
+    else:
+        approved_amount = parse_decimal(data.get("approved_amount", application.approved_amount or application.applied_amount))
+        approved_tenure = parse_int(data.get("approved_tenure", application.approved_tenure or application.tenure_months))
+        if approved_amount is None or approved_tenure is None:
+            return jsonify({"message": "approved_amount and approved_tenure must be valid"}), 400
+        application.approved_amount = money(approved_amount)
+        application.approved_tenure = approved_tenure
+
+    application.review_notes = data.get("review_notes")
+    if target_status == STATUS_APPROVED:
         application.approved_at = datetime.utcnow()
-        if hasattr(application, "approved_by"):
-            application.approved_by = int(get_jwt_identity())
-        if hasattr(application, "approved_by_id"):
-            application.approved_by_id = int(get_jwt_identity())
-    elif target_status == STATUS_STAFF_APPROVED:
+    else:
         application.assigned_officer_id = int(get_jwt_identity())
-
-    try:
-        db.session.commit()
-        current_app.logger.info(
-            "Application %s approved to %s by user_id=%s",
-            application.id,
-            target_status,
-            get_jwt_identity(),
-        )
-        return jsonify(build_application_response(application))
-    except Exception as exc:  # pragma: no cover - defensive logging
-        db.session.rollback()
-        current_app.logger.exception(
-            "Failed to approve application %s: %s", application.id, exc
-        )
-        return jsonify({"message": "Failed to approve application"}), 500
-
+    db.session.commit()
+    return jsonify(build_application_response(application))
 
 def generate_loan_number() -> str:
     today = date.today()
@@ -971,103 +1014,65 @@ def generate_loan_number() -> str:
 def disburse_application(application_id):
     application = LoanApplication.query.get_or_404(application_id)
     if application.status != STATUS_APPROVED:
-        return (
-            jsonify(
-                {
-                    "message": "Only APPROVED applications can be disbursed",
-                    "status": application.status,
-                }
-            ),
-            400,
-        )
+        return jsonify({"message": "Only APPROVED applications can be disbursed", "status": application.status}), 400
 
     data = request.get_json(silent=True) or {}
     funding_account = None
     if data.get("funding_account_id") is not None:
         try:
-            funding_account = validate_funding_account(
-                AccountingAccount.query.get(int(data["funding_account_id"]))
-            )
+            funding_account = validate_funding_account(AccountingAccount.query.get(int(data["funding_account_id"])))
         except (TypeError, ValueError):
             return jsonify({"message": "funding_account_id must be a valid account id"}), 400
         except AccountingError as exc:
             return jsonify({"message": str(exc)}), 400
-    else:
-        current_app.logger.warning(
-            "Legacy disbursement request for application %s did not include funding_account_id; using DEFAULT_DISBURSEMENT_ACCOUNT",
-            application.id,
-        )
 
-    principal = application.approved_amount or application.applied_amount
-    tenure_months = application.approved_tenure or application.tenure_months
-    interest_rate = application.interest_rate or Decimal("0")
-    total_days = max(int(tenure_months or 0) * 30, 1)
-    payment_interval_days = int(data.get("payment_interval_days", 7) or 7)
     disbursement_date = date.fromisoformat(data.get("disbursement_date")) if data.get("disbursement_date") else date.today()
-    start_date = disbursement_date
-    end_date = start_date + timedelta(days=total_days - 1)
-    total_payable = Decimal(principal) + (
-        Decimal(principal) * (Decimal(interest_rate) / Decimal("100"))
-    )
+    use_flexible_terms = _terms_complete(application)
+    if use_flexible_terms:
+        terms, errors = _validate_and_calculate_terms(_application_terms(application))
+        if errors:
+            return jsonify({"message": "Approved commercial terms are incomplete or invalid", "errors": errors}), 400
+        principal = terms["approved_amount"]
+        loan_days = terms["loan_days"]
+        start_date = disbursement_date
+        maturity_date = start_date + timedelta(days=loan_days)
+        end_date = maturity_date
+        total_payable = terms["total_repayment"]
+        daily_installment = money(total_payable / Decimal(loan_days))
+        loan_kwargs = {
+            "loan_days": loan_days, "repayment_frequency": terms["repayment_frequency"],
+            "number_of_installments": terms["number_of_installments"], "installment_amount": terms["installment_amount"],
+            "total_repayment": terms["total_repayment"], "total_interest": terms["total_interest"],
+            "interest_type": terms["interest_type"], "maturity_date": maturity_date,
+        }
+        interest_rate = terms["interest_rate"]
+        payment_interval_days = {"DAILY": 1, "WEEKLY": 7, "MONTHLY": 30}[terms["repayment_frequency"]]
+        total_days = loan_days
+    else:
+        principal = application.approved_amount or application.applied_amount
+        tenure_months = application.approved_tenure or application.tenure_months
+        interest_rate = application.interest_rate or Decimal("0")
+        total_days = max(int(tenure_months or 0) * 30, 1)
+        payment_interval_days = int(data.get("payment_interval_days", 7) or 7)
+        start_date = disbursement_date
+        end_date = start_date + timedelta(days=total_days - 1)
+        maturity_date = end_date
+        total_payable = money(Decimal(principal) + (Decimal(principal) * (Decimal(interest_rate) / Decimal("100"))))
+        daily_installment = money(total_payable / Decimal(total_days))
+        loan_kwargs = {"maturity_date": maturity_date}
 
-    loan = Loan(
-        loan_number=generate_loan_number(),
-        customer_id=application.customer_id,
-        principal_amount=principal,
-        interest_rate=interest_rate,
-        total_days=total_days,
-        payment_interval_days=payment_interval_days,
-        daily_installment=total_payable / Decimal(total_days),
-        total_payable=total_payable,
-        start_date=start_date,
-        end_date=end_date,
-        status="ACTIVE",
-        created_by_id=int(get_jwt_identity()),
-    )
+    loan = Loan(loan_number=generate_loan_number(), customer_id=application.customer_id, principal_amount=principal, interest_rate=interest_rate, total_days=total_days, payment_interval_days=payment_interval_days, daily_installment=daily_installment, total_payable=total_payable, start_date=start_date, end_date=end_date, status="ACTIVE", created_by_id=int(get_jwt_identity()), **loan_kwargs)
 
     try:
-        db.session.add(loan)
-        db.session.flush()
-        generate_loan_ledger(loan)
+        db.session.add(loan); db.session.flush(); generate_loan_ledger(loan)
         application.status = STATUS_DISBURSED
-        if hasattr(application, "disbursed_at"):
-            application.disbursed_at = datetime.utcnow()
-        post_loan_disbursement(
-            loan,
-            int(get_jwt_identity()),
-            funding_account=funding_account,
-            disbursement_date=disbursement_date,
-        )
+        post_loan_disbursement(loan, int(get_jwt_identity()), funding_account=funding_account, disbursement_date=disbursement_date)
         db.session.commit()
-        current_app.logger.info(
-            "Application %s disbursed into loan %s by user_id=%s",
-            application.id,
-            loan.id,
-            get_jwt_identity(),
-        )
-        return (
-            jsonify(
-                {
-                    "message": "Loan disbursed",
-                    "loan_id": loan.id,
-                    "loan_number": loan.loan_number,
-                    "application": build_application_response(application),
-                }
-            ),
-            201,
-        )
+        return jsonify({"message": "Loan disbursed", "loan_id": loan.id, "loan_number": loan.loan_number, "loan": {"principal_amount": float(loan.principal_amount), "loan_days": loan.loan_days, "repayment_frequency": loan.repayment_frequency, "number_of_installments": loan.number_of_installments, "installment_amount": _decimal_to_float(loan.installment_amount), "total_repayment": _decimal_to_float(loan.total_repayment), "total_interest": _decimal_to_float(loan.total_interest), "interest_rate": float(loan.interest_rate), "interest_type": loan.interest_type, "start_date": loan.start_date.isoformat(), "maturity_date": loan.maturity_date.isoformat() if loan.maturity_date else None, "final_installment_due_date": loan.final_installment_due_date.isoformat() if loan.final_installment_due_date else None}, "application": build_application_response(application)}), 201
     except AccountingError as exc:
-        db.session.rollback()
-        current_app.logger.exception(
-            "Accounting posting failed while disbursing application %s", application.id
-        )
-        return jsonify({"message": "Accounting posting failed", "error": str(exc)}), 400
-    except Exception as exc:  # pragma: no cover - defensive logging
-        db.session.rollback()
-        current_app.logger.exception(
-            "Failed to disburse application %s: %s", application.id, exc
-        )
-        return jsonify({"message": "Failed to disburse loan"}), 500
+        db.session.rollback(); return jsonify({"message": "Accounting posting failed", "error": str(exc)}), 400
+    except Exception as exc:
+        db.session.rollback(); current_app.logger.exception("Failed to disburse application %s: %s", application.id, exc); return jsonify({"message": "Failed to disburse loan"}), 500
 
 
 @loan_app_bp.route("/<int:application_id>/reject", methods=["POST"])
