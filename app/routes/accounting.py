@@ -21,6 +21,12 @@ from ..accounting import (
     account_subtype,
     validate_funding_account,
     resolve_system_account,
+    trial_balance_report,
+    income_statement_report,
+    statement_of_financial_position_report,
+    reports_summary,
+    report_csv,
+    seed_default_report_classifications,
 )
 from .utils import role_required
 
@@ -36,7 +42,7 @@ def _error(exc):
 
 @accounting_bp.before_request
 def _ensure_seeded():
-    seed_default_accounts()
+    seed_default_report_classifications()
     db.session.flush()
 
 @accounting_bp.route("/accounts", methods=["GET"])
@@ -48,7 +54,7 @@ def list_accounts():
     if request.args.get("parent_id"): q=q.filter_by(parent_id=request.args.get("parent_id"))
     if request.args.get("search"):
         s=f"%{request.args['search']}%"; q=q.filter((AccountingAccount.account_code.ilike(s)) | (AccountingAccount.account_name.ilike(s)))
-    return jsonify([{"id":a.id,"account_code":a.account_code,"account_name":a.account_name,"account_type":a.account_type,"normal_balance":a.normal_balance,"parent_id":a.parent_id,"description":a.description,"is_system_account":a.is_system_account,"is_active":a.is_active,"allow_manual_posting":a.allow_manual_posting,"cash_flow_category":a.cash_flow_category,"account_subtype":account_subtype(a)} for a in q.order_by(AccountingAccount.account_code).all()])
+    return jsonify([{"id":a.id,"account_code":a.account_code,"account_name":a.account_name,"account_type":a.account_type,"normal_balance":a.normal_balance,"parent_id":a.parent_id,"description":a.description,"is_system_account":a.is_system_account,"is_active":a.is_active,"allow_manual_posting":a.allow_manual_posting,"cash_flow_category":a.cash_flow_category,"account_subtype":account_subtype(a),"financial_statement_group":a.financial_statement_group,"financial_statement_order":a.financial_statement_order,"cash_flow_group":a.cash_flow_group} for a in q.order_by(AccountingAccount.account_code).all()])
 
 @accounting_bp.route("/accounts", methods=["POST"])
 @role_required(["admin"])
@@ -177,6 +183,78 @@ def _ledger_data():
         loan_id=_arg("loan_id"),
         query_params=request.args.to_dict(flat=True),
     )
+
+
+
+def _bool_arg(name, default=False):
+    value = request.args.get(name)
+    if value is None:
+        return default
+    return str(value).lower() in ("1", "true", "yes", "on")
+
+def _generated_by():
+    user_id = _uid()
+    return str(user_id) if user_id else "system"
+
+@accounting_bp.route("/reports/trial-balance", methods=["GET"])
+@role_required(["admin"])
+def trial_balance():
+    try:
+        return jsonify(trial_balance_report(as_of_date=_arg_date("as_of_date") or date.today(), date_from=_arg_date("date_from"), include_zero_balances=_bool_arg("include_zero_balances"), account_type=_arg("account_type"), account_id=_arg("account_id"), comparative_as_of_date=_arg_date("comparative_as_of_date")))
+    except Exception as exc: return _error(exc)
+
+@accounting_bp.route("/reports/income-statement", methods=["GET"])
+@role_required(["admin"])
+def income_statement():
+    if not _arg("date_from") or not _arg("date_to"):
+        return jsonify({"message":"date_from and date_to are required"}), 400
+    try:
+        return jsonify(income_statement_report(_arg_date("date_from"), _arg_date("date_to"), _arg_date("comparative_date_from"), _arg_date("comparative_date_to"), _bool_arg("include_zero_balances")))
+    except Exception as exc: return _error(exc)
+
+@accounting_bp.route("/reports/statement-of-financial-position", methods=["GET"])
+@accounting_bp.route("/reports/balance-sheet", methods=["GET"])
+@role_required(["admin"])
+def statement_of_financial_position():
+    try:
+        return jsonify(statement_of_financial_position_report(_arg_date("as_of_date") or date.today(), _arg_date("comparative_as_of_date"), _bool_arg("include_zero_balances")))
+    except Exception as exc: return _error(exc)
+
+@accounting_bp.route("/reports/account-drilldown", methods=["GET"])
+@role_required(["admin"])
+def account_drilldown():
+    if not _arg("account_id") or not _arg("date_to"):
+        return jsonify({"message":"account_id and date_to are required"}), 400
+    try:
+        return jsonify(general_ledger(account_id=_arg("account_id"), date_from=_arg_date("date_from"), date_to=_arg_date("date_to"), customer_id=_arg("customer_id"), loan_id=_arg("loan_id"), query_params=request.args.to_dict(flat=True)))
+    except Exception as exc: return _error(exc)
+
+@accounting_bp.route("/reports/summary", methods=["GET"])
+@role_required(["admin"])
+def financial_reports_summary():
+    try:
+        return jsonify(reports_summary(_arg_date("date_from"), _arg_date("date_to"), _arg_date("as_of_date")))
+    except Exception as exc: return _error(exc)
+
+@accounting_bp.route("/reports/trial-balance/export.csv", methods=["GET"])
+@role_required(["admin"])
+def trial_balance_csv():
+    data=trial_balance_report(as_of_date=_arg_date("as_of_date") or date.today(), date_from=_arg_date("date_from"), include_zero_balances=_bool_arg("include_zero_balances"), account_type=_arg("account_type"), account_id=_arg("account_id"), comparative_as_of_date=_arg_date("comparative_as_of_date"))
+    return Response(report_csv(data, _generated_by()), mimetype="text/csv", headers={"Content-Disposition":"attachment; filename=trial-balance.csv"})
+
+@accounting_bp.route("/reports/income-statement/export.csv", methods=["GET"])
+@role_required(["admin"])
+def income_statement_csv():
+    if not _arg("date_from") or not _arg("date_to"):
+        return jsonify({"message":"date_from and date_to are required"}), 400
+    data=income_statement_report(_arg_date("date_from"), _arg_date("date_to"), _arg_date("comparative_date_from"), _arg_date("comparative_date_to"), _bool_arg("include_zero_balances"))
+    return Response(report_csv(data, _generated_by()), mimetype="text/csv", headers={"Content-Disposition":"attachment; filename=income-statement.csv"})
+
+@accounting_bp.route("/reports/statement-of-financial-position/export.csv", methods=["GET"])
+@role_required(["admin"])
+def statement_of_financial_position_csv():
+    data=statement_of_financial_position_report(_arg_date("as_of_date") or date.today(), _arg_date("comparative_as_of_date"), _bool_arg("include_zero_balances"))
+    return Response(report_csv(data, _generated_by()), mimetype="text/csv", headers={"Content-Disposition":"attachment; filename=statement-of-financial-position.csv"})
 
 @accounting_bp.route("/general-ledger", methods=["GET"])
 @role_required(["admin"])

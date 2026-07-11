@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import csv
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from io import StringIO
 
@@ -438,7 +438,7 @@ def create_account(data, user_id=None):
     typ = data.get("account_type"); normal = data.get("normal_balance"); subtype = data.get("account_subtype", "OTHER")
     if typ not in ACCOUNT_TYPES or normal not in NORMAL_BALANCES or subtype not in ACCOUNT_SUBTYPES:
         raise AccountingError("Invalid account type, normal balance, or subtype")
-    acct = AccountingAccount(account_code=data["account_code"], account_name=data["account_name"], account_type=typ, normal_balance=normal, parent_id=data.get("parent_id"), description=data.get("description"), is_active=data.get("is_active", True), allow_manual_posting=data.get("allow_manual_posting", True), cash_flow_category=data.get("cash_flow_category", subtype if subtype in ("CASH", "BANK") else "NONE"), account_subtype=subtype)
+    acct = AccountingAccount(account_code=data["account_code"], account_name=data["account_name"], account_type=typ, normal_balance=normal, parent_id=data.get("parent_id"), description=data.get("description"), is_active=data.get("is_active", True), allow_manual_posting=data.get("allow_manual_posting", True), cash_flow_category=data.get("cash_flow_category", subtype if subtype in ("CASH", "BANK") else "NONE"), account_subtype=subtype, financial_statement_group=data.get("financial_statement_group"), financial_statement_order=data.get("financial_statement_order"), cash_flow_group=data.get("cash_flow_group"))
     db.session.add(acct); db.session.flush(); log_audit("ACCOUNT_CREATE", "AccountingAccount", acct.id, user_id); return acct
 
 def update_account(acct, data, user_id=None):
@@ -450,7 +450,7 @@ def update_account(acct, data, user_id=None):
                 log_audit("PROTECTED_ACCOUNT_UPDATE_ATTEMPTED", "AccountingAccount", acct.id, user_id, {"field": f}); raise AccountingError(f"{f} cannot be changed after journal activity exists")
     if "is_active" in data and data["is_active"] is False and account_is_mapped(acct):
         log_audit("PROTECTED_ACCOUNT_UPDATE_ATTEMPTED", "AccountingAccount", acct.id, user_id, {"field": "is_active"}); raise AccountingError("Mapped accounts cannot be deactivated")
-    for field in ["account_name", "description", "is_active", "allow_manual_posting", "cash_flow_category", "account_subtype"]:
+    for field in ["account_name", "description", "is_active", "allow_manual_posting", "cash_flow_category", "account_subtype", "financial_statement_group", "financial_statement_order", "cash_flow_group"]:
         if field in data: setattr(acct, field, data[field])
     log_audit("ACCOUNT_ACTIVATION_CHANGED" if "is_active" in data else "ACCOUNT_UPDATE", "AccountingAccount", acct.id, user_id, data); return acct
 
@@ -528,3 +528,170 @@ def general_ledger(account_id=None, date_from=None, date_to=None, customer_id=No
 def ledger_csv(data):
     fields=["journal_entry_id","journal_date","journal_no","description","reference_type","reference_id","source_module","debit","credit","running_balance","customer_id","customer_number","customer_name","loan_id","loan_number","payment_id","collection_id"]
     out=StringIO(); w=csv.DictWriter(out, fieldnames=fields, extrasaction="ignore"); w.writeheader(); w.writerows(data["transactions"]); return out.getvalue()
+
+# Phase 2 financial reporting
+FINANCIAL_STATEMENT_GROUPS = {
+    "OPERATING_INCOME", "OTHER_INCOME", "STAFF_EXPENSE", "ADMIN_EXPENSE",
+    "TRANSPORT_EXPENSE", "FINANCE_COST", "IMPAIRMENT_EXPENSE", "TAX_EXPENSE",
+    "OTHER_EXPENSE", "CURRENT_ASSET", "NON_CURRENT_ASSET", "CURRENT_LIABILITY",
+    "NON_CURRENT_LIABILITY", "EQUITY",
+}
+DEFAULT_FINANCIAL_CLASSIFICATIONS = {
+    "1000": ("CURRENT_ASSET", 10), "1010": ("CURRENT_ASSET", 20),
+    "1100": ("CURRENT_ASSET", 30), "1110": ("CURRENT_ASSET", 40),
+    "1120": ("CURRENT_ASSET", 50), "1990": ("CURRENT_ASSET", 90),
+    "2000": ("CURRENT_LIABILITY", 10), "2100": ("CURRENT_LIABILITY", 20),
+    "3000": ("EQUITY", 10), "3100": ("EQUITY", 20),
+    "4000": ("OPERATING_INCOME", 10), "4010": ("OPERATING_INCOME", 20),
+    "4020": ("OPERATING_INCOME", 30), "5000": ("STAFF_EXPENSE", 10),
+    "5010": ("ADMIN_EXPENSE", 20), "5020": ("ADMIN_EXPENSE", 30),
+    "5030": ("TRANSPORT_EXPENSE", 40), "5040": ("ADMIN_EXPENSE", 50),
+    "5050": ("IMPAIRMENT_EXPENSE", 60),
+}
+INCOME_SECTION_NAMES = {"OPERATING_INCOME": "Operating Income", "OTHER_INCOME": "Other Income", None: "UNCLASSIFIED INCOME"}
+EXPENSE_SECTION_NAMES = {"STAFF_EXPENSE":"Staff Costs","ADMIN_EXPENSE":"Administrative Expenses","TRANSPORT_EXPENSE":"Transport and Collection Expenses","FINANCE_COST":"Finance Costs","IMPAIRMENT_EXPENSE":"Loan Impairment / Write-off Expense","TAX_EXPENSE":"Tax Expense","OTHER_EXPENSE":"Other Expenses", None:"UNCLASSIFIED EXPENSE"}
+
+
+def seed_default_report_classifications():
+    seed_default_accounts()
+    for code, (group, order) in DEFAULT_FINANCIAL_CLASSIFICATIONS.items():
+        acct = AccountingAccount.query.filter_by(account_code=code).first()
+        if acct:
+            if not getattr(acct, "financial_statement_group", None):
+                acct.financial_statement_group = group
+            if getattr(acct, "financial_statement_order", None) is None:
+                acct.financial_statement_order = order
+    db.session.flush()
+
+
+def _fmt(value): return f"{money(value):.2f}"
+def _today(): return date.today()
+def _posted_filter(): return func.upper(AccountingJournalEntry.status).in_(["POSTED", "REVERSED"])
+
+def _account_depth(account):
+    depth=0; p=account.parent
+    while p: depth += 1; p = p.parent
+    return depth
+
+def _signed_balance(account, debit, credit):
+    debit=money(debit); credit=money(credit)
+    return money(debit-credit) if account.normal_balance == "DEBIT" else money(credit-debit)
+
+def _side_amounts(account, signed):
+    signed=money(signed)
+    side = account.normal_balance if signed >= 0 else ("CREDIT" if account.normal_balance == "DEBIT" else "DEBIT")
+    return (abs(signed), Decimal("0.00"), side) if side == "DEBIT" else (Decimal("0.00"), abs(signed), side)
+
+def _sum_by_account(date_to=None, date_from=None, account_types=None):
+    q = db.session.query(AccountingJournalLine.account_id, func.coalesce(func.sum(AccountingJournalLine.debit), 0), func.coalesce(func.sum(AccountingJournalLine.credit), 0)).join(AccountingJournalEntry).filter(_posted_filter())
+    if date_from: q = q.filter(AccountingJournalEntry.journal_date >= date_from)
+    if date_to: q = q.filter(AccountingJournalEntry.journal_date <= date_to)
+    if account_types: q = q.join(AccountingAccount).filter(AccountingAccount.account_type.in_(account_types))
+    return {r[0]: (money(r[1]), money(r[2])) for r in q.group_by(AccountingJournalLine.account_id).all()}
+
+def _warnings():
+    issues = reconciliation_issues()
+    return [{"code":"INCOMPLETE_ACCOUNTING_HISTORY","message":"Some operational transactions have no accounting journals."}] if any("MISSING" in i.get("type", "") for i in issues) else []
+
+def _validate_posted_journals():
+    issues=[]
+    for e in AccountingJournalEntry.query.filter(_posted_filter()).all():
+        td=sum((money(l.debit) for l in e.lines), Decimal("0.00")); tc=sum((money(l.credit) for l in e.lines), Decimal("0.00"))
+        if td != tc or money(e.total_debit) != td or money(e.total_credit) != tc:
+            issues.append({"type":"POSTED_JOURNAL_TOTAL_MISMATCH","journal_id":e.id})
+    return issues
+
+def trial_balance_report(as_of_date=None, date_from=None, include_zero_balances=False, account_type=None, account_id=None, comparative_as_of_date=None):
+    seed_default_report_classifications(); as_of_date = as_of_date or _today()
+    accounts_q = AccountingAccount.query
+    if account_type: accounts_q=accounts_q.filter_by(account_type=account_type)
+    if account_id: accounts_q=accounts_q.filter_by(id=int(account_id))
+    accounts=accounts_q.order_by(AccountingAccount.account_code).all()
+    opening_map = _sum_by_account(date_to=(date_from - timedelta(days=1)) if date_from else None) if date_from else {}
+    period_map = _sum_by_account(date_from=date_from, date_to=as_of_date) if date_from else _sum_by_account(date_to=as_of_date)
+    comp_map = _sum_by_account(date_to=comparative_as_of_date) if comparative_as_of_date else {}
+    rows=[]; totals={k:Decimal('0.00') for k in ['opening_debit','opening_credit','period_debit','period_credit','closing_debit','closing_credit']}
+    for a in accounts:
+        od,oc = opening_map.get(a.id, (Decimal('0.00'), Decimal('0.00'))); pd,pc = period_map.get(a.id, (Decimal('0.00'), Decimal('0.00')))
+        opening_signed=_signed_balance(a, od, oc); closing_signed=_signed_balance(a, od+pd, oc+pc)
+        opening_debit, opening_credit, _ = _side_amounts(a, opening_signed); closing_debit, closing_credit, side = _side_amounts(a, closing_signed)
+        if not include_zero_balances and not any([opening_debit, opening_credit, pd, pc, closing_debit, closing_credit]): continue
+        for k,v in [('opening_debit',opening_debit),('opening_credit',opening_credit),('period_debit',pd),('period_credit',pc),('closing_debit',closing_debit),('closing_credit',closing_credit)]: totals[k]+=money(v)
+        cd,cc = comp_map.get(a.id, (Decimal('0.00'), Decimal('0.00'))); comp=_signed_balance(a, cd, cc) if comparative_as_of_date else None
+        rows.append({"account_id":a.id,"account_code":a.account_code,"account_name":a.account_name,"account_type":a.account_type,"account_subtype":account_subtype(a),"normal_balance":a.normal_balance,"opening_debit":_fmt(opening_debit),"opening_credit":_fmt(opening_credit),"period_debit":_fmt(pd),"period_credit":_fmt(pc),"closing_debit":_fmt(closing_debit),"closing_credit":_fmt(closing_credit),"net_balance":_fmt(closing_signed),"balance_side":side,"comparative_net_balance": _fmt(comp) if comparative_as_of_date else None,"is_parent":bool(a.children),"depth":_account_depth(a),"parent_id":a.parent_id,"display_order":a.financial_statement_order,"parent_totals_included":False,"drilldown":{"account_id":a.id,"date_from":date_from.isoformat() if date_from else None,"date_to":as_of_date.isoformat()}})
+    diff=money(totals['closing_debit']-totals['closing_credit']); issues=_validate_posted_journals()
+    if diff != 0: issues.append({"type":"UNBALANCED_TRIAL_BALANCE","difference":_fmt(diff)})
+    return {"report":"TRIAL_BALANCE","as_of_date":as_of_date.isoformat(),"date_from":date_from.isoformat() if date_from else None,"accounts":rows,"totals":{f"total_{k}":_fmt(v) for k,v in totals.items()} | {"difference":_fmt(diff),"is_balanced":diff==0},"validation":{"is_valid":not issues,"difference":_fmt(diff),"issues":issues},"warnings":_warnings()}
+
+def _account_amounts(types, date_from=None, date_to=None): return _sum_by_account(date_from=date_from, date_to=date_to, account_types=types)
+
+def _variance(amount, comp):
+    var=money(amount-comp); pct=None if comp==0 else money((var/abs(comp))*Decimal('100'))
+    return _fmt(var), (_fmt(pct) if pct is not None else None)
+
+def income_statement_report(date_from, date_to, comparative_date_from=None, comparative_date_to=None, include_zero_balances=False):
+    seed_default_report_classifications(); data=_account_amounts(['INCOME','EXPENSE'], date_from, date_to); comp=_account_amounts(['INCOME','EXPENSE'], comparative_date_from, comparative_date_to) if comparative_date_from and comparative_date_to else {}
+    sections_i={}; sections_e={}; total_i=total_e=tax=Decimal('0.00'); issues=[]
+    for a in AccountingAccount.query.filter(AccountingAccount.account_type.in_(['INCOME','EXPENSE'])).order_by(AccountingAccount.financial_statement_order, AccountingAccount.account_code).all():
+        d,c=data.get(a.id,(Decimal('0.00'),Decimal('0.00'))); amount=money(c-d) if a.account_type=='INCOME' else money(d-c)
+        cd,cc=comp.get(a.id,(Decimal('0.00'),Decimal('0.00'))); camount=money(cc-cd) if a.account_type=='INCOME' else money(cd-cc)
+        if not include_zero_balances and amount==0 and camount==0: continue
+        group=a.financial_statement_group if a.financial_statement_group in FINANCIAL_STATEMENT_GROUPS else None
+        if group is None: issues.append({"type":"UNCLASSIFIED_ACCOUNT","account_id":a.id})
+        var,pct=_variance(amount,camount); row={"account_id":a.id,"account_code":a.account_code,"account_name":a.account_name,"amount":_fmt(amount),"comparative_amount":_fmt(camount) if comp else None,"variance":var if comp else None,"variance_percent":pct if comp else None,"drilldown":{"account_id":a.id,"date_from":date_from.isoformat(),"date_to":date_to.isoformat()}}
+        bucket=sections_i if a.account_type=='INCOME' else sections_e; name=(INCOME_SECTION_NAMES if a.account_type=='INCOME' else EXPENSE_SECTION_NAMES).get(group, (INCOME_SECTION_NAMES if a.account_type=='INCOME' else EXPENSE_SECTION_NAMES)[None])
+        bucket.setdefault(name, []).append(row)
+        if a.account_type=='INCOME': total_i += amount
+        else:
+            total_e += amount
+            if group == 'TAX_EXPENSE': tax += amount
+    def pack(sections): return [{"section_name":k,"accounts":v,"total":_fmt(sum(Decimal(x['amount']) for x in v))} for k,v in sections.items()]
+    net=money(total_i-total_e); diff=money(total_i-total_e-net)
+    return {"report":"INCOME_STATEMENT","date_from":date_from.isoformat(),"date_to":date_to.isoformat(),"income":{"sections":pack(sections_i),"total_income":_fmt(total_i)},"expenses":{"sections":pack(sections_e),"total_expenses":_fmt(total_e)},"profit_before_tax":_fmt(total_i-total_e+tax),"tax_expense":_fmt(tax),"net_profit":_fmt(net),"validation":{"is_valid":diff==0 and not issues,"difference":_fmt(diff),"issues":issues},"warnings":_warnings()}
+
+def _balance_sheet_account_rows(types, as_of_date, comparative_as_of_date=None, include_zero_balances=False):
+    data=_sum_by_account(date_to=as_of_date, account_types=types); comp=_sum_by_account(date_to=comparative_as_of_date, account_types=types) if comparative_as_of_date else {}; rows=[]
+    for a in AccountingAccount.query.filter(AccountingAccount.account_type.in_(types)).order_by(AccountingAccount.financial_statement_order, AccountingAccount.account_code).all():
+        d,c=data.get(a.id,(Decimal('0.00'),Decimal('0.00'))); amount=_signed_balance(a,d,c)
+        cd,cc=comp.get(a.id,(Decimal('0.00'),Decimal('0.00'))); camount=_signed_balance(a,cd,cc)
+        if not include_zero_balances and amount==0 and camount==0: continue
+        rows.append({"account_id":a.id,"account_code":a.account_code,"account_name":a.account_name,"account_type":a.account_type,"financial_statement_group":a.financial_statement_group,"amount":_fmt(amount),"comparative_amount":_fmt(camount) if comparative_as_of_date else None,"drilldown":{"account_id":a.id,"date_from":None,"date_to":as_of_date.isoformat()}})
+    return rows
+
+def statement_of_financial_position_report(as_of_date=None, comparative_as_of_date=None, include_zero_balances=False):
+    seed_default_report_classifications(); as_of_date=as_of_date or _today(); rows=_balance_sheet_account_rows(['ASSET','LIABILITY','EQUITY'], as_of_date, comparative_as_of_date, include_zero_balances)
+    ca=[r for r in rows if r['financial_statement_group'] in (None,'CURRENT_ASSET') and r['account_type']=='ASSET']; nca=[r for r in rows if r['financial_statement_group']=='NON_CURRENT_ASSET']
+    cl=[r for r in rows if r['financial_statement_group'] in (None,'CURRENT_LIABILITY') and r['account_type']=='LIABILITY']; ncl=[r for r in rows if r['financial_statement_group']=='NON_CURRENT_LIABILITY']
+    eq=[r for r in rows if r['account_type']=='EQUITY']
+    pl=income_statement_report(date(1900,1,1), as_of_date)['net_profit']; pl_dec=Decimal(pl)
+    ta=sum(Decimal(r['amount']) for r in ca+nca); tl=sum(Decimal(r['amount']) for r in cl+ncl); eq_accounts=sum(Decimal(r['amount']) for r in eq); te=money(eq_accounts+pl_dec); diff=money(ta-(tl+te)); issues=[]
+    if diff != 0: issues.append({"type":"UNBALANCED_STATEMENT_OF_FINANCIAL_POSITION","difference":_fmt(diff)})
+    return {"report":"STATEMENT_OF_FINANCIAL_POSITION","as_of_date":as_of_date.isoformat(),"assets":{"current_assets":{"accounts":ca,"total":_fmt(sum(Decimal(r['amount']) for r in ca))},"non_current_assets":{"accounts":nca,"total":_fmt(sum(Decimal(r['amount']) for r in nca))},"total_assets":_fmt(ta)},"liabilities":{"current_liabilities":{"accounts":cl,"total":_fmt(sum(Decimal(r['amount']) for r in cl))},"non_current_liabilities":{"accounts":ncl,"total":_fmt(sum(Decimal(r['amount']) for r in ncl))},"total_liabilities":_fmt(tl)},"equity":{"accounts":eq,"retained_earnings":"0.00","current_period_profit_loss":_fmt(pl_dec),"total_equity":_fmt(te),"policy":"Current period profit/loss is cumulative posted income less expenses through the as-of date until year-end closing is implemented; retained earnings account balance remains in equity accounts."},"total_liabilities_and_equity":_fmt(tl+te),"difference":_fmt(diff),"is_balanced":diff==0,"validation":{"is_valid":not issues,"difference":_fmt(diff),"issues":issues},"warnings":_warnings()}
+
+def reports_summary(date_from=None, date_to=None, as_of_date=None):
+    as_of_date=as_of_date or date_to or _today(); date_from=date_from or date(as_of_date.year,1,1); date_to=date_to or as_of_date
+    isr=income_statement_report(date_from,date_to); sfp=statement_of_financial_position_report(as_of_date); tb=trial_balance_report(as_of_date)
+    unclassified=AccountingAccount.query.filter(AccountingAccount.account_type.in_(['INCOME','EXPENSE','ASSET','LIABILITY','EQUITY']), AccountingAccount.financial_statement_group.is_(None)).count()
+    return {"total_assets":sfp['assets']['total_assets'],"total_liabilities":sfp['liabilities']['total_liabilities'],"total_equity":sfp['equity']['total_equity'],"total_income":isr['income']['total_income'],"total_expenses":isr['expenses']['total_expenses'],"net_profit":isr['net_profit'],"trial_balance_difference":tb['totals']['difference'],"statement_of_financial_position_difference":sfp['difference'],"unclassified_account_count":unclassified}
+
+def report_csv(data, generated_by=None):
+    out=StringIO(); w=csv.writer(out); w.writerow([data.get('report','REPORT')]); w.writerow(['Generated At', datetime.utcnow().isoformat(), 'Generated By', generated_by or 'system'])
+    if data['report']=='TRIAL_BALANCE':
+        w.writerow(['As Of', data['as_of_date']]); w.writerow(['Section','Account Code','Account Name','Debit','Credit','Amount'])
+        for r in data['accounts']: w.writerow(['Trial Balance',r['account_code'],r['account_name'],r['closing_debit'],r['closing_credit'],r['net_balance']])
+        w.writerow(['Totals','','',data['totals']['total_closing_debit'],data['totals']['total_closing_credit'],data['totals']['difference']])
+    elif data['report']=='INCOME_STATEMENT':
+        w.writerow(['Period', data['date_from'], data['date_to']]); w.writerow(['Section','Account Code','Account Name','Debit','Credit','Amount'])
+        for part in ['income','expenses']:
+            for sec in data[part]['sections']:
+                for r in sec['accounts']: w.writerow([sec['section_name'],r['account_code'],r['account_name'],'','',f"Rs. {Decimal(r['amount']):,.2f}"])
+                w.writerow([sec['section_name']+' Total','','','','',sec['total']])
+        w.writerow(['Net Profit','','','','',data['net_profit']])
+    else:
+        w.writerow(['As Of', data['as_of_date']]); w.writerow(['Section','Account Code','Account Name','Debit','Credit','Amount'])
+        for top in [('Current Assets',data['assets']['current_assets']),('Non-current Assets',data['assets']['non_current_assets']),('Current Liabilities',data['liabilities']['current_liabilities']),('Non-current Liabilities',data['liabilities']['non_current_liabilities'])]:
+            for r in top[1]['accounts']: w.writerow([top[0],r['account_code'],r['account_name'],'','',f"Rs. {Decimal(r['amount']):,.2f}"])
+            w.writerow([top[0]+' Total','','','','',top[1]['total']])
+        for r in data['equity']['accounts']: w.writerow(['Equity',r['account_code'],r['account_name'],'','',f"Rs. {Decimal(r['amount']):,.2f}"])
+        w.writerow(['Total Liabilities and Equity','','','','',data['total_liabilities_and_equity']])
+    return out.getvalue()
