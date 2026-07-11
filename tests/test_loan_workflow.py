@@ -1019,3 +1019,97 @@ def test_admin_ledger_currency_fields_are_lkr_formatted_without_changing_numbers
     assert body["totals"]["total_payable"] == 15000.0
     assert body["totals"]["total_payable_formatted"] == "Rs. 15,000.00"
     assert Loan.query.get(loan_id).total_payable == Decimal("15000.00")
+
+
+def _approved_terms_payload(**overrides):
+    payload = {
+        "approved_amount": "15000",
+        "loan_days": 63,
+        "repayment_frequency": "WEEKLY",
+        "number_of_installments": 8,
+        "installment_amount": "2400",
+        "interest_type": "FLAT",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_flexible_terms_approval_and_disbursement_create_eight_weekly_rows(app, client):
+    from app.models import AccountingJournalEntry, Payment
+
+    admin_user = _create_user("admin", "Flexible Admin", "flex-admin@example.com")
+    customer_user = _create_user("customer", "Flexible Customer", "flex-customer@example.com")
+    customer = _customer_profile(customer_user, code="CUST-FLEX")
+    application = LoanApplication(
+        application_number="APP-FLEX",
+        customer_id=customer.id,
+        loan_type="GROW_BUSINESS",
+        status=STATUS_SUBMITTED,
+        applied_amount=Decimal("15000"),
+        tenure_months=3,
+        full_name="Flexible Customer",
+        nic_number="123456789V",
+        mobile_number="0700000000",
+    )
+    db.session.add(application); db.session.commit()
+
+    before_journals = AccountingJournalEntry.query.count()
+    approval = client.post(f"/loan-applications/{application.id}/approve", headers=_auth_headers(app, admin_user), json=_approved_terms_payload())
+    assert approval.status_code == 200
+    body = approval.get_json()
+    assert body["status"] == STATUS_APPROVED
+    assert body["approved_amount"] == 15000.0
+    assert body["total_repayment"] == 19200.0
+    assert body["total_interest"] == 4200.0
+    assert body["interest_rate"] == 28.0
+    assert AccountingJournalEntry.query.count() == before_journals
+
+    disbursed = client.post(f"/loan-applications/{application.id}/disburse", headers=_auth_headers(app, admin_user), json={"disbursement_date": "2026-01-01"})
+    assert disbursed.status_code == 201
+    loan = Loan.query.get(disbursed.get_json()["loan_id"])
+    assert loan.principal_amount == Decimal("15000.00")
+    assert loan.loan_days == 63
+    assert loan.maturity_date == date(2026, 3, 5)
+    assert len(loan.ledger_entries) == 8
+    assert sum((entry.principal_amount for entry in loan.ledger_entries), Decimal("0")) == Decimal("15000.00")
+    assert sum((entry.interest_amount for entry in loan.ledger_entries), Decimal("0")) == Decimal("4200.00")
+    assert sum((entry.installment_amount for entry in loan.ledger_entries), Decimal("0")) == Decimal("19200.00")
+    assert loan.ledger_entries[0].principal_amount == Decimal("1875.00")
+    assert loan.ledger_entries[0].interest_amount == Decimal("525.00")
+
+    pay = client.post("/staff/payments", headers=_auth_headers(app, admin_user), json={"loan_id": loan.id, "amount_collected": "2400", "collection_date": "2026-01-07", "payment_method": "Cash"})
+    assert pay.status_code == 200
+    payment = Payment.query.get(pay.get_json()["payment_id"])
+    assert payment.principal_paid == Decimal("1875.00")
+    assert payment.interest_paid == Decimal("525.00")
+    journals = AccountingJournalEntry.query.filter_by(status="POSTED").all()
+    assert all(j.total_debit == j.total_credit for j in journals)
+
+
+def test_flexible_terms_validation_rejects_bad_payloads(app, client):
+    admin_user = _create_user("admin", "Bad Flex Admin", "bad-flex-admin@example.com")
+    customer_user = _create_user("customer", "Bad Flex Customer", "bad-flex-customer@example.com")
+    customer = _customer_profile(customer_user, code="CUST-BAD-FLEX")
+    for idx, overrides in enumerate([
+        {"installment_amount": "1000"},
+        {"approved_amount": "0"},
+        {"loan_days": -1},
+        {"repayment_frequency": "YEARLY"},
+        {"number_of_installments": 0},
+    ]):
+        application = LoanApplication(application_number=f"APP-BAD-FLEX-{idx}", customer_id=customer.id, loan_type="GROW_BUSINESS", status=STATUS_SUBMITTED, applied_amount=Decimal("15000"), tenure_months=3, full_name="Bad Flex Customer", nic_number="123456789V", mobile_number="0700000000")
+        db.session.add(application); db.session.commit()
+        response = client.post(f"/loan-applications/{application.id}/approve", headers=_auth_headers(app, admin_user), json=_approved_terms_payload(**overrides))
+        assert response.status_code == 400
+        assert response.get_json().get("errors")
+
+
+def test_legacy_loan_with_null_flexible_fields_still_loads(app, client):
+    admin_user = _create_user("admin", "Legacy Admin", "legacy-admin@example.com")
+    customer_user = _create_user("customer", "Legacy Customer", "legacy-customer@example.com")
+    customer = _customer_profile(customer_user, code="CUST-LEGACY")
+    loan = Loan(loan_number="LN-LEGACY-NULLS", customer_id=customer.id, principal_amount=Decimal("1000"), interest_rate=Decimal("0"), total_days=10, daily_installment=Decimal("100"), total_payable=Decimal("1000"), start_date=date.today(), end_date=date.today(), status="ACTIVE", created_by_id=admin_user.id)
+    db.session.add(loan); db.session.commit()
+    response = client.get(f"/admin/loans/{loan.id}/ledger", headers=_auth_headers(app, admin_user))
+    assert response.status_code == 200
+    assert response.get_json()["loan"]["loan_days"] is None
