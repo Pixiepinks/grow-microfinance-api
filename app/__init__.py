@@ -143,14 +143,15 @@ def create_app():
 
 
     @accounting_cli.command("backfill-disbursements")
-    @click.option("--dry-run/--commit", default=True, help="Preview without committing by default.")
+    @click.option("--apply", "apply_changes", is_flag=True, default=False, help="Persist journals. Dry-run is the default.")
     @click.option("--loan-id", type=int, default=None, help="Backfill one loan disbursement.")
     @click.option("--date-from", default=None, help="Only include loans starting on/after YYYY-MM-DD.")
     @click.option("--date-to", default=None, help="Only include loans starting on/before YYYY-MM-DD.")
-    def accounting_backfill_disbursements(dry_run, loan_id, date_from, date_to):
+    @click.option("--funding-account-code", default=None, help="Explicit funding account code override.")
+    def accounting_backfill_disbursements(apply_changes, loan_id, date_from, date_to, funding_account_code):
         from datetime import date as date_cls
-        from .models import Loan, AccountingJournalEntry
-        from .accounting import post_loan_disbursement, AccountingError, money
+        from .models import Loan, AccountingAccount, AccountingJournalEntry
+        from .accounting import post_loan_disbursement, AccountingError, money, resolve_system_account
 
         start = date_cls.fromisoformat(date_from) if date_from else None
         end = date_cls.fromisoformat(date_to) if date_to else None
@@ -171,13 +172,60 @@ def create_app():
                     summary["mismatched"] += 1
                 continue
             try:
-                post_loan_disbursement(loan)
+                funding_account = AccountingAccount.query.filter_by(account_code=funding_account_code).first() if funding_account_code else resolve_system_account("DEFAULT_DISBURSEMENT_ACCOUNT")
+                click.echo({"loan_id": loan.id, "funding_account": funding_account.account_code})
+                post_loan_disbursement(loan, funding_account=funding_account)
                 summary["created"] += 1
             except AccountingError as exc:
-                current_app.logger.exception("Failed to backfill disbursement for loan %s", loan.id)
+                app.logger.exception("Failed to backfill disbursement for loan %s", loan.id)
                 summary["failed"] += 1
                 click.echo({"loan_id": loan.id, "error": str(exc)})
-        if dry_run:
+        if not apply_changes:
+            db.session.rollback()
+        else:
+            db.session.commit()
+        click.echo(summary)
+
+    @accounting_cli.command("backfill-payments")
+    @click.option("--apply", "apply_changes", is_flag=True, default=False, help="Persist journals. Dry-run is the default.")
+    @click.option("--payment-id", type=int, default=None, help="Backfill one payment journal.")
+    @click.option("--date-from", default=None, help="Only include payments on/after YYYY-MM-DD.")
+    @click.option("--date-to", default=None, help="Only include payments on/before YYYY-MM-DD.")
+    @click.option("--receipt-account-code", default=None, help="Explicit receipt account code override.")
+    def accounting_backfill_payments(apply_changes, payment_id, date_from, date_to, receipt_account_code):
+        from datetime import date as date_cls
+        from .models import Payment, AccountingAccount, AccountingJournalEntry
+        from .accounting import post_loan_payment, AccountingError, money
+
+        start = date_cls.fromisoformat(date_from) if date_from else None
+        end = date_cls.fromisoformat(date_to) if date_to else None
+        summary = {"created": 0, "skipped": 0, "failed": 0, "mismatched": 0}
+        query = Payment.query
+        if payment_id:
+            query = query.filter_by(id=payment_id)
+        if start:
+            query = query.filter(Payment.collection_date >= start)
+        if end:
+            query = query.filter(Payment.collection_date <= end)
+        for payment in query.all():
+            existing = AccountingJournalEntry.query.filter_by(idempotency_key=f"LOAN_PAYMENT:{payment.id}").first()
+            if existing:
+                summary["skipped"] += 1
+                continue
+            total = money(payment.amount_collected)
+            allocated = money(money(payment.principal_paid) + money(payment.interest_paid) + money(payment.penalty_paid) + money(payment.other_fee_paid))
+            if allocated != total:
+                summary["mismatched"] += 1
+                click.echo({"payment_id": payment.id, "error": "Stored payment allocation does not match amount collected"})
+                continue
+            try:
+                receipt_account = AccountingAccount.query.filter_by(account_code=receipt_account_code).first() if receipt_account_code else None
+                post_loan_payment(payment, receipt_account=receipt_account)
+                summary["created"] += 1
+            except AccountingError as exc:
+                summary["failed"] += 1
+                click.echo({"payment_id": payment.id, "error": str(exc)})
+        if not apply_changes:
             db.session.rollback()
         else:
             db.session.commit()
