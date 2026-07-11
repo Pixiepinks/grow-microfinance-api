@@ -96,9 +96,14 @@ def seed_default_accounts():
             db.session.add(AccountingAccount(account_code=code, account_name=name, account_type=typ, normal_balance=normal, is_system_account=system, cash_flow_category=("RECEIVABLE" if "RECEIVABLE" in category else category), account_subtype=category))
         else:
             acct.is_system_account = bool(system) or acct.is_system_account
-            acct.account_type = typ
-            acct.normal_balance = normal
-            if hasattr(acct, "account_subtype"):
+            # Seed correction is intentionally conservative for existing
+            # accounts: mark core accounts as system accounts and fill missing
+            # metadata, but do not mutate protected accounting identity fields.
+            if not account_has_activity(acct):
+                acct.account_type = typ
+                acct.normal_balance = normal
+                acct.account_subtype = category
+            elif not getattr(acct, "account_subtype", None):
                 acct.account_subtype = category
             if getattr(acct, "cash_flow_category", None) in (None, "NONE") and category != "NONE":
                 acct.cash_flow_category = "RECEIVABLE" if "RECEIVABLE" in category else category
@@ -339,12 +344,30 @@ def _issue(issue_type, severity, source_type, source_id, source_reference, descr
     payload.update({k: v for k, v in extra.items() if v is not None})
     return payload
 
+def _backfill_metadata(issue_type, loan=None, payment=None):
+    can_backfill = issue_type in ("MISSING_DISBURSEMENT_JOURNAL", "MISSING_PAYMENT_JOURNAL")
+    block_reason = None
+    if issue_type == "MISSING_PAYMENT_JOURNAL" and payment:
+        total = money(payment.amount_collected)
+        allocated = money(money(payment.principal_paid) + money(payment.interest_paid) + money(payment.penalty_paid) + money(payment.other_fee_paid))
+        if allocated != total:
+            can_backfill = False
+            block_reason = "Stored payment allocation does not match amount collected"
+    return {
+        "customer_name": getattr(getattr(loan, "customer", None), "full_name", None),
+        "loan_number": getattr(loan, "loan_number", None),
+        "payment_reference": getattr(payment, "transaction_reference", None) or (str(payment.id) if payment else None),
+        "recommended_action": "Run the matching dry-run accounting backfill command, review the result, then rerun with --apply." if can_backfill else "Review source data before attempting backfill.",
+        "can_backfill": can_backfill,
+        "backfill_block_reason": block_reason,
+    }
+
 def reconciliation_issues():
     issues=[]
     for loan in Loan.query.filter(Loan.status.in_(["Active","ACTIVE"])).all():
         journals=AccountingJournalEntry.query.filter_by(reference_type="LOAN_DISBURSEMENT", reference_id=str(loan.id)).all()
         if not journals:
-            item=_issue("MISSING_DISBURSEMENT_JOURNAL", "WARNING", "LOAN", loan.id, loan.loan_number, "Active loan has no posted disbursement journal.", "LOAN", loan.id)
+            item=_issue("MISSING_DISBURSEMENT_JOURNAL", "WARNING", "LOAN", loan.id, loan.loan_number, "Active loan has no posted disbursement journal.", "LOAN", loan.id, **_backfill_metadata("MISSING_DISBURSEMENT_JOURNAL", loan=loan))
             if item: issues.append(item)
         if len(journals)>1:
             item=_issue("DUPLICATE_DISBURSEMENT_JOURNAL", "ERROR", "LOAN", loan.id, loan.loan_number, "Loan has more than one disbursement journal.", "LOAN", loan.id, count=len(journals))
@@ -360,7 +383,7 @@ def reconciliation_issues():
     for p in Payment.query.all():
         if not AccountingJournalEntry.query.filter_by(reference_type="LOAN_PAYMENT", reference_id=str(p.id)).first():
             loan = p.loan
-            item=_issue("MISSING_PAYMENT_JOURNAL", "WARNING", "PAYMENT", p.id, getattr(loan, "loan_number", None), "Payment has no posted accounting journal.", "PAYMENT", p.id, payment_id=p.id)
+            item=_issue("MISSING_PAYMENT_JOURNAL", "WARNING", "PAYMENT", p.id, getattr(loan, "loan_number", None), "Payment has no posted accounting journal.", "PAYMENT", p.id, payment_id=p.id, **_backfill_metadata("MISSING_PAYMENT_JOURNAL", loan=loan, payment=p))
             if item: issues.append(item)
     for e in AccountingJournalEntry.query.all():
         td=sum((money(l.debit) for l in e.lines), Decimal("0.00")); tc=sum((money(l.credit) for l in e.lines), Decimal("0.00"))
@@ -392,6 +415,8 @@ def validate_setting_account(key, account):
         raise AccountingError("Account not found")
     if not account.is_active:
         raise AccountingError("Account is inactive")
+    if not account.is_system_account:
+        raise AccountingError("Mapped accounting settings must reference system accounts")
     if not account.allow_manual_posting:
         raise AccountingError("Account does not allow posting")
     valid_types, valid_subtypes = SETTING_VALIDATION[key]
@@ -481,6 +506,8 @@ def update_account(acct, data, user_id=None):
                 log_audit("PROTECTED_ACCOUNT_UPDATE_ATTEMPTED", "AccountingAccount", acct.id, user_id, {"field": f}); raise AccountingError(f"{f} cannot be changed after journal activity exists")
     if "is_active" in data and data["is_active"] is False and account_is_mapped(acct):
         log_audit("PROTECTED_ACCOUNT_UPDATE_ATTEMPTED", "AccountingAccount", acct.id, user_id, {"field": "is_active"}); raise AccountingError("Mapped accounts cannot be deactivated")
+    if "account_subtype" in data and data["account_subtype"] != account_subtype(acct) and account_is_mapped(acct):
+        log_audit("PROTECTED_ACCOUNT_UPDATE_ATTEMPTED", "AccountingAccount", acct.id, user_id, {"field": "account_subtype"}); raise AccountingError("Mapped account subtype cannot be changed incompatibly")
     for field in ["account_name", "description", "is_active", "allow_manual_posting", "cash_flow_category", "account_subtype", "financial_statement_group", "financial_statement_order", "cash_flow_group"]:
         if field in data: setattr(acct, field, data[field])
     log_audit("ACCOUNT_ACTIVATION_CHANGED" if "is_active" in data else "ACCOUNT_UPDATE", "AccountingAccount", acct.id, user_id, data); return acct
@@ -548,13 +575,27 @@ def general_ledger(account_id=None, date_from=None, date_to=None, customer_id=No
     if date_to: tx_query=tx_query.filter(AccountingJournalEntry.journal_date <= date_to)
     def signed(line): return money(line.debit-line.credit) if account.normal_balance=="DEBIT" else money(line.credit-line.debit)
     opening=sum((signed(l) for l in before.all()), Decimal("0.00")) if date_from else Decimal("0.00")
-    running=money(opening); tx=[]; td=tc=Decimal("0.00")
+    running=money(opening); all_tx=[]; td=tc=Decimal("0.00")
     rows=tx_query.order_by(AccountingJournalEntry.journal_date, AccountingJournalEntry.journal_no, AccountingJournalLine.line_no).all()
     current_app.logger.info("general_ledger query", extra={"query_params": query_params or {}, "resolved_account_id": account.id, "journal_lines_found": len(rows)})
     for l in rows:
         running=money(running+signed(l)); td+=money(l.debit); tc+=money(l.credit); e=l.journal_entry; ctx=_line_context(l)
-        tx.append({"journal_entry_id": e.id, "journal_date": e.journal_date.isoformat(), "journal_no": e.journal_no, "description": e.description, "reference_type": e.reference_type, "reference_id": e.reference_id, "source_module": e.source_module, "debit": f"{money(l.debit):.2f}", "credit": f"{money(l.credit):.2f}", "running_balance": f"{running:.2f}", **ctx})
-    return {"account": {"id": account.id, "account_code": account.account_code, "account_name": account.account_name, "account_type": account.account_type, "account_subtype": account_subtype(account), "normal_balance": account.normal_balance}, "opening_balance": f"{money(opening):.2f}", "transactions": tx, "running_balance": f"{running:.2f}", "closing_balance": f"{running:.2f}", "total_debit": f"{money(td):.2f}", "total_credit": f"{money(tc):.2f}"}
+        all_tx.append({"journal_entry_id": e.id, "journal_date": e.journal_date.isoformat(), "journal_no": e.journal_no, "description": e.description, "reference_type": e.reference_type, "reference_id": e.reference_id, "source_module": e.source_module, "debit": f"{money(l.debit):.2f}", "credit": f"{money(l.credit):.2f}", "running_balance": f"{running:.2f}", **ctx})
+    expected = money(opening + td - tc) if account.normal_balance == "DEBIT" else money(opening + tc - td)
+    if expected != money(running):
+        raise AccountingError("General ledger invariant failed: closing balance does not match account-normal movement")
+    page = _int_filter((query_params or {}).get("page"), "page") if query_params else None
+    per_page = _int_filter((query_params or {}).get("per_page"), "per_page") if query_params else None
+    tx = all_tx
+    pagination = None
+    if page and per_page:
+        start = max(page - 1, 0) * per_page
+        tx = all_tx[start:start + per_page]
+        pagination = {"page": page, "per_page": per_page, "total": len(all_tx)}
+    result = {"account": {"id": account.id, "account_code": account.account_code, "account_name": account.account_name, "account_type": account.account_type, "account_subtype": account_subtype(account), "normal_balance": account.normal_balance}, "opening_balance": f"{money(opening):.2f}", "transactions": tx, "running_balance": f"{running:.2f}", "closing_balance": f"{running:.2f}", "total_debit": f"{money(td):.2f}", "total_credit": f"{money(tc):.2f}"}
+    if pagination:
+        result["pagination"] = pagination
+    return result
 
 def ledger_csv(data):
     fields=["journal_entry_id","journal_date","journal_no","description","reference_type","reference_id","source_module","debit","credit","running_balance","customer_id","customer_number","customer_name","loan_id","loan_number","payment_id","collection_id"]
@@ -707,7 +748,16 @@ def statement_of_financial_position_report(as_of_date=None, comparative_as_of_da
     for r in rows:
         amount=Decimal(r['amount']); group=r['financial_statement_group']
         if r['account_type']=='ASSET' and r.get('account_subtype')=='BANK' and amount < 0:
-            adj=dict(r); adj['amount']=_fmt(abs(amount)); adj['presentation_adjustment']='BANK_OVERDRAFT_RECLASSIFICATION'; adj['financial_statement_group']='CURRENT_LIABILITY'; cl.append(adj)
+            adj=dict(r)
+            adj['account_name']=f"Bank Overdraft — {r['account_name']}"
+            adj['amount']=_fmt(abs(amount))
+            if comparative_as_of_date and adj.get("comparative_amount") is not None:
+                adj["comparative_amount"] = _fmt(abs(Decimal(adj["comparative_amount"])))
+            adj['original_account_type']=r['account_type']
+            adj['presentation_section']='CURRENT_LIABILITY'
+            adj['presentation_adjustment']='BANK_OVERDRAFT_RECLASSIFICATION'
+            adj['financial_statement_group']='CURRENT_LIABILITY'
+            cl.append(adj)
         elif r['account_type']=='ASSET' and group=='NON_CURRENT_ASSET': nca.append(r)
         elif r['account_type']=='ASSET': ca.append(r)
         elif r['account_type']=='LIABILITY' and group=='NON_CURRENT_LIABILITY': ncl.append(r)
@@ -717,7 +767,7 @@ def statement_of_financial_position_report(as_of_date=None, comparative_as_of_da
     ta=sum(Decimal(r['amount']) for r in ca+nca); tl=sum(Decimal(r['amount']) for r in cl+ncl); eq_accounts=sum(Decimal(r['amount']) for r in eq); te=money(eq_accounts+pl_dec); diff=money(ta-(tl+te)); issues=[]
     if diff != 0: issues.append({"type":"UNBALANCED_FINANCIAL_POSITION","difference":_fmt(diff)})
     has_activity=any(r.get('has_activity') for r in rows)
-    return {"report":"STATEMENT_OF_FINANCIAL_POSITION","as_of_date":as_of_date.isoformat(),"assets":{"current_assets":{"accounts":ca,"total":_fmt(sum(Decimal(r['amount']) for r in ca))},"non_current_assets":{"accounts":nca,"total":_fmt(sum(Decimal(r['amount']) for r in nca))},"total_assets":_fmt(ta)},"liabilities":{"current_liabilities":{"accounts":cl,"total":_fmt(sum(Decimal(r['amount']) for r in cl))},"non_current_liabilities":{"accounts":ncl,"total":_fmt(sum(Decimal(r['amount']) for r in ncl))},"total_liabilities":_fmt(tl)},"equity":{"accounts":eq,"retained_earnings":"0.00","current_period_profit_loss":_fmt(pl_dec),"total_equity":_fmt(te),"policy":"BANK accounts with credit balances are presented as current liability bank overdrafts using BANK_OVERDRAFT_RECLASSIFICATION; current period profit/loss is cumulative posted income less expenses through the as-of date until year-end closing is implemented."},"total_liabilities_and_equity":_fmt(tl+te),"difference":_fmt(diff),"is_balanced":diff==0,"financial_position_balanced":diff==0,"validation":{"is_valid":not issues,"difference":_fmt(diff),"issues":issues},"warnings":_warnings(issues),"has_activity":has_activity,"is_empty":not has_activity}
+    return {"report":"STATEMENT_OF_FINANCIAL_POSITION","as_of_date":as_of_date.isoformat(),"assets":{"current_assets":{"accounts":ca,"total":_fmt(sum(Decimal(r['amount']) for r in ca))},"non_current_assets":{"accounts":nca,"total":_fmt(sum(Decimal(r['amount']) for r in nca))},"total_assets":_fmt(ta)},"liabilities":{"current_liabilities":{"accounts":cl,"total":_fmt(sum(Decimal(r['amount']) for r in cl))},"non_current_liabilities":{"accounts":ncl,"total":_fmt(sum(Decimal(r['amount']) for r in ncl))},"total_liabilities":_fmt(tl)},"equity":{"accounts":eq,"retained_earnings":"0.00","current_period_profit_loss":_fmt(pl_dec),"total_equity":_fmt(te),"policy":"BANK accounts with credit balances are presented as current liability bank overdrafts using BANK_OVERDRAFT_RECLASSIFICATION; current period profit/loss is cumulative posted income less expenses through the as-of date until year-end closing is implemented."},"total_liabilities_and_equity":_fmt(tl+te),"difference":_fmt(diff),"is_balanced":diff==0,"financial_position_balanced":diff==0,"validation":{"is_valid":not issues,"difference":_fmt(diff),"issues":issues},"warnings":_warnings(issues),"has_activity":has_activity,"is_empty":not bool(rows)}
 
 def reports_summary(date_from=None, date_to=None, as_of_date=None):
     as_of_date=as_of_date or date_to or _today(); date_from=date_from or date(as_of_date.year,1,1); date_to=date_to or as_of_date
