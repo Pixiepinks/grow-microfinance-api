@@ -3,7 +3,7 @@ from flask import Blueprint, Response, jsonify, request
 from flask_jwt_extended import get_jwt_identity
 
 from ..extensions import db
-from ..models import AccountingAccount, AccountingJournalEntry
+from ..models import AccountingAccount, AccountingJournalEntry, AccountingJournalLine, Customer, Loan
 from ..accounting import (
     AccountingError,
     create_account,
@@ -16,6 +16,11 @@ from ..accounting import (
     seed_default_accounts,
     serialize_journal,
     update_account,
+    accounting_settings_payload,
+    update_accounting_settings,
+    account_subtype,
+    validate_funding_account,
+    resolve_system_account,
 )
 from .utils import role_required
 
@@ -43,7 +48,7 @@ def list_accounts():
     if request.args.get("parent_id"): q=q.filter_by(parent_id=request.args.get("parent_id"))
     if request.args.get("search"):
         s=f"%{request.args['search']}%"; q=q.filter((AccountingAccount.account_code.ilike(s)) | (AccountingAccount.account_name.ilike(s)))
-    return jsonify([{"id":a.id,"account_code":a.account_code,"account_name":a.account_name,"account_type":a.account_type,"normal_balance":a.normal_balance,"parent_id":a.parent_id,"description":a.description,"is_system_account":a.is_system_account,"is_active":a.is_active,"allow_manual_posting":a.allow_manual_posting,"cash_flow_category":a.cash_flow_category} for a in q.order_by(AccountingAccount.account_code).all()])
+    return jsonify([{"id":a.id,"account_code":a.account_code,"account_name":a.account_name,"account_type":a.account_type,"normal_balance":a.normal_balance,"parent_id":a.parent_id,"description":a.description,"is_system_account":a.is_system_account,"is_active":a.is_active,"allow_manual_posting":a.allow_manual_posting,"cash_flow_category":a.cash_flow_category,"account_subtype":account_subtype(a)} for a in q.order_by(AccountingAccount.account_code).all()])
 
 @accounting_bp.route("/accounts", methods=["POST"])
 @role_required(["admin"])
@@ -62,6 +67,45 @@ def edit_account(account_id):
         return jsonify({"id":acct.id,"account_code":acct.account_code})
     except Exception as exc: return _error(exc)
 
+@accounting_bp.route("/accounts/<int:account_id>", methods=["DELETE"])
+@role_required(["admin"])
+def delete_account(account_id):
+    acct=AccountingAccount.query.get_or_404(account_id)
+    try:
+        update_account(acct, {"_delete": True}, _uid())
+        db.session.delete(acct); db.session.commit()
+        return jsonify({"message":"Account deleted"})
+    except Exception as exc: return _error(exc)
+
+@accounting_bp.route("/settings", methods=["GET"])
+@role_required(["admin"])
+def get_settings():
+    return jsonify({"settings": accounting_settings_payload()})
+
+@accounting_bp.route("/settings", methods=["PUT"])
+@role_required(["admin"])
+def put_settings():
+    try:
+        settings=update_accounting_settings(request.get_json() or {}, _uid()); db.session.commit()
+        return jsonify({"settings": settings})
+    except AccountingError as exc:
+        db.session.rollback()
+        details = exc.args[0] if exc.args and isinstance(exc.args[0], dict) else {"message": str(exc)}
+        return jsonify({"message":"Validation failed", "errors": details}), 400
+    except Exception as exc: return _error(exc)
+
+@accounting_bp.route("/funding-accounts", methods=["GET"])
+@role_required(["admin"])
+def funding_accounts():
+    method=(request.args.get("method") or "OTHER").upper()
+    subtypes = ["CASH"] if method == "CASH" else ["BANK"] if method in ("BANK_TRANSFER", "CHEQUE") else ["CASH", "BANK"]
+    default_ids=set()
+    for key in ["DEFAULT_DISBURSEMENT_ACCOUNT", "DEFAULT_CASH_COLLECTION_ACCOUNT", "DEFAULT_BANK_COLLECTION_ACCOUNT"]:
+        try: default_ids.add(resolve_system_account(key).id)
+        except Exception: pass
+    accounts=AccountingAccount.query.filter_by(is_active=True, account_type="ASSET", allow_manual_posting=True).order_by(AccountingAccount.account_code).all()
+    return jsonify({"accounts":[{"id":a.id,"account_code":a.account_code,"account_name":a.account_name,"account_subtype":account_subtype(a),"is_default":a.id in default_ids} for a in accounts if account_subtype(a) in subtypes]})
+
 @accounting_bp.route("/journals", methods=["GET"])
 @role_required(["admin"])
 def list_journals():
@@ -70,8 +114,14 @@ def list_journals():
     if request.args.get("date_to"): q=q.filter(AccountingJournalEntry.journal_date<=date.fromisoformat(request.args["date_to"]))
     for f in ["status","reference_type"]:
         if request.args.get(f): q=q.filter(getattr(AccountingJournalEntry,f)==request.args[f])
+    if request.args.get("journal_no"): q=q.filter(AccountingJournalEntry.journal_no.ilike(f"%{request.args['journal_no']}%"))
+    if request.args.get("reference_id"): q=q.filter(AccountingJournalEntry.reference_id==request.args["reference_id"])
     if request.args.get("search"):
         s=f"%{request.args['search']}%"; q=q.filter((AccountingJournalEntry.journal_no.ilike(s)) | (AccountingJournalEntry.description.ilike(s)))
+    if request.args.get("loan_number"):
+        q=q.join(AccountingJournalEntry.lines).join(Loan, AccountingJournalLine.loan_id==Loan.id).filter(Loan.loan_number.ilike(f"%{request.args['loan_number']}%"))
+    if request.args.get("customer_name"):
+        q=q.join(AccountingJournalEntry.lines).join(Customer, AccountingJournalLine.customer_id==Customer.id).filter(Customer.full_name.ilike(f"%{request.args['customer_name']}%"))
     if request.args.get("account_id"): q=q.join(AccountingJournalEntry.lines).filter_by(account_id=request.args.get("account_id"))
     if request.args.get("customer_id"): q=q.join(AccountingJournalEntry.lines).filter_by(customer_id=request.args.get("customer_id"))
     if request.args.get("loan_id"): q=q.join(AccountingJournalEntry.lines).filter_by(loan_id=request.args.get("loan_id"))

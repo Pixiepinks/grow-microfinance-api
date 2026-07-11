@@ -5,9 +5,9 @@ from flask_jwt_extended import get_jwt_identity
 
 from ..currency import CURRENCY_CODE, format_currency
 from ..extensions import db
-from ..models import Loan, LoanApplication, Payment, Customer
+from ..models import Loan, LoanApplication, Payment, Customer, AccountingAccount
 from ..loan_ledger import generate_loan_ledger
-from ..accounting import AccountingError, allocate_payment, money, post_loan_payment
+from ..accounting import AccountingError, allocate_payment, money, post_loan_payment, validate_funding_account
 from .loan_applications import (
     STATUS_STAFF_APPROVED,
     STATUS_SUBMITTED,
@@ -46,6 +46,15 @@ def record_payment():
     loan_id = data.get("loan_id")
     payment_method = data.get("payment_method", "Cash")
     remarks = data.get("remarks")
+    transaction_reference = data.get("transaction_reference")
+    receipt_account = None
+    if data.get("receipt_account_id") is not None:
+        try:
+            receipt_account = validate_funding_account(AccountingAccount.query.get(int(data["receipt_account_id"])), payment_method)
+        except (TypeError, ValueError):
+            return jsonify({"message": "receipt_account_id must be a valid account id"}), 400
+        except AccountingError as exc:
+            return jsonify({"message": str(exc)}), 400
 
     if not loan_id:
         return jsonify({"message": "loan_id is required"}), 400
@@ -95,10 +104,12 @@ def record_payment():
             collected_by_id=int(get_jwt_identity()),
             payment_method=payment_method,
             remarks=remarks,
+            transaction_reference=transaction_reference,
+            receipt_account_id=receipt_account.id if receipt_account else None,
         )
         db.session.add(payment)
         db.session.flush()
-        post_loan_payment(payment, int(get_jwt_identity()))
+        post_loan_payment(payment, int(get_jwt_identity()), receipt_account=receipt_account)
         db.session.commit()
     except AccountingError as exc:
         db.session.rollback()
