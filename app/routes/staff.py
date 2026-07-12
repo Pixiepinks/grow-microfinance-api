@@ -187,21 +187,17 @@ def staff_loan_applications():
             .all()
         )
 
-        results = [
-            {
-                "id": app.id,
-                "application_number": app.application_number,
-                "customer_name": app.full_name,
-                "loan_type": app.loan_type,
-                "currency": CURRENCY_CODE,
-                "applied_amount": float(app.applied_amount),
-                "applied_amount_formatted": format_currency(app.applied_amount),
-                "tenure_months": app.tenure_months,
-                "status": app.status,
-                "created_at": app.created_at.isoformat() if app.created_at else None,
-            }
-            for app in applications
-        ]
+        results = []
+        for app in applications:
+            serialized = build_application_response(app)
+            results.append(
+                {
+                    **serialized,
+                    "customer_name": app.full_name,
+                    "currency": CURRENCY_CODE,
+                    "applied_amount_formatted": format_currency(app.applied_amount),
+                }
+            )
 
         response = jsonify(results)
         logger.info("Handled %s %s with status %s", request.method, request.path, 200)
