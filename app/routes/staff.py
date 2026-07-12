@@ -7,7 +7,7 @@ from ..currency import CURRENCY_CODE, format_currency
 from ..extensions import db
 from ..models import Loan, LoanApplication, Payment, Customer, AccountingAccount
 from ..loan_ledger import generate_loan_ledger
-from ..accounting import AccountingError, allocate_payment, money, post_loan_payment, validate_funding_account
+from ..accounting import AccountingError, allocate_payment, money, post_loan_payment, validate_collection_account
 from .loan_applications import (
     STATUS_STAFF_APPROVED,
     STATUS_SUBMITTED,
@@ -44,15 +44,19 @@ def list_customers():
 def record_payment():
     data = request.get_json() or {}
     loan_id = data.get("loan_id")
-    payment_method = data.get("payment_method", "Cash")
+    payment_method = (data.get("collection_method") or data.get("payment_method") or "CASH_OFFICE").upper()
+    if payment_method == "CASH": payment_method = "CASH_OFFICE"
+    if payment_method == "BANK": payment_method = "BANK_TRANSFER"
     remarks = data.get("remarks")
     transaction_reference = data.get("transaction_reference")
     receipt_account = None
-    if data.get("receipt_account_id") is not None:
+    collector_id = data.get("collector_id")
+    account_id = data.get("collection_account_id") or data.get("receipt_account_id")
+    if account_id is not None:
         try:
-            receipt_account = validate_funding_account(AccountingAccount.query.get(int(data["receipt_account_id"])), payment_method)
+            receipt_account = validate_collection_account(AccountingAccount.query.get(int(account_id)), payment_method, collector_id)
         except (TypeError, ValueError):
-            return jsonify({"message": "receipt_account_id must be a valid account id"}), 400
+            return jsonify({"message": "collection_account_id must be a valid account id"}), 400
         except AccountingError as exc:
             return jsonify({"message": str(exc)}), 400
 
@@ -101,11 +105,17 @@ def record_payment():
             penalty_paid=penalty_paid,
             other_fee_paid=other_fee_paid,
             collection_date=collection_date_value,
+            payment_date=collection_date_value,
+            accounting_date=collection_date_value,
             collected_by_id=int(get_jwt_identity()),
+            collector_id=int(collector_id) if collector_id else None,
             payment_method=payment_method,
+            collection_method=payment_method,
             remarks=remarks,
             transaction_reference=transaction_reference,
             receipt_account_id=receipt_account.id if receipt_account else None,
+            collection_account_id=receipt_account.id if receipt_account else None,
+            bank_reference=transaction_reference,
         )
         db.session.add(payment)
         db.session.flush()

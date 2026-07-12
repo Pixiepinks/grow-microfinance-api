@@ -16,8 +16,11 @@ from ..models import (
     LoanLedger,
     Payment,
     User,
+    AccountingAccount,
+    AccountingJournalLine,
+    CollectionDepositBatch,
 )
-from ..accounting import post_loan_disbursement, AccountingError, accrue_due_loan_interest, reverse_payment, reverse_loan_disbursement, money as acct_money
+from ..accounting import post_loan_disbursement, AccountingError, accrue_due_loan_interest, reverse_payment, reverse_loan_disbursement, money as acct_money, preview_collection_deposit, create_collection_deposit, reverse_collection_deposit, collector_cash_position, account_subtype
 from ..loan_ledger import (
     daily_interest_rate,
     generate_loan_ledger,
@@ -529,3 +532,114 @@ def admin_reverse_disbursement(loan_id):
         return jsonify(result)
     except AccountingError as exc:
         db.session.rollback(); return jsonify({"message": str(exc)}), 422
+
+
+def _payment_summary(p):
+    loan = p.loan
+    return {
+        "payment_id": p.id,
+        "receipt_number": p.receipt_number,
+        "customer": loan.customer.full_name if loan and loan.customer else None,
+        "customer_id": loan.customer_id if loan else None,
+        "loan_id": p.loan_id,
+        "loan_number": loan.loan_number if loan else None,
+        "payment_date": (p.payment_date or p.collection_date).isoformat() if (p.payment_date or p.collection_date) else None,
+        "amount_collected": f"{acct_money(p.amount_collected):.2f}",
+        "amount_already_deposited": f"{acct_money(p.deposited_amount):.2f}",
+        "undeposited_amount": f"{acct_money(p.undeposited_amount):.2f}",
+        "deposit_status": p.deposit_status,
+        "collection_account": p.collection_account.account_name if p.collection_account else None,
+        "collection_account_id": p.collection_account_id,
+    }
+
+
+@admin_bp.route("/collections/undeposited", methods=["GET"])
+@role_required(["admin"])
+def undeposited_collections():
+    q = Payment.query.options(joinedload(Payment.loan).joinedload(Loan.customer)).filter(Payment.reversed_at.is_(None), Payment.deposit_status.in_(["UNDEPOSITED", "PARTIALLY_DEPOSITED"]))
+    if request.args.get("collector_id"): q = q.filter(Payment.collector_id == int(request.args["collector_id"]))
+    if request.args.get("account_id"): q = q.filter(Payment.collection_account_id == int(request.args["account_id"]))
+    if request.args.get("loan_id"): q = q.filter(Payment.loan_id == int(request.args["loan_id"]))
+    if request.args.get("customer_id"): q = q.join(Loan).filter(Loan.customer_id == int(request.args["customer_id"]))
+    if request.args.get("date_from"): q = q.filter(Payment.collection_date >= date.fromisoformat(request.args["date_from"]))
+    if request.args.get("date_to"): q = q.filter(Payment.collection_date <= date.fromisoformat(request.args["date_to"]))
+    if request.args.get("deposit_status"): q = q.filter(Payment.deposit_status == request.args["deposit_status"])
+    return jsonify({"items": [_payment_summary(p) for p in q.order_by(Payment.collection_date, Payment.id).all()]})
+
+
+@admin_bp.route("/collection-deposits/preview", methods=["POST"])
+@role_required(["admin"])
+def preview_deposit():
+    try:
+        result = preview_collection_deposit(request.get_json() or {})
+        return jsonify({"total_amount": f"{result['total_amount']:.2f}", "journal_preview": result["journal_preview"], "validation_errors": result["validation_errors"]})
+    except AccountingError as exc:
+        return jsonify({"message": str(exc)}), 422
+
+
+def _deposit_dict(b):
+    return {"id": b.id, "deposit_number": b.deposit_number, "collector_id": b.collector_id, "collector": b.collector.name if b.collector else None, "collector_account_id": b.collector_account_id, "collector_account": b.collector_account.account_name if b.collector_account else None, "bank_account_id": b.bank_account_id, "bank_account": b.bank_account.account_name if b.bank_account else None, "deposit_date": b.deposit_date.isoformat(), "accounting_date": b.accounting_date.isoformat(), "total_amount": f"{acct_money(b.total_amount):.2f}", "bank_reference": b.bank_reference, "deposit_slip_reference": b.deposit_slip_reference, "remarks": b.remarks, "journal_entry_id": b.journal_entry_id, "status": b.status, "allocations": [{"payment_id": a.payment_id, "allocated_amount": f"{acct_money(a.allocated_amount):.2f}"} for a in b.allocations]}
+
+
+@admin_bp.route("/collection-deposits", methods=["POST"])
+@role_required(["admin"])
+def create_deposit():
+    try:
+        batch = create_collection_deposit(request.get_json() or {}, int(get_jwt_identity()))
+        db.session.commit()
+        return jsonify(_deposit_dict(batch)), 201
+    except AccountingError as exc:
+        db.session.rollback()
+        return jsonify(exc.args[0] if exc.args and isinstance(exc.args[0], dict) else {"message": str(exc)}), 422
+
+
+@admin_bp.route("/collection-deposits", methods=["GET"])
+@role_required(["admin"])
+def list_deposits():
+    q = CollectionDepositBatch.query
+    if request.args.get("collector_id"): q = q.filter_by(collector_id=int(request.args["collector_id"]))
+    if request.args.get("status"): q = q.filter_by(status=request.args["status"])
+    if request.args.get("date_from"): q = q.filter(CollectionDepositBatch.deposit_date >= date.fromisoformat(request.args["date_from"]))
+    if request.args.get("date_to"): q = q.filter(CollectionDepositBatch.deposit_date <= date.fromisoformat(request.args["date_to"]))
+    return jsonify({"items": [_deposit_dict(b) for b in q.order_by(CollectionDepositBatch.deposit_date.desc(), CollectionDepositBatch.id.desc()).all()]})
+
+
+@admin_bp.route("/collection-deposits/<int:deposit_id>", methods=["GET"])
+@role_required(["admin"])
+def get_deposit(deposit_id):
+    return jsonify(_deposit_dict(CollectionDepositBatch.query.get_or_404(deposit_id)))
+
+
+@admin_bp.route("/collection-deposits/<int:deposit_id>/reverse", methods=["POST"])
+@role_required(["admin"])
+def reverse_deposit(deposit_id):
+    data = request.get_json() or {}
+    try:
+        rev = reverse_collection_deposit(CollectionDepositBatch.query.get_or_404(deposit_id), date.fromisoformat(data.get("reversal_date") or date.today().isoformat()), data.get("reason"), int(get_jwt_identity()))
+        db.session.commit()
+        return jsonify({"reversal_journal_id": rev.id})
+    except AccountingError as exc:
+        db.session.rollback(); return jsonify({"message": str(exc)}), 422
+
+
+@admin_bp.route("/collectors/<int:collector_id>/cash-position", methods=["GET"])
+@role_required(["admin"])
+def collector_position(collector_id):
+    as_of = date.fromisoformat(request.args["as_of_date"]) if request.args.get("as_of_date") else None
+    pos = collector_cash_position(collector_id, as_of); collector = User.query.get_or_404(collector_id)
+    return jsonify({"collector": collector.name, "opening_balance": "0.00", "collections": f"{pos['collections']:.2f}", "deposits": f"{pos['deposits']:.2f}", "adjustments": "0.00", "closing_balance": f"{pos['closing_balance']:.2f}", "undeposited_payments": [_payment_summary(p) for p in pos["undeposited_payments"]]})
+
+
+@admin_bp.route("/collections/reconciliation", methods=["GET"])
+@role_required(["admin"])
+def collections_reconciliation():
+    accounts = AccountingAccount.query.filter_by(is_collection_account=True).all()
+    items=[]
+    for acct in accounts:
+        deb = db.session.query(db.func.coalesce(db.func.sum(AccountingJournalLine.debit), 0)).filter_by(account_id=acct.id).scalar()
+        cre = db.session.query(db.func.coalesce(db.func.sum(AccountingJournalLine.credit), 0)).filter_by(account_id=acct.id).scalar()
+        gl = acct_money(deb) - acct_money(cre)
+        pos = collector_cash_position(acct.collector_id) if acct.collector_id else {"closing_balance": acct_money(0)}
+        sub = acct_money(pos["closing_balance"])
+        items.append({"collector_id": acct.collector_id, "collector": acct.collector.name if acct.collector else None, "account_id": acct.id, "account": acct.account_name, "gl_collection_account_balance": f"{gl:.2f}", "collector_subledger_balance": f"{sub:.2f}", "difference": f"{acct_money(gl-sub):.2f}"})
+    return jsonify({"items": items})

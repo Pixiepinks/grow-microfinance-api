@@ -28,11 +28,14 @@ from .models import (
 CENT = Decimal("0.01")
 ACCOUNT_TYPES = {"ASSET", "LIABILITY", "EQUITY", "INCOME", "EXPENSE"}
 NORMAL_BALANCES = {"DEBIT", "CREDIT"}
-ACCOUNT_SUBTYPES = {"CASH", "BANK", "LOAN_RECEIVABLE", "INTEREST_RECEIVABLE", "PENALTY_RECEIVABLE", "OTHER_CURRENT_ASSET", "FIXED_ASSET", "ACCOUNTS_PAYABLE", "BORROWING", "CAPITAL", "RETAINED_EARNINGS", "INTEREST_INCOME", "PENALTY_INCOME", "FEE_INCOME", "OPERATING_EXPENSE", "WRITE_OFF_EXPENSE", "SUSPENSE", "OTHER"}
+ACCOUNT_SUBTYPES = {"CASH", "BANK", "COLLECTION_CLEARING", "LOAN_RECEIVABLE", "INTEREST_RECEIVABLE", "PENALTY_RECEIVABLE", "OTHER_CURRENT_ASSET", "FIXED_ASSET", "ACCOUNTS_PAYABLE", "BORROWING", "CAPITAL", "RETAINED_EARNINGS", "INTEREST_INCOME", "PENALTY_INCOME", "FEE_INCOME", "OPERATING_EXPENSE", "WRITE_OFF_EXPENSE", "SUSPENSE", "OTHER"}
 SYSTEM_MAPPINGS = {
     "DEFAULT_DISBURSEMENT_ACCOUNT": "1010",
     "DEFAULT_CASH_COLLECTION_ACCOUNT": "1000",
     "DEFAULT_BANK_COLLECTION_ACCOUNT": "1010",
+    "default_cash_on_hand_account": "1000",
+    "default_bank_account": "1010",
+    "collector_clearing_control_account": "1050",
     "CASH_ACCOUNT": "1000",
     "BANK_ACCOUNT": "1010",
     "LOAN_RECEIVABLE_ACCOUNT": "1100",
@@ -55,6 +58,7 @@ SYSTEM_MAPPINGS = {
 DEFAULT_ACCOUNTS = [
     ("1000", "Cash on Hand", "ASSET", "DEBIT", True, "CASH"),
     ("1010", "Main Bank Account", "ASSET", "DEBIT", True, "BANK"),
+    ("1050", "Collector Cash Clearing – Control", "ASSET", "DEBIT", True, "COLLECTION_CLEARING"),
     ("1100", "Loan Principal Receivable", "ASSET", "DEBIT", True, "LOAN_RECEIVABLE"),
     ("1110", "Interest Receivable", "ASSET", "DEBIT", True, "INTEREST_RECEIVABLE"),
     ("1120", "Penalty Receivable", "ASSET", "DEBIT", True, "PENALTY_RECEIVABLE"),
@@ -77,6 +81,9 @@ SETTING_VALIDATION = {
     "DEFAULT_DISBURSEMENT_ACCOUNT": ({"ASSET"}, {"CASH", "BANK"}),
     "DEFAULT_CASH_COLLECTION_ACCOUNT": ({"ASSET"}, {"CASH"}),
     "DEFAULT_BANK_COLLECTION_ACCOUNT": ({"ASSET"}, {"BANK"}),
+    "default_cash_on_hand_account": ({"ASSET"}, {"CASH"}),
+    "default_bank_account": ({"ASSET"}, {"BANK"}),
+    "collector_clearing_control_account": ({"ASSET"}, {"COLLECTION_CLEARING"}),
     "LOAN_RECEIVABLE_ACCOUNT": ({"ASSET"}, {"LOAN_RECEIVABLE"}),
     "INTEREST_RECEIVABLE_ACCOUNT": ({"ASSET"}, {"INTEREST_RECEIVABLE"}),
     "PENALTY_RECEIVABLE_ACCOUNT": ({"ASSET"}, {"PENALTY_RECEIVABLE"}),
@@ -156,12 +163,27 @@ def create_account(data, user_id=None):
         parent = AccountingAccount.query.get(parent_id)
         if not parent or parent.account_type != typ:
             raise AccountingError("Parent account type is incompatible")
-    acct = AccountingAccount(account_code=data["account_code"], account_name=data["account_name"], account_type=typ, normal_balance=normal, parent_id=parent_id, description=data.get("description"), is_active=data.get("is_active", True), allow_manual_posting=data.get("allow_manual_posting", True), cash_flow_category=data.get("cash_flow_category", "NONE"))
+    subtype = data.get("account_subtype") or data.get("subtype") or "OTHER"
+    is_collection = bool(data.get("is_collection_account")) or subtype == "COLLECTION_CLEARING"
+    collector_id = data.get("collector_id")
+    if is_collection:
+        if typ != "ASSET" or normal != "DEBIT":
+            raise AccountingError("Collector collection accounts must be debit ASSET accounts")
+        subtype = "COLLECTION_CLEARING"
+        if collector_id and AccountingAccount.query.filter_by(collector_id=int(collector_id), is_collection_account=True, is_active=True).first():
+            raise AccountingError("Only one active default collection account is allowed per collector")
+    acct = AccountingAccount(account_code=data["account_code"], account_name=data["account_name"], account_type=typ, normal_balance=normal, parent_id=parent_id, parent_account_id=data.get("parent_account_id"), collector_id=collector_id, is_collection_account=is_collection, account_role=data.get("account_role"), account_subtype=subtype, description=data.get("description"), is_active=data.get("is_active", True), allow_manual_posting=data.get("allow_manual_posting", True), cash_flow_category=data.get("cash_flow_category", "NONE"))
     db.session.add(acct); db.session.flush(); log_audit("ACCOUNT_CREATE", "AccountingAccount", acct.id, user_id); return acct
 
 def update_account(acct, data, user_id=None):
-    for field in ["account_name", "description", "is_active", "allow_manual_posting", "cash_flow_category"]:
+    for field in ["account_name", "description", "is_active", "allow_manual_posting", "cash_flow_category", "account_role", "parent_account_id"]:
         if field in data: setattr(acct, field, data[field])
+    if "collector_id" in data: acct.collector_id = data["collector_id"]
+    if "is_collection_account" in data or data.get("account_subtype") == "COLLECTION_CLEARING":
+        acct.is_collection_account = bool(data.get("is_collection_account", acct.is_collection_account)) or data.get("account_subtype") == "COLLECTION_CLEARING"
+        if acct.is_collection_account:
+            if acct.account_type != "ASSET" or acct.normal_balance != "DEBIT": raise AccountingError("Collector collection accounts must be debit ASSET accounts")
+            acct.account_subtype = "COLLECTION_CLEARING"
     log_audit("ACCOUNT_UPDATE", "AccountingAccount", acct.id, user_id); return acct
 
 def _line_from_payload(raw, line_no):
@@ -980,3 +1002,160 @@ def post_loan_disbursement(loan, user_id=None, funding_key="DEFAULT_DISBURSEMENT
         as_of = min(date.today(), loan.maturity_date or loan.end_date or date.today())
         accrue_due_loan_interest(as_of, loan.id, historical=True, requested_by=user_id)
     return posted
+
+# Collector collection accounting
+COLLECTION_METHODS = {"CASH_COLLECTOR", "BANK_TRANSFER", "CASH_OFFICE", "CHEQUE", "MOBILE_TRANSFER", "OTHER"}
+COLLECTOR_DEPOSIT_STATUSES = {"NOT_APPLICABLE", "UNDEPOSITED", "PARTIALLY_DEPOSITED", "DEPOSITED", "REVERSED"}
+
+
+def _number(prefix, model, field, for_date):
+    stem = f"{prefix}-{for_date:%Y%m%d}-"
+    try:
+        db.session.execute(text("select pg_advisory_xact_lock(hashtext(:p))"), {"p": stem})
+    except Exception:
+        pass
+    last = db.session.query(func.max(getattr(model, field))).filter(getattr(model, field).like(stem + "%")).scalar()
+    return f"{stem}{(int(last.rsplit('-', 1)[1]) + 1 if last else 1):04d}"
+
+
+def generate_receipt_number(payment_date):
+    return _number("GROW-RCPT", Payment, "receipt_number", payment_date)
+
+
+def generate_deposit_number(deposit_date):
+    from .models import CollectionDepositBatch
+    return _number("GROW-DEP", CollectionDepositBatch, "deposit_number", deposit_date)
+
+
+def validate_collection_account(account, method, collector_id=None):
+    if not account or not account.is_active:
+        raise AccountingError("Collection account is inactive or missing")
+    subtype = account_subtype(account)
+    if method == "BANK_TRANSFER" and subtype != "BANK":
+        raise AccountingError("BANK_TRANSFER requires a bank collection account")
+    if method == "CASH_OFFICE" and subtype != "CASH":
+        raise AccountingError("CASH_OFFICE requires a Cash on Hand account")
+    if method == "CASH_COLLECTOR":
+        if not collector_id:
+            raise AccountingError("collector_id is required for CASH_COLLECTOR")
+        if account.account_type != "ASSET" or account.normal_balance != "DEBIT" or subtype != "COLLECTION_CLEARING" or not account.is_collection_account:
+            raise AccountingError("CASH_COLLECTOR requires a debit asset COLLECTION_CLEARING account")
+        if account.collector_id != int(collector_id):
+            raise AccountingError("Collection account is not linked to the collector")
+    return account
+
+
+def validate_funding_account(account, *_args):
+    if not account:
+        raise AccountingError("Funding account not found")
+    if getattr(account, "is_collection_account", False) or account_subtype(account) == "COLLECTION_CLEARING":
+        raise AccountingError("Collection clearing accounts cannot fund loans")
+    if not account.is_active:
+        raise AccountingError("Funding account is inactive")
+    if account.account_type != "ASSET":
+        raise AccountingError("Funding account must be an ASSET account")
+    if account_subtype(account) not in ("CASH", "BANK"):
+        raise AccountingError("Funding account must be configured as CASH or BANK")
+    if not account.allow_manual_posting:
+        raise AccountingError("Funding account does not allow posting")
+    return account
+
+
+def post_loan_payment(payment, user_id=None, receipt_account=None):
+    existing = AccountingJournalEntry.query.filter_by(idempotency_key=f"LOAN_PAYMENT:{payment.id}").first()
+    if existing: return existing
+    total = money(payment.amount_collected); principal=money(payment.principal_paid); interest=money(payment.interest_paid); penalty=money(payment.penalty_paid); other=money(payment.other_fee_paid)
+    if money(principal+interest+penalty+other) != total: raise AccountingError("Payment allocation does not match amount collected")
+    method = (payment.collection_method or payment.payment_method or "CASH_OFFICE").upper()
+    if method == "CASH": method = "CASH_OFFICE"
+    if method == "BANK": method = "BANK_TRANSFER"
+    pay_date = payment.accounting_date or payment.payment_date or payment.collection_date
+    require_open_accounting_period(pay_date)
+    loan = payment.loan
+    if pay_date < loan.start_date:
+        raise AccountingError("Payment date cannot be before loan disbursement date")
+    receipt_account = validate_collection_account(receipt_account or payment.collection_account or resolve_system_account("DEFAULT_CASH_COLLECTION_ACCOUNT" if method == "CASH_OFFICE" else "DEFAULT_BANK_COLLECTION_ACCOUNT"), method, payment.collector_id)
+    lines=[{"account_id": receipt_account.id, "debit": total, "customer_id": loan.customer_id, "loan_id": loan.id, "payment_id": payment.id}]
+    acct_method = getattr(loan, "interest_accounting_method", LOAN_ACCRUAL_METHOD)
+    for key, amt in [("DELAY_INTEREST_RECEIVABLE" if acct_method == LOAN_ACCRUAL_METHOD else "DELAY_INTEREST_INCOME", penalty), ("INTEREST_RECEIVABLE" if acct_method == LOAN_ACCRUAL_METHOD else "LOAN_INTEREST_INCOME", interest), ("LOAN_PRINCIPAL_RECEIVABLE", principal), ("UNAPPLIED_CUSTOMER_FUNDS", other)]:
+        if amt > 0: lines.append({"account_id": resolve_system_account(key).id, "credit": amt, "customer_id": loan.customer_id, "loan_id": loan.id, "payment_id": payment.id})
+    entry = create_draft_journal(pay_date, "Loan payment", lines, "LOAN_PAYMENT", payment.id, "PAYMENTS", user_id, f"LOAN_PAYMENT:{payment.id}")
+    entry.loan_id = loan.id; entry.customer_id = loan.customer_id; entry.accounting_date = pay_date
+    posted = post_journal(entry, user_id)
+    payment.journal_id = posted.id; payment.payment_date = pay_date; payment.accounting_date = pay_date
+    payment.collection_method = method; payment.collection_account_id = receipt_account.id
+    payment.receipt_number = payment.receipt_number or generate_receipt_number(pay_date)
+    payment.bank_reference = payment.bank_reference or payment.transaction_reference
+    payment.deposit_status = "UNDEPOSITED" if method == "CASH_COLLECTOR" else "NOT_APPLICABLE"
+    for ledger, typ, amt in getattr(loan, "_pending_allocations", []):
+        db.session.add(PaymentAllocation(payment_id=payment.id, loan_id=loan.id, ledger_id=ledger.id if ledger else None, allocation_type=typ, amount=money(amt)))
+    return posted
+
+
+def _payment_deposit_status(payment):
+    if payment.reversed_at: return "REVERSED"
+    if (payment.collection_method or "").upper() != "CASH_COLLECTOR": return "NOT_APPLICABLE"
+    dep = money(payment.deposited_amount)
+    amt = money(payment.amount_collected)
+    return "UNDEPOSITED" if dep == 0 else "DEPOSITED" if dep >= amt else "PARTIALLY_DEPOSITED"
+
+
+def collector_cash_position(collector_id, as_of_date=None):
+    q = Payment.query.filter(Payment.collector_id == collector_id, Payment.reversed_at.is_(None), Payment.deposit_status != "NOT_APPLICABLE")
+    if as_of_date: q = q.filter(Payment.collection_date <= as_of_date)
+    payments = q.all(); collections=sum((money(p.amount_collected) for p in payments), Decimal("0.00")); deposits=sum((money(p.deposited_amount) for p in payments), Decimal("0.00"))
+    return {"collections": money(collections), "deposits": money(deposits), "adjustments": Decimal("0.00"), "closing_balance": money(collections-deposits), "undeposited_payments": [p for p in payments if money(p.undeposited_amount) > 0]}
+
+
+def preview_collection_deposit(data):
+    collector_id = int(data["collector_id"]); collector_account = AccountingAccount.query.get(int(data["collector_account_id"])); bank = AccountingAccount.query.get(int(data["bank_account_id"]))
+    validate_collection_account(collector_account, "CASH_COLLECTOR", collector_id)
+    if not bank or account_subtype(bank) != "BANK": raise AccountingError("bank_account_id must be an active bank account")
+    deposit_date = date.fromisoformat(data.get("deposit_date") or date.today().isoformat()); require_open_accounting_period(deposit_date)
+    seen=set(); total=Decimal("0.00"); errors=[]; rows=[]
+    for raw in data.get("allocations") or []:
+        pid=int(raw["payment_id"]); amt=money(raw.get("amount"))
+        if pid in seen: errors.append({"payment_id": pid, "message": "Duplicate deposit allocation"}); continue
+        seen.add(pid); p=Payment.query.get(pid)
+        if not p or p.collector_id != collector_id or p.collection_account_id != collector_account.id: errors.append({"payment_id": pid, "message": "Payment not eligible for this collector/account"}); continue
+        if p.reversed_at or p.deposit_status in ("NOT_APPLICABLE", "REVERSED"): errors.append({"payment_id": pid, "message": "Payment is not depositable"}); continue
+        if deposit_date < (p.accounting_date or p.collection_date): errors.append({"payment_id": pid, "message": "Deposit date cannot precede payment date"}); continue
+        if amt <= 0 or amt > money(p.undeposited_amount): errors.append({"payment_id": pid, "message": "Allocation exceeds undeposited amount"}); continue
+        total += amt; rows.append((p, amt))
+    return {"collector_account": collector_account, "bank_account": bank, "deposit_date": deposit_date, "total_amount": money(total), "rows": rows, "validation_errors": errors, "journal_preview": {"debit_account": bank.account_name, "credit_account": collector_account.account_name, "amount": f"{money(total):.2f}"}}
+
+
+def create_collection_deposit(data, user_id=None):
+    from .models import CollectionDepositBatch, CollectionDepositAllocation
+    preview = preview_collection_deposit(data)
+    if preview["validation_errors"]: raise AccountingError({"validation_errors": preview["validation_errors"]})
+    total = preview["total_amount"]
+    if total <= 0: raise AccountingError("Deposit allocations are required")
+    batch = CollectionDepositBatch(deposit_number=generate_deposit_number(preview["deposit_date"]), collector_id=int(data["collector_id"]), collector_account_id=preview["collector_account"].id, bank_account_id=preview["bank_account"].id, deposit_date=preview["deposit_date"], accounting_date=preview["deposit_date"], total_amount=total, bank_reference=data.get("bank_reference"), deposit_slip_reference=data.get("deposit_slip_reference"), remarks=data.get("remarks"), created_by=user_id, status="POSTED")
+    db.session.add(batch); db.session.flush()
+    for p, amt in preview["rows"]:
+        db.session.add(CollectionDepositAllocation(deposit_batch_id=batch.id, payment_id=p.id, allocated_amount=amt)); p.deposited_amount=money(Decimal(p.deposited_amount or 0)+amt); p.deposit_status=_payment_deposit_status(p)
+    entry=create_draft_journal(batch.accounting_date, f"Collector deposit {batch.deposit_number}", [{"account_id": batch.bank_account_id, "debit": total}, {"account_id": batch.collector_account_id, "credit": total}], "COLLECTION_DEPOSIT", batch.id, "COLLECTIONS", user_id, f"COLLECTION_DEPOSIT:{batch.id}")
+    posted=post_journal(entry, user_id); batch.journal_entry_id=posted.id; log_audit("COLLECTION_DEPOSIT_POST", "CollectionDepositBatch", batch.id, user_id)
+    return batch
+
+
+def reverse_collection_deposit(batch, reversal_date, reason, user_id=None):
+    if not reason: raise AccountingError("Reversal reason is required")
+    if batch.status != "POSTED": raise AccountingError("Only POSTED collection deposits can be reversed")
+    require_open_accounting_period(reversal_date)
+    entry=AccountingJournalEntry.query.get(batch.journal_entry_id)
+    rev=reverse_journal(entry, reversal_date, reason, user_id)
+    for alloc in batch.allocations:
+        p=alloc.payment; p.deposited_amount=money(Decimal(p.deposited_amount or 0)-Decimal(alloc.allocated_amount)); p.deposit_status=_payment_deposit_status(p)
+    batch.status="REVERSED"; batch.reversed_at=datetime.utcnow(); batch.reversal_reason=reason; batch.reversal_journal_id=rev.id; log_audit("COLLECTION_DEPOSIT_REVERSE", "CollectionDepositBatch", batch.id, user_id, reason)
+    return rev
+
+_old_reverse_payment_impl = reverse_payment
+
+def reverse_payment(payment, reversal_date, reason, user_id=None):
+    if money(getattr(payment, "deposited_amount", 0)) > 0:
+        raise AccountingError("Cannot reverse a payment already included in a posted deposit batch; reverse the deposit first")
+    rev = _old_reverse_payment_impl(payment, reversal_date, reason, user_id)
+    payment.status = "REVERSED"; payment.deposit_status = "REVERSED"; payment.reversed_by = user_id
+    return rev
