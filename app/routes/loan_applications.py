@@ -101,12 +101,80 @@ def _validate_and_calculate_terms(data: dict, *, allow_legacy: bool = False, sta
             "interest_type": "FLAT", "interest_rate_basis": interest_rate_basis,
             "total_days": resolved.total_days, "maturity_date": resolved.maturity_date}, []
 
+
+
+def _normalized_application_term_payload(data: dict, customer_id=None) -> tuple[dict | None, list[str], list[str]]:
+    payload = dict(data or {})
+    if customer_id is not None:
+        payload["customer_id"] = customer_id
+
+    missing = []
+    term_type_present = payload.get("term_type") not in (None, "")
+    if not term_type_present:
+        if payload.get("loan_days") not in (None, ""):
+            payload["term_type"] = "DAYS"
+            payload["term_value"] = payload.get("loan_days")
+        elif payload.get("tenure_months") not in (None, ""):
+            payload["term_type"] = "MONTHS"
+            payload["term_value"] = payload.get("tenure_months")
+
+    for field in NEW_APPLICATION_TERM_REQUIRED_FIELDS:
+        if payload.get(field) in (None, ""):
+            missing.append(field)
+    if missing:
+        return None, missing, []
+
+    term_payload = {
+        "approved_amount": payload.get("applied_amount"),
+        "term_type": payload.get("term_type"),
+        "term_value": payload.get("term_value"),
+        "loan_days": payload.get("loan_days"),
+        "tenure_months": payload.get("tenure_months"),
+        "repayment_frequency": payload.get("repayment_frequency"),
+        "interest_rate": payload.get("interest_rate"),
+        "interest_rate_basis": payload.get("interest_rate_basis"),
+        "interest_type": payload.get("interest_type"),
+    }
+    terms, errors = _validate_and_calculate_terms(term_payload, allow_legacy=True)
+    return terms, [], errors
+
+
+def _apply_calculated_terms(application: LoanApplication, terms: dict, *, set_approved_amount: bool = False):
+    for field in [
+        "term_type",
+        "term_value",
+        "loan_days",
+        "tenure_months",
+        "repayment_frequency",
+        "number_of_installments",
+        "installment_count",
+        "installment_amount",
+        "total_repayment",
+        "total_interest",
+        "interest_rate",
+        "interest_type",
+        "interest_rate_basis",
+    ]:
+        value = terms.get(field)
+        if field == "tenure_months" and value is None and isinstance(application, LoanApplication):
+            value = 0
+        setattr(application, field, value)
+    if set_approved_amount:
+        application.approved_amount = terms.get("approved_amount")
+
+
+def _term_display(application: LoanApplication):
+    if not application.term_type or application.term_value is None:
+        return None
+    unit = "days" if application.term_type == "DAYS" else "months"
+    return f"{application.term_value} {unit}"
+
 def _application_terms(application):
     return {k: getattr(application, k, None) for k in ["approved_amount", "term_type", "term_value", "loan_days", "tenure_months", "repayment_frequency", "number_of_installments", "installment_amount", "total_repayment", "total_interest", "interest_rate", "interest_type", "interest_rate_basis"]}
 
 
 def _missing_disbursement_term_fields(application):
-    required = ["approved_amount", "term_type", "term_value", "repayment_frequency", "interest_rate", "interest_rate_basis"]
+    required = ["approved_amount", "term_type", "term_value", "repayment_frequency", "installment_count", "interest_rate", "interest_rate_basis"]
     return [field for field in required if getattr(application, field, None) is None]
 
 
@@ -129,9 +197,18 @@ COMMON_REQUIRED_FIELDS = [
     "mobile_number",
     "loan_type",
     "applied_amount",
-    "tenure_months",
     "monthly_income",
     "monthly_expenses",
+]
+
+NEW_APPLICATION_TERM_REQUIRED_FIELDS = [
+    "customer_id",
+    "applied_amount",
+    "term_type",
+    "term_value",
+    "repayment_frequency",
+    "interest_rate",
+    "interest_rate_basis",
 ]
 
 TYPE_REQUIRED_FIELDS: Dict[str, List[str]] = {
@@ -329,7 +406,7 @@ def validate_application_payload(data: dict, loan_type: str) -> List[str]:
     if parse_decimal(data.get("monthly_expenses")) is None:
         errors.append("monthly_expenses must be a number")
 
-    if parse_int(data.get("tenure_months")) is None:
+    if data.get("tenure_months") not in (None, "") and parse_int(data.get("tenure_months")) is None:
         errors.append("tenure_months must be a number")
 
     for field in TYPE_REQUIRED_FIELDS.get(loan_type, []):
@@ -385,7 +462,8 @@ def build_application_response(application: LoanApplication) -> dict:
             if application.applied_amount is not None
             else None
         ),
-        "tenure_months": application.tenure_months,
+        "tenure_months": None if application.term_type == "DAYS" else application.tenure_months,
+        "term_display": _term_display(application),
         "interest_rate": (
             float(application.interest_rate)
             if application.interest_rate is not None
@@ -410,6 +488,7 @@ def build_application_response(application: LoanApplication) -> dict:
         "installment_count": application.installment_count,
         "installment_amount": _decimal_to_float(application.installment_amount),
         "total_repayment": _decimal_to_float(application.total_repayment),
+        "total_payable": _decimal_to_float(application.total_repayment),
         "total_interest": _decimal_to_float(application.total_interest),
         "interest_type": application.interest_type,
         "interest_rate_basis": application.interest_rate_basis,
@@ -455,6 +534,7 @@ def build_application_response(application: LoanApplication) -> dict:
         ),
         "has_existing_loans": application.has_existing_loans,
         "existing_loan_details": application.existing_loan_details,
+        "loan_purpose": (application.extra_data or {}).get("loan_purpose"),
         "extra_data": application.extra_data or {},
         "documents": [
             {
@@ -510,6 +590,7 @@ def apply_status_transition(
     return None
 
 
+@admin_api_bp.route("/loan-applications", methods=["POST"])
 @loan_app_bp.route("", methods=["POST"])
 @role_required(["customer", "admin", "staff"])
 def create_application():
@@ -540,8 +621,18 @@ def create_application():
             400,
         )
 
+    data["customer_id"] = customer_id
     loan_type = data.get("loan_type")
     type_data = collect_type_specific_data(loan_type, data)
+    if data.get("loan_purpose") not in (None, ""):
+        type_data["loan_purpose"] = data.get("loan_purpose")
+
+    terms, missing_term_fields, term_errors = _normalized_application_term_payload(data, customer_id)
+    if missing_term_fields:
+        return jsonify({"error": "Loan application validation failed", "missing_fields": missing_term_fields}), 422
+    if term_errors:
+        return jsonify({"error": "Loan application validation failed", "errors": term_errors}), 422
+
     validation_errors = validate_application_payload(
         {**data, **type_data, "loan_type": loan_type}, loan_type
     )
@@ -563,8 +654,8 @@ def create_application():
         loan_type=loan_type,
         status=initial_status,
         applied_amount=parse_decimal(data.get("applied_amount")) or Decimal("0"),
-        tenure_months=parse_int(data.get("tenure_months"), 0) or 0,
-        interest_rate=parse_decimal(data.get("interest_rate")),
+        tenure_months=terms["tenure_months"] or 0,
+        interest_rate=terms["interest_rate"],
         full_name=data.get("full_name"),
         nic_number=data.get("nic_number"),
         mobile_number=data.get("mobile_number"),
@@ -584,8 +675,14 @@ def create_application():
         submitted_at=datetime.utcnow() if initial_status == STATUS_SUBMITTED else None,
     )
 
-    db.session.add(application)
-    db.session.commit()
+    _apply_calculated_terms(application, terms)
+
+    try:
+        db.session.add(application)
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        raise
 
     return jsonify(build_application_response(application)), 201
 
@@ -607,6 +704,8 @@ def update_application(application_id):
     data = normalize_application_payload(request.get_json() or {})
     loan_type = data.get("loan_type", application.loan_type)
     type_data = collect_type_specific_data(loan_type, data)
+    if data.get("loan_purpose") not in (None, ""):
+        type_data["loan_purpose"] = data.get("loan_purpose")
 
     current_payload = build_application_response(application)
     validation_source = {**current_payload, **data, **type_data, "loan_type": loan_type}
@@ -648,7 +747,16 @@ def update_application(application_id):
     if "monthly_expenses" in data:
         application.monthly_expenses = parse_decimal(data.get("monthly_expenses"))
 
-    if "tenure_months" in data:
+    term_fields = {"term_type", "term_value", "loan_days", "tenure_months", "repayment_frequency", "interest_rate", "interest_rate_basis", "interest_type", "applied_amount"}
+    if any(field in data for field in term_fields):
+        term_source = {**build_application_response(application), **data}
+        terms, missing_term_fields, term_errors = _normalized_application_term_payload(term_source, application.customer_id)
+        if missing_term_fields:
+            return jsonify({"error": "Loan application validation failed", "missing_fields": missing_term_fields}), 422
+        if term_errors:
+            return jsonify({"error": "Loan application validation failed", "errors": term_errors}), 422
+        _apply_calculated_terms(application, terms)
+    elif "tenure_months" in data:
         application.tenure_months = parse_int(
             data.get("tenure_months"), application.tenure_months
         )
@@ -1005,7 +1113,7 @@ def approve_application(application_id):
         else:
             terms, errors = _validate_and_calculate_terms(data)
             if errors:
-                return jsonify({"message": "Validation failed", "errors": errors}), 400
+                return jsonify({"error": "Loan application validation failed", "errors": errors}), 422
             for field, value in terms.items():
                 if field not in {"total_payable", "total_days", "maturity_date"} and not (field == "tenure_months" and value is None):
                     setattr(application, field, value)

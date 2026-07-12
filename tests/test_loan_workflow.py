@@ -54,7 +54,13 @@ def _sample_application_payload():
         "nic_number": "123456789V",
         "mobile_number": "0700000000",
         "applied_amount": "10000",
-        "tenure_months": 6,
+        "term_type": "DAYS",
+        "term_value": 63,
+        "loan_days": 63,
+        "repayment_frequency": "WEEKLY",
+        "interest_rate": 26,
+        "interest_rate_basis": "FLAT_TERM",
+        "loan_purpose": "Education",
         "monthly_income": "50000",
         "monthly_expenses": "10000",
         "business_name": "Jane's Shop",
@@ -79,6 +85,63 @@ def test_customer_submission_sets_submitted_status(app, client):
     assert body["status"] == STATUS_SUBMITTED
     assert body["submitted_at"] is not None
 
+
+
+def test_create_application_persists_backend_calculated_flexible_terms(app, client):
+    admin_user = _create_user("admin", "Create Flex Admin", "create-flex-admin@example.com")
+    customer_user = _create_user("customer", "Create Flex Customer", "create-flex-customer@example.com")
+    customer = _customer_profile(customer_user, code="CUST-CREATE-FLEX")
+    payload = {
+        **_sample_application_payload(),
+        "customer_id": customer.id,
+        "loan_type": "GROW_PERSONAL",
+        "applied_amount": 15000,
+        "term_type": "DAYS",
+        "term_value": 63,
+        "loan_days": 63,
+        "repayment_frequency": "WEEKLY",
+        "interest_rate": 26,
+        "interest_rate_basis": "FLAT_TERM",
+        "loan_purpose": "Education",
+        "employment_type": "salaried",
+        "net_monthly_salary": "50000",
+        "employer_name": "Acme Ltd",
+    }
+    for key in ["business_name", "business_address", "monthly_sales", "business_type"]:
+        payload.pop(key, None)
+
+    response = client.post("/loan-applications", headers=_auth_headers(app, admin_user), json=payload)
+
+    assert response.status_code == 201
+    body = response.get_json()
+    application = LoanApplication.query.get(body["id"])
+    assert application.term_type == "DAYS"
+    assert application.term_value == 63
+    assert application.loan_days == 63
+    assert application.repayment_frequency == "WEEKLY"
+    assert application.installment_count == 9
+    assert application.installment_amount == Decimal("2100.00")
+    assert application.total_interest == Decimal("3900.00")
+    assert application.total_repayment == Decimal("18900.00")
+    assert application.extra_data["loan_purpose"] == "Education"
+    assert body["term_display"] == "63 days"
+    assert body["loan_purpose"] == "Education"
+
+
+def test_create_application_rejects_missing_flexible_term_fields(app, client):
+    admin_user = _create_user("admin", "Missing Flex Admin", "missing-flex-admin@example.com")
+    customer_user = _create_user("customer", "Missing Flex Customer", "missing-flex-customer@example.com")
+    customer = _customer_profile(customer_user, code="CUST-MISSING-FLEX")
+    payload = {**_sample_application_payload(), "customer_id": customer.id}
+    payload.pop("term_type", None)
+    payload.pop("term_value", None)
+    payload.pop("repayment_frequency", None)
+
+    response = client.post("/loan-applications", headers=_auth_headers(app, admin_user), json=payload)
+
+    assert response.status_code == 422
+    assert response.get_json()["error"] == "Loan application validation failed"
+    assert "repayment_frequency" in response.get_json()["missing_fields"]
 
 def test_staff_can_submit_draft_application_without_documents(app, client):
     staff_user = _create_user("staff", "Staff Submit", "staff-submit@example.com")
@@ -1220,7 +1283,7 @@ def test_flexible_terms_validation_rejects_bad_payloads(app, client):
         application = LoanApplication(application_number=f"APP-BAD-FLEX-{idx}", customer_id=customer.id, loan_type="GROW_BUSINESS", status=STATUS_SUBMITTED, applied_amount=Decimal("15000"), tenure_months=3, full_name="Bad Flex Customer", nic_number="123456789V", mobile_number="0700000000")
         db.session.add(application); db.session.commit()
         response = client.post(f"/loan-applications/{application.id}/approve", headers=_auth_headers(app, admin_user), json=_approved_terms_payload(**overrides))
-        assert response.status_code == 400
+        assert response.status_code == 422
         assert response.get_json().get("errors")
 
 
@@ -1274,6 +1337,7 @@ def test_disbursement_rejects_missing_term_type_without_creating_loan_or_ledger(
     assert response.status_code == 422
     assert response.get_json()["error"] == "Loan term information is incomplete"
     assert "term_type" in response.get_json()["missing_fields"]
+    assert "installment_count" in response.get_json()["missing_fields"]
     assert Loan.query.count() == 0
 
 
