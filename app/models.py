@@ -448,14 +448,31 @@ class Payment(db.Model):
     reversed_at = db.Column(db.DateTime)
     reversal_journal_id = db.Column(db.Integer, db.ForeignKey("accounting_journal_entries.id"))
     reversal_reason = db.Column(db.Text)
+    payment_date = db.Column(db.Date)
+    accounting_date = db.Column(db.Date)
+    collection_method = db.Column(db.String(50))
+    collection_account_id = db.Column(db.Integer, db.ForeignKey("accounting_accounts.id"))
+    collector_id = db.Column(db.Integer, db.ForeignKey("users.id"))
+    bank_reference = db.Column(db.String(120))
+    receipt_number = db.Column(db.String(40), unique=True, index=True)
+    status = db.Column(db.String(20), nullable=False, default="POSTED")
+    reversed_by = db.Column(db.Integer, db.ForeignKey("users.id"))
+    deposited_amount = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    deposit_status = db.Column(db.String(30), nullable=False, default="NOT_APPLICABLE")
+
+    @property
+    def undeposited_amount(self):
+        return Decimal(self.amount_collected or 0) - Decimal(self.deposited_amount or 0)
 
     loan = relationship("Loan", back_populates="payments")
     collected_by = relationship(
         "User", back_populates="collected_payments", foreign_keys=[collected_by_id]
     )
+    collector = relationship("User", foreign_keys=[collector_id])
+    collection_account = relationship("AccountingAccount", foreign_keys=[collection_account_id])
 
 ACCOUNT_TYPES = ("ASSET", "LIABILITY", "EQUITY", "INCOME", "EXPENSE")
-ACCOUNT_SUBTYPES = ("CASH", "BANK", "LOAN_RECEIVABLE", "INTEREST_RECEIVABLE", "PENALTY_RECEIVABLE", "OTHER_CURRENT_ASSET", "FIXED_ASSET", "ACCOUNTS_PAYABLE", "BORROWING", "CAPITAL", "RETAINED_EARNINGS", "INTEREST_INCOME", "PENALTY_INCOME", "FEE_INCOME", "OPERATING_EXPENSE", "WRITE_OFF_EXPENSE", "SUSPENSE", "OTHER")
+ACCOUNT_SUBTYPES = ("CASH", "BANK", "COLLECTION_CLEARING", "LOAN_RECEIVABLE", "INTEREST_RECEIVABLE", "PENALTY_RECEIVABLE", "OTHER_CURRENT_ASSET", "FIXED_ASSET", "ACCOUNTS_PAYABLE", "BORROWING", "CAPITAL", "RETAINED_EARNINGS", "INTEREST_INCOME", "PENALTY_INCOME", "FEE_INCOME", "OPERATING_EXPENSE", "WRITE_OFF_EXPENSE", "SUSPENSE", "OTHER")
 NORMAL_BALANCES = ("DEBIT", "CREDIT")
 JOURNAL_STATUSES = ("DRAFT", "POSTED", "REVERSED")
 
@@ -465,7 +482,7 @@ class AccountingAccount(db.Model):
     __table_args__ = (
         db.CheckConstraint("account_type in ('ASSET','LIABILITY','EQUITY','INCOME','EXPENSE')", name="ck_accounting_accounts_type"),
         db.CheckConstraint("normal_balance in ('DEBIT','CREDIT')", name="ck_accounting_accounts_normal_balance"),
-        db.CheckConstraint("account_subtype in ('CASH','BANK','LOAN_RECEIVABLE','INTEREST_RECEIVABLE','PENALTY_RECEIVABLE','OTHER_CURRENT_ASSET','FIXED_ASSET','ACCOUNTS_PAYABLE','BORROWING','CAPITAL','RETAINED_EARNINGS','INTEREST_INCOME','PENALTY_INCOME','FEE_INCOME','OPERATING_EXPENSE','WRITE_OFF_EXPENSE','SUSPENSE','OTHER')", name="ck_accounting_accounts_subtype"),
+        db.CheckConstraint("account_subtype in ('CASH','BANK','COLLECTION_CLEARING','LOAN_RECEIVABLE','INTEREST_RECEIVABLE','PENALTY_RECEIVABLE','OTHER_CURRENT_ASSET','FIXED_ASSET','ACCOUNTS_PAYABLE','BORROWING','CAPITAL','RETAINED_EARNINGS','INTEREST_INCOME','PENALTY_INCOME','FEE_INCOME','OPERATING_EXPENSE','WRITE_OFF_EXPENSE','SUSPENSE','OTHER')", name="ck_accounting_accounts_subtype"),
     )
 
     id = db.Column(db.Integer, primary_key=True)
@@ -474,6 +491,10 @@ class AccountingAccount(db.Model):
     account_type = db.Column(db.String(20), nullable=False)
     normal_balance = db.Column(db.String(10), nullable=False)
     parent_id = db.Column(db.Integer, db.ForeignKey("accounting_accounts.id"))
+    parent_account_id = db.Column(db.Integer, db.ForeignKey("accounting_accounts.id"))
+    collector_id = db.Column(db.Integer, db.ForeignKey("users.id"))
+    is_collection_account = db.Column(db.Boolean, nullable=False, default=False)
+    account_role = db.Column(db.String(50))
     description = db.Column(db.Text)
     cash_flow_category = db.Column(db.String(20), nullable=False, default="NONE")
     account_subtype = db.Column(db.String(40), nullable=False, default="OTHER")
@@ -486,7 +507,9 @@ class AccountingAccount(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
-    parent = relationship("AccountingAccount", remote_side=[id], backref="children")
+    parent = relationship("AccountingAccount", remote_side=[id], foreign_keys=[parent_id], backref="children")
+    parent_account = relationship("AccountingAccount", remote_side=[id], foreign_keys=[parent_account_id])
+    collector = relationship("User", foreign_keys=[collector_id])
 
 
 class AccountingJournalEntry(db.Model):
@@ -602,3 +625,45 @@ class AccountingAuditLog(db.Model):
     user_id = db.Column(db.Integer, db.ForeignKey("users.id"))
     details = db.Column(db.Text)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+
+class CollectionDepositBatch(db.Model):
+    __tablename__ = "collection_deposit_batches"
+
+    id = db.Column(db.Integer, primary_key=True)
+    deposit_number = db.Column(db.String(40), unique=True, index=True, nullable=False)
+    collector_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+    collector_account_id = db.Column(db.Integer, db.ForeignKey("accounting_accounts.id"), nullable=False)
+    bank_account_id = db.Column(db.Integer, db.ForeignKey("accounting_accounts.id"), nullable=False)
+    deposit_date = db.Column(db.Date, nullable=False)
+    accounting_date = db.Column(db.Date, nullable=False)
+    total_amount = db.Column(Numeric(18, 2), nullable=False)
+    bank_reference = db.Column(db.String(120))
+    deposit_slip_reference = db.Column(db.String(120))
+    remarks = db.Column(db.Text)
+    journal_entry_id = db.Column(db.Integer, db.ForeignKey("accounting_journal_entries.id"))
+    reversal_journal_id = db.Column(db.Integer, db.ForeignKey("accounting_journal_entries.id"))
+    status = db.Column(db.String(20), nullable=False, default="DRAFT")
+    created_by = db.Column(db.Integer, db.ForeignKey("users.id"))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    reversed_at = db.Column(db.DateTime)
+    reversal_reason = db.Column(db.Text)
+
+    collector = relationship("User", foreign_keys=[collector_id])
+    collector_account = relationship("AccountingAccount", foreign_keys=[collector_account_id])
+    bank_account = relationship("AccountingAccount", foreign_keys=[bank_account_id])
+    journal_entry = relationship("AccountingJournalEntry", foreign_keys=[journal_entry_id])
+    allocations = relationship("CollectionDepositAllocation", back_populates="deposit_batch", cascade="all, delete-orphan")
+
+
+class CollectionDepositAllocation(db.Model):
+    __tablename__ = "collection_deposit_allocations"
+
+    id = db.Column(db.Integer, primary_key=True)
+    deposit_batch_id = db.Column(db.Integer, db.ForeignKey("collection_deposit_batches.id"), nullable=False, index=True)
+    payment_id = db.Column(db.Integer, db.ForeignKey("payments.id"), nullable=False, index=True)
+    allocated_amount = db.Column(Numeric(18, 2), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+    deposit_batch = relationship("CollectionDepositBatch", back_populates="allocations")
+    payment = relationship("Payment")
