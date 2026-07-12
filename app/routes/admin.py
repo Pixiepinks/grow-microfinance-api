@@ -643,3 +643,126 @@ def collections_reconciliation():
         sub = acct_money(pos["closing_balance"])
         items.append({"collector_id": acct.collector_id, "collector": acct.collector.name if acct.collector else None, "account_id": acct.id, "account": acct.account_name, "gl_collection_account_balance": f"{gl:.2f}", "collector_subledger_balance": f"{sub:.2f}", "difference": f"{acct_money(gl-sub):.2f}"})
     return jsonify({"items": items})
+
+def _collector_account_payload(account):
+    if not account:
+        return None
+    return {"id": account.id, "code": account.account_code, "name": account.account_name}
+
+
+def _collector_payload(user):
+    account = AccountingAccount.query.get(user.default_collection_account_id) if user.default_collection_account_id else None
+    return {
+        "id": user.id,
+        "name": user.name,
+        "employee_code": getattr(user, "employee_code", None),
+        "collector_code": user.collector_code,
+        "status": user.collector_status,
+        "is_collector": user.is_collector,
+        "can_collect_cash": user.can_collect_cash,
+        "default_collection_account": _collector_account_payload(account),
+    }
+
+
+@admin_bp.route("/collectors", methods=["GET"])
+@role_required(["admin"])
+def list_collectors():
+    q = User.query.filter(User.is_collector.is_(True))
+    status = request.args.get("status")
+    if status:
+        q = q.filter(User.collector_status == status.upper())
+    if request.args.get("active_only", "").lower() in ("1", "true", "yes"):
+        q = q.filter(User.collector_status == "ACTIVE", User.is_active.is_(True))
+    if request.args.get("search"):
+        s = f"%{request.args['search']}%"
+        q = q.filter((User.name.ilike(s)) | (User.email.ilike(s)) | (User.collector_code.ilike(s)))
+    return jsonify({"items": [_collector_payload(u) for u in q.order_by(User.name).all()]})
+
+
+@admin_bp.route("/collectors", methods=["POST"])
+@role_required(["admin"])
+def create_collector():
+    from ..accounting import create_collector_collection_account
+    data = request.get_json() or {}
+    staff_id = data.get("staff_id")
+    if not staff_id:
+        return jsonify({"message": "staff_id is required"}), 400
+    user = User.query.get_or_404(int(staff_id))
+    if user.role not in ("admin", "staff"):
+        return jsonify({"message": "Only staff/admin users can be collectors"}), 422
+    try:
+        user.is_collector = True
+        user.can_collect_cash = bool(data.get("can_collect_cash", True))
+        user.collector_status = (data.get("collector_status") or "ACTIVE").upper()
+        if user.collector_status not in ("ACTIVE", "INACTIVE", "SUSPENDED"):
+            raise AccountingError("Invalid collector_status")
+        if data.get("collector_code") is not None:
+            user.collector_code = data.get("collector_code")
+        if data.get("collection_account_id"):
+            acct = AccountingAccount.query.get(int(data["collection_account_id"]))
+            from ..accounting import validate_collection_account
+            validate_collection_account(acct, "CASH_COLLECTOR", user.id)
+            user.default_collection_account_id = acct.id
+        elif data.get("create_collection_account"):
+            create_collector_collection_account(user)
+        db.session.commit()
+        return jsonify(_collector_payload(user)), 201
+    except AccountingError as exc:
+        db.session.rollback()
+        return jsonify({"error": "Collector setup incomplete", "message": str(exc)}), 422
+
+
+@admin_bp.route("/collectors/<int:collector_id>", methods=["PATCH"])
+@role_required(["admin"])
+def update_collector(collector_id):
+    user = User.query.get_or_404(collector_id)
+    data = request.get_json() or {}
+    try:
+        if "collector_code" in data:
+            user.collector_code = data["collector_code"]
+        if "can_collect_cash" in data:
+            user.can_collect_cash = bool(data["can_collect_cash"])
+        if "collector_status" in data or "status" in data:
+            status = (data.get("collector_status") or data.get("status") or "").upper()
+            if status not in ("ACTIVE", "INACTIVE", "SUSPENDED"):
+                raise AccountingError("Invalid collector_status")
+            user.collector_status = status
+        if data.get("create_collection_account"):
+            from ..accounting import create_collector_collection_account
+            create_collector_collection_account(user)
+        user.is_collector = True
+        db.session.commit()
+        return jsonify(_collector_payload(user))
+    except AccountingError as exc:
+        db.session.rollback()
+        return jsonify({"error": "Collector setup incomplete", "message": str(exc)}), 422
+
+
+@admin_bp.route("/collectors/<int:collector_id>/activate", methods=["POST"])
+@role_required(["admin"])
+def activate_collector(collector_id):
+    user = User.query.get_or_404(collector_id)
+    user.is_collector = True; user.can_collect_cash = True; user.collector_status = "ACTIVE"
+    db.session.commit()
+    return jsonify(_collector_payload(user))
+
+
+@admin_bp.route("/collectors/<int:collector_id>/deactivate", methods=["POST"])
+@role_required(["admin"])
+def deactivate_collector(collector_id):
+    user = User.query.get_or_404(collector_id)
+    user.collector_status = "INACTIVE"; user.can_collect_cash = False
+    db.session.commit()
+    return jsonify(_collector_payload(user))
+
+
+@admin_bp.route("/collections/collectors/options", methods=["GET"])
+@role_required(["admin", "staff"])
+def collector_options():
+    q = User.query.filter(User.is_collector.is_(True), User.can_collect_cash.is_(True), User.collector_status == "ACTIVE", User.is_active.is_(True))
+    items = []
+    for user in q.order_by(User.name).all():
+        acct = AccountingAccount.query.get(user.default_collection_account_id) if user.default_collection_account_id else None
+        if acct and acct.is_active and acct.allow_manual_posting and acct.is_collection_account and account_subtype(acct) == "COLLECTION_CLEARING" and acct.collector_id == user.id:
+            items.append({"collector_id": user.id, "collector_name": user.name, "collection_account_id": acct.id, "collection_account_code": acct.account_code, "collection_account_name": acct.account_name})
+    return jsonify({"items": items})

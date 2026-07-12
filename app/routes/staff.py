@@ -52,13 +52,16 @@ def record_payment():
     receipt_account = None
     collector_id = data.get("collector_id")
     account_id = data.get("collection_account_id") or data.get("receipt_account_id")
+    if payment_method == "CASH_COLLECTOR" and (not collector_id or not account_id):
+        return jsonify({"error": "Collector setup incomplete", "message": "collector_id and collection_account_id are required for CASH_COLLECTOR payments."}), 422
     if account_id is not None:
         try:
             receipt_account = validate_collection_account(AccountingAccount.query.get(int(account_id)), payment_method, collector_id)
+        except AccountingError as exc:
+            status = 422 if payment_method == "CASH_COLLECTOR" else 400
+            return jsonify({"error": "Collector setup incomplete", "message": str(exc)}), status
         except (TypeError, ValueError):
             return jsonify({"message": "collection_account_id must be a valid account id"}), 400
-        except AccountingError as exc:
-            return jsonify({"message": str(exc)}), 400
 
     if not loan_id:
         return jsonify({"message": "loan_id is required"}), 400
@@ -123,7 +126,8 @@ def record_payment():
         db.session.commit()
     except AccountingError as exc:
         db.session.rollback()
-        return jsonify({"message": str(exc)}), 400
+        status = 422 if payment_method == "CASH_COLLECTOR" else 400
+        return jsonify({"error": "Collector setup incomplete", "message": str(exc)}), status
 
     return jsonify({"message": "Payment recorded", "payment_id": payment.id})
 
