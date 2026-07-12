@@ -1,3 +1,4 @@
+import ast
 import os
 import stat
 import subprocess
@@ -20,8 +21,24 @@ def _script_directory():
 
 
 def test_alembic_revision_ids_fit_production_version_column():
-    for revision in _script_directory().walk_revisions():
-        assert len(revision.revision) <= 32, revision.revision
+    max_revision_length = 32
+
+    for path in (ROOT / "migrations" / "versions").glob("*.py"):
+        tree = ast.parse(path.read_text())
+        for node in tree.body:
+            if (
+                isinstance(node, ast.Assign)
+                and any(
+                    isinstance(target, ast.Name) and target.id == "revision"
+                    for target in node.targets
+                )
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)
+            ):
+                assert len(node.value.value) <= max_revision_length, (
+                    f"{path}: revision {node.value.value!r} "
+                    f"exceeds {max_revision_length} characters"
+                )
 
 
 def test_alembic_chain_has_one_head_and_valid_down_revisions():
@@ -66,7 +83,7 @@ def test_migration_from_0021_to_head_succeeds(tmp_path):
         text=True,
         capture_output=True,
     )
-    assert "0023_flexible_loan_terms" in current.stdout
+    assert "0025_ledger_start_nullable" in current.stdout
 
 
 def test_loan_model_columns_exist_after_schema_creation(app):
