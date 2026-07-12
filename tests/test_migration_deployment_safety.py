@@ -258,3 +258,37 @@ def test_loan_application_post_validation_failure_returns_json(app, client):
     assert response.status_code == 400
     assert response.is_json
     assert "errors" in response.get_json()
+
+
+def test_collector_migration_is_fail_fast_and_diagnostic():
+    source = (ROOT / "migrations" / "versions" / "0027_collector_collections.py").read_text()
+    tree = ast.parse(source)
+
+    assert not any(isinstance(node, ast.Try) for node in ast.walk(tree))
+    assert "except Exception" not in source
+    assert "except ProgrammingError" not in source
+    assert "InFailedSqlTransaction" not in source
+
+    for message in [
+        "0027: adding accounting_accounts.collector_id",
+        "0027: adding accounting_accounts.is_collection_account",
+        "0027: creating collection_deposit_batches",
+        "0027: creating collection_deposit_allocations",
+        "0027: migration complete",
+    ]:
+        assert message in source
+
+
+def test_collector_migration_uses_verified_schema_helpers():
+    source = (ROOT / "migrations" / "versions" / "0027_collector_collections.py").read_text()
+
+    assert 'revision = "0027_collector_collect"' in source
+    assert 'down_revision = "0026_loan_accrual"' in source
+    assert "def _table_names(bind):" in source
+    assert "def _column_names(bind, table):" in source
+    assert "def _fk_names(bind, table):" in source
+    assert "def _index_names(bind, table):" in source
+    assert "def _create_fk_if_possible(" in source
+    assert "sa.Enum" not in source
+    assert "op.create_table(\n            \"collection_deposit_batches\"" in source
+    assert "op.create_table(\n            \"collection_deposit_allocations\"" in source
