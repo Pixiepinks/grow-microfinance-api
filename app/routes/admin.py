@@ -22,6 +22,7 @@ from ..loan_ledger import (
     daily_interest_rate,
     generate_loan_ledger,
     ledger_totals,
+    loan_config_summary,
     money,
 )
 from .utils import role_required
@@ -252,6 +253,7 @@ def get_loan(loan_id):
 
 
 def _loan_to_dict(loan: Loan) -> dict:
+    config = loan_config_summary(loan)
     return {
         "id": loan.id,
         "loan_number": loan.loan_number,
@@ -263,16 +265,16 @@ def _loan_to_dict(loan: Loan) -> dict:
         "interest_rate": float(loan.interest_rate),
         "total_days": loan.total_days,
         "payment_interval_days": loan.payment_interval_days,
-        "start_date": loan.start_date.isoformat() if loan.start_date else None,
-        "end_date": loan.end_date.isoformat() if loan.end_date else None,
-        "term_type": loan.term_type,
-        "term_value": loan.term_value,
-        "loan_days": loan.loan_days,
+        "start_date": config["start_date"].isoformat() if config.get("start_date") else None,
+        "end_date": config["end_date"].isoformat() if config.get("end_date") else None,
+        "term_type": config["term_type"],
+        "term_value": config["term_value"],
+        "loan_days": config["loan_days"],
         "tenure_months": loan.tenure_months,
-        "repayment_frequency": loan.repayment_frequency,
-        "term_display": (f"{loan.term_value} days" if loan.term_type == "DAYS" and loan.term_value is not None else (f"{loan.term_value} months" if loan.term_type == "MONTHS" and loan.term_value is not None else None)),
-        "number_of_installments": loan.number_of_installments,
-        "installment_count": loan.installment_count,
+        "repayment_frequency": config["repayment_frequency"],
+        "term_display": config["term_display"],
+        "number_of_installments": config["number_of_installments"],
+        "installment_count": config["installment_count"],
         "installment_amount": (
             float(loan.installment_amount)
             if loan.installment_amount is not None
@@ -287,10 +289,10 @@ def _loan_to_dict(loan: Loan) -> dict:
         ),
         "interest_type": loan.interest_type,
         "interest_rate_basis": loan.interest_rate_basis,
-        "maturity_date": loan.maturity_date.isoformat() if loan.maturity_date else None,
+        "maturity_date": config["maturity_date"].isoformat() if config.get("maturity_date") else None,
         "final_installment_due_date": (
-            loan.final_installment_due_date.isoformat()
-            if loan.final_installment_due_date
+            config["final_installment_due_date"].isoformat()
+            if config.get("final_installment_due_date")
             else None
         ),
         "status": loan.status,
@@ -340,7 +342,9 @@ def get_loan_ledger(loan_id):
     return jsonify(
         {
             "loan": _loan_to_dict(loan),
+            "summary": ledger_totals(loan) | {"installment_count": len(loan.ledger_entries)},
             "ledger": [_ledger_to_dict(entry) for entry in loan.ledger_entries],
+            "items": [_ledger_to_dict(entry) for entry in loan.ledger_entries],
             "totals": ledger_totals(loan),
         }
     )

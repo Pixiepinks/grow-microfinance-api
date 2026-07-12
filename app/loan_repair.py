@@ -2,7 +2,7 @@ from decimal import Decimal
 
 from .accounting import log_audit, money
 from .extensions import db
-from .loan_ledger import generate_loan_ledger
+from .loan_ledger import backfill_period_start_dates_from_schedule, derive_loan_metadata_from_ledger, generate_loan_ledger
 from .loan_terms import calculate_flat_term_amounts, resolve_loan_term
 from .models import Loan, LoanApplication, LoanLedger, Payment
 
@@ -81,3 +81,46 @@ def repair_unpaid_defective_loan(loan_id: int, *, user_id=None, apply_changes: b
     else:
         db.session.rollback()
     return summary
+
+
+def _set_missing(loan, field, value, changed):
+    if getattr(loan, field, None) is None and value is not None:
+        setattr(loan, field, value)
+        changed.append(field)
+
+def repair_loan_term_metadata_from_ledger(loan_id: int, *, user_id=None) -> dict:
+    loan = Loan.query.get(loan_id)
+    if not loan:
+        raise LoanRepairError("Loan not found")
+    entries = sorted(list(loan.ledger_entries), key=lambda e: (e.installment_no or 0, e.due_date))
+    if not entries:
+        raise LoanRepairError("Loan has no ledger rows to derive metadata from")
+
+    before_totals = {
+        "principal": str(sum((money(e.principal_amount) for e in entries), Decimal("0.00"))),
+        "interest": str(sum((money(e.interest_amount) for e in entries), Decimal("0.00"))),
+        "payable": str(sum((money(e.installment_amount) for e in entries), Decimal("0.00"))),
+    }
+    derived = derive_loan_metadata_from_ledger(loan)
+    changed = []
+    for field in ["term_type", "term_value", "loan_days", "repayment_frequency", "installment_count", "number_of_installments", "start_date", "maturity_date", "end_date", "final_installment_due_date"]:
+        _set_missing(loan, field, derived.get(field), changed)
+    if loan.total_days is None and derived.get("total_days") is not None:
+        loan.total_days = derived["total_days"]
+        changed.append("total_days")
+    period_starts_backfilled = backfill_period_start_dates_from_schedule(loan)
+    if period_starts_backfilled:
+        changed.append("period_start_date")
+
+    after_totals = {
+        "principal": str(sum((money(e.principal_amount) for e in entries), Decimal("0.00"))),
+        "interest": str(sum((money(e.interest_amount) for e in entries), Decimal("0.00"))),
+        "payable": str(sum((money(e.installment_amount) for e in entries), Decimal("0.00"))),
+    }
+    if before_totals != after_totals:
+        db.session.rollback()
+        raise LoanRepairError("Repair attempted to change financial ledger totals")
+
+    log_audit("LOAN_TERM_METADATA_REPAIR", "Loan", loan.id, user_id, {"changed_fields": changed, "ledger_rows": len(entries), "totals": after_totals})
+    db.session.commit()
+    return {"loan_id": loan.id, "changed_fields": changed, "ledger_rows": len(entries), "totals": after_totals, "audit_logged": True}
