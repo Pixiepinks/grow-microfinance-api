@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from io import BytesIO
 
@@ -976,7 +976,7 @@ def test_disbursement_creates_ledger_automatically(app, client):
     loan = Loan.query.get(response.get_json()["loan_id"])
     assert len(loan.ledger_entries) == 5
     assert [entry.period_days for entry in loan.ledger_entries] == [7, 7, 7, 7, 2]
-    assert [entry.due_date for entry in loan.ledger_entries] == [date(2026, 7, 18), date(2026, 7, 25), date(2026, 8, 1), date(2026, 8, 8), date(2026, 8, 10)]
+    assert [entry.due_date for entry in loan.ledger_entries] == [date(2026, 7, 19), date(2026, 7, 26), date(2026, 8, 2), date(2026, 8, 9), date(2026, 8, 11)]
 
 
 def _draft_application(customer: Customer, number: str = "APP-DOCS") -> LoanApplication:
@@ -1295,7 +1295,7 @@ def test_legacy_loan_with_null_flexible_fields_still_loads(app, client):
     db.session.add(loan); db.session.commit()
     response = client.get(f"/admin/loans/{loan.id}/ledger", headers=_auth_headers(app, admin_user))
     assert response.status_code == 200
-    assert response.get_json()["loan"]["loan_days"] is None
+    assert response.get_json()["loan"]["loan_days"] == 10
 
 
 def test_resolve_loan_term_days_weekly_stub_and_months():
@@ -1374,3 +1374,130 @@ def test_safe_repair_replaces_unpaid_defective_one_row_loan(app, client):
     assert loan.total_payable == Decimal("18900.00")
     assert sum((entry.interest_amount for entry in loan.ledger_entries), Decimal("0")) == Decimal("3900.00")
     assert AccountingAuditLog.query.filter_by(action="LOAN_TERM_LEDGER_REPAIR", entity_id=str(loan.id)).count() == 1
+
+
+def _legacy_weekly_ledger_loan(admin_user, customer, *, missing_period_starts=False):
+    loan = Loan(
+        loan_number="LN-META-LEGACY",
+        customer_id=customer.id,
+        principal_amount=Decimal("15000.00"),
+        interest_rate=Decimal("26.00"),
+        total_days=63,
+        payment_interval_days=7,
+        daily_installment=Decimal("300.00"),
+        total_payable=Decimal("18900.00"),
+        start_date=date(2026, 7, 8),
+        end_date=date(2026, 7, 8),
+        status="ACTIVE",
+        created_by_id=admin_user.id,
+    )
+    db.session.add(loan)
+    db.session.flush()
+    from app.models import LoanLedger
+    period_start = date(2026, 7, 8)
+    opening = Decimal("15000.00")
+    for no in range(1, 10):
+        principal = Decimal("1666.67") if no < 9 else Decimal("1666.64")
+        closing = Decimal("0.00") if no == 9 else opening - principal
+        db.session.add(LoanLedger(
+            loan_id=loan.id,
+            installment_no=no,
+            period_start_date=None if missing_period_starts else period_start,
+            due_date=period_start + timedelta(days=7),
+            period_days=7,
+            opening_balance=opening,
+            principal_amount=principal,
+            interest_amount=Decimal("433.33") if no < 9 else Decimal("433.36"),
+            installment_amount=Decimal("2100.00"),
+            closing_balance=closing,
+            paid_amount=Decimal("0.00"),
+            status="PENDING",
+        ))
+        opening = closing
+        period_start = period_start + timedelta(days=7)
+    db.session.commit()
+    return loan
+
+
+def test_loan_serializer_returns_stored_flexible_metadata(app, client):
+    admin_user = _create_user("admin", "Stored Meta Admin", "stored-meta@example.com")
+    customer = _customer_profile(_create_user("customer", "Stored Meta Customer", "stored-meta-customer@example.com"), code="CUST-STORED-META")
+    loan = Loan(loan_number="LN-STORED-META", customer_id=customer.id, principal_amount=Decimal("15000.00"), interest_rate=Decimal("26.00"), total_days=63, payment_interval_days=7, daily_installment=Decimal("300.00"), total_payable=Decimal("18900.00"), loan_days=63, term_type="DAYS", term_value=63, repayment_frequency="WEEKLY", number_of_installments=9, installment_count=9, interest_rate_basis="FLAT_TERM", start_date=date(2026, 7, 8), end_date=date(2026, 9, 9), maturity_date=date(2026, 9, 9), final_installment_due_date=date(2026, 9, 9), status="ACTIVE", created_by_id=admin_user.id)
+    db.session.add(loan); db.session.commit()
+
+    response = client.get(f"/admin/loans/{loan.id}", headers=_auth_headers(app, admin_user))
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["term_type"] == "DAYS"
+    assert body["term_value"] == 63
+    assert body["loan_days"] == 63
+    assert body["term_display"] == "63 days"
+    assert body["repayment_frequency"] == "WEEKLY"
+    assert body["installment_count"] == 9
+    assert body["number_of_installments"] == 9
+    assert body["start_date"] == "2026-07-08"
+    assert body["maturity_date"] == "2026-09-09"
+    assert body["final_installment_due_date"] == "2026-09-09"
+    assert body["interest_rate"] == 26.0
+    assert body["interest_rate_basis"] == "FLAT_TERM"
+
+
+def test_ledger_api_derives_missing_metadata_from_weekly_rows(app, client):
+    admin_user = _create_user("admin", "Derived Meta Admin", "derived-meta@example.com")
+    customer = _customer_profile(_create_user("customer", "Derived Meta Customer", "derived-meta-customer@example.com"), code="CUST-DERIVED-META")
+    loan = _legacy_weekly_ledger_loan(admin_user, customer)
+    loan.term_type = None; loan.term_value = None; loan.loan_days = None; loan.repayment_frequency = None; loan.installment_count = None; loan.number_of_installments = None; loan.maturity_date = None; loan.final_installment_due_date = None
+    db.session.commit()
+
+    response = client.get(f"/admin/loans/{loan.id}/ledger", headers=_auth_headers(app, admin_user))
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["loan"]["term_type"] == "DAYS"
+    assert body["loan"]["term_value"] == 63
+    assert body["loan"]["term_display"] == "63 days"
+    assert body["loan"]["repayment_frequency"] == "WEEKLY"
+    assert body["loan"]["installment_count"] == 9
+    assert body["loan"]["maturity_date"] == "2026-09-09"
+    assert body["summary"]["installment_count"] == 9
+    assert body["summary"]["total_principal"] == 15000.0
+    assert body["summary"]["total_interest"] == 3900.0
+    assert body["summary"]["total_payable"] == 18900.0
+    assert len(body["items"]) == 9
+
+
+def test_repair_loan_term_metadata_from_ledger_is_idempotent(app, client):
+    from app.loan_repair import repair_loan_term_metadata_from_ledger
+    admin_user = _create_user("admin", "Metadata Repair Admin", "metadata-repair@example.com")
+    customer = _customer_profile(_create_user("customer", "Metadata Repair Customer", "metadata-repair-customer@example.com"), code="CUST-META-REPAIR")
+    loan = _legacy_weekly_ledger_loan(admin_user, customer)
+    loan.term_type = None; loan.term_value = None; loan.loan_days = None; loan.repayment_frequency = None; loan.installment_count = None; loan.number_of_installments = None; loan.maturity_date = None; loan.final_installment_due_date = None
+    db.session.commit()
+
+    first = repair_loan_term_metadata_from_ledger(loan.id, user_id=admin_user.id)
+    second = repair_loan_term_metadata_from_ledger(loan.id, user_id=admin_user.id)
+
+    db.session.refresh(loan)
+    assert first["ledger_rows"] == 9
+    assert second["ledger_rows"] == 9
+    assert len(loan.ledger_entries) == 9
+    assert sum((entry.principal_amount for entry in loan.ledger_entries), Decimal("0")) == Decimal("15000.00")
+    assert sum((entry.interest_amount for entry in loan.ledger_entries), Decimal("0")) == Decimal("3900.00")
+    assert loan.term_type == "DAYS"
+    assert loan.term_value == 63
+
+
+def test_repair_backfills_missing_period_start_dates_from_schedule(app, client):
+    from app.loan_repair import repair_loan_term_metadata_from_ledger
+    admin_user = _create_user("admin", "Period Repair Admin", "period-repair@example.com")
+    customer = _customer_profile(_create_user("customer", "Period Repair Customer", "period-repair-customer@example.com"), code="CUST-PERIOD-REPAIR")
+    loan = _legacy_weekly_ledger_loan(admin_user, customer, missing_period_starts=True)
+
+    repair_loan_term_metadata_from_ledger(loan.id, user_id=admin_user.id)
+
+    db.session.refresh(loan)
+    starts = [entry.period_start_date for entry in loan.ledger_entries]
+    assert starts == [date(2026, 7, 8) + timedelta(days=7 * idx) for idx in range(9)]
+    assert [entry.due_date for entry in loan.ledger_entries] == [date(2026, 7, 15) + timedelta(days=7 * idx) for idx in range(9)]
+    assert sum((entry.installment_amount for entry in loan.ledger_entries), Decimal("0")) == Decimal("18900.00")

@@ -89,6 +89,96 @@ def _generate_fixed_terms_ledger(loan: Loan):
     loan.daily_installment = money(total_repayment / Decimal(max(int(loan.total_days or count), 1)))
     return entries
 
+
+def _ordered_entries(loan: Loan):
+    return sorted(list(loan.ledger_entries), key=lambda e: (e.installment_no or 0, e.due_date))
+
+def infer_frequency_from_ledger(entries) -> str | None:
+    if not entries:
+        return None
+    days = [int(e.period_days) for e in entries if e.period_days]
+    if days and len(days) == len(entries) and all(day == 1 for day in days):
+        return "DAILY"
+    if days and len(days) == len(entries) and all(day == 7 for day in days):
+        return "WEEKLY"
+    due_dates = [e.due_date for e in entries if e.due_date]
+    if len(due_dates) == len(entries) and len(due_dates) > 1:
+        current = due_dates[0]
+        monthly = True
+        for nxt in due_dates[1:]:
+            current = _add_month(current)
+            if nxt != current:
+                monthly = False
+                break
+        if monthly:
+            return "MONTHLY"
+    return None
+
+def derive_loan_metadata_from_ledger(loan: Loan) -> dict:
+    entries = _ordered_entries(loan)
+    if not entries:
+        return {}
+    total_days = sum(int(e.period_days or 0) for e in entries)
+    first = entries[0]
+    start_dates = [e.period_start_date for e in entries if e.period_start_date]
+    start_date = min(start_dates) if start_dates else (first.due_date - timedelta(days=int(first.period_days or 0)) if first.due_date and first.period_days else None)
+    maturity_date = max((e.due_date for e in entries if e.due_date), default=None)
+    frequency = infer_frequency_from_ledger(entries)
+    return {
+        "installment_count": len(entries),
+        "number_of_installments": len(entries),
+        "total_days": total_days or None,
+        "term_type": "DAYS" if total_days else None,
+        "term_value": total_days or None,
+        "loan_days": total_days or None,
+        "repayment_frequency": frequency,
+        "start_date": start_date,
+        "maturity_date": maturity_date,
+        "end_date": maturity_date,
+        "final_installment_due_date": maturity_date,
+    }
+
+def loan_config_summary(loan: Loan) -> dict:
+    derived = derive_loan_metadata_from_ledger(loan)
+    term_type = loan.term_type or derived.get("term_type")
+    term_value = loan.term_value if loan.term_value is not None else derived.get("term_value")
+    loan_days = loan.loan_days if loan.loan_days is not None else derived.get("loan_days")
+    frequency = loan.repayment_frequency or derived.get("repayment_frequency")
+    installment_count = loan.installment_count or derived.get("installment_count")
+    number_of_installments = loan.number_of_installments or derived.get("number_of_installments")
+    start_date = loan.start_date or derived.get("start_date")
+    maturity_date = loan.maturity_date or derived.get("maturity_date")
+    final_due = loan.final_installment_due_date or derived.get("final_installment_due_date")
+    term_display = None
+    if term_type == "DAYS" and term_value is not None:
+        term_display = f"{term_value} days"
+    elif term_type == "MONTHS" and term_value is not None:
+        term_display = f"{term_value} months"
+    return {
+        "term_type": term_type, "term_value": term_value, "loan_days": loan_days, "tenure_months": loan.tenure_months,
+        "term_display": term_display, "repayment_frequency": frequency, "installment_count": installment_count,
+        "number_of_installments": number_of_installments, "start_date": start_date, "maturity_date": maturity_date,
+        "end_date": loan.end_date or derived.get("end_date"), "final_installment_due_date": final_due,
+        "interest_rate": loan.interest_rate, "interest_rate_basis": loan.interest_rate_basis,
+    }
+
+def backfill_period_start_dates_from_schedule(loan: Loan) -> int:
+    entries = _ordered_entries(loan)
+    if not entries:
+        return 0
+    changed = 0
+    previous_due = None
+    for entry in entries:
+        if entry.period_start_date is None:
+            if entry.installment_no == 1 or previous_due is None:
+                entry.period_start_date = loan.start_date or (entry.due_date - timedelta(days=int(entry.period_days or 0)) if entry.due_date and entry.period_days else None)
+            else:
+                entry.period_start_date = previous_due
+            if entry.period_start_date is not None:
+                changed += 1
+        previous_due = entry.due_date or previous_due
+    return changed
+
 def generate_loan_ledger(loan: Loan):
     """Create repayment ledger rows for a loan if they do not already exist."""
     existing_count = LoanLedger.query.filter_by(loan_id=loan.id).count() if loan.id else 0

@@ -307,7 +307,7 @@ class LoanLedger(db.Model):
         db.Integer, db.ForeignKey("loans.id"), nullable=False, index=True
     )
     installment_no = db.Column(db.Integer, nullable=False)
-    period_start_date = db.Column(db.Date, nullable=False)
+    period_start_date = db.Column(db.Date)
     due_date = db.Column(db.Date, nullable=False)
     period_days = db.Column(db.Integer, nullable=False)
     opening_balance = db.Column(Numeric(12, 2), nullable=False)
