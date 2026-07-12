@@ -258,6 +258,12 @@ class Loan(db.Model):
     status = db.Column(db.String(50), default="Active")
     created_by_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    interest_accounting_method = db.Column(db.String(32), nullable=False, default="ACCRUAL_BY_INSTALLMENT")
+    historical_accrual_mode = db.Column(db.String(16), nullable=False, default="AUTO")
+    accrual_processed_through = db.Column(db.Date)
+    disbursement_journal_id = db.Column(db.Integer, db.ForeignKey("accounting_journal_entries.id"))
+    reversed_at = db.Column(db.DateTime)
+    reversal_journal_id = db.Column(db.Integer, db.ForeignKey("accounting_journal_entries.id"))
 
     customer = relationship("Customer", back_populates="loans")
     created_by = relationship(
@@ -319,6 +325,16 @@ class LoanLedger(db.Model):
     paid_date = db.Column(db.Date)
     delay_days = db.Column(db.Integer, nullable=False, default=0)
     delay_interest = db.Column(Numeric(12, 2), nullable=False, default=Decimal("0.00"))
+    interest_accrued = db.Column(db.Boolean, nullable=False, default=False)
+    interest_accrued_at = db.Column(db.DateTime)
+    interest_accrual_journal_id = db.Column(db.Integer, db.ForeignKey("accounting_journal_entries.id"))
+    delay_interest_accrued = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    delay_interest_accrued_at = db.Column(db.DateTime)
+    delay_interest_accrual_journal_id = db.Column(db.Integer, db.ForeignKey("accounting_journal_entries.id"))
+    principal_paid = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    interest_paid = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    delay_interest_paid = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    unapplied_amount = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
     status = db.Column(db.String(20), nullable=False, default="PENDING")
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(
@@ -428,6 +444,10 @@ class Payment(db.Model):
     receipt_account_id = db.Column(db.Integer, db.ForeignKey("accounting_accounts.id"))
     remarks = db.Column(db.String(255))
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    journal_id = db.Column(db.Integer, db.ForeignKey("accounting_journal_entries.id"))
+    reversed_at = db.Column(db.DateTime)
+    reversal_journal_id = db.Column(db.Integer, db.ForeignKey("accounting_journal_entries.id"))
+    reversal_reason = db.Column(db.Text)
 
     loan = relationship("Loan", back_populates="payments")
     collected_by = relationship(
@@ -479,6 +499,13 @@ class AccountingJournalEntry(db.Model):
     reference_type = db.Column(db.String(50))
     reference_id = db.Column(db.String(64))
     source_module = db.Column(db.String(50))
+    source_type = db.Column(db.String(80), index=True)
+    source_id = db.Column(db.Integer, index=True)
+    loan_id = db.Column(db.Integer, db.ForeignKey("loans.id"), index=True)
+    customer_id = db.Column(db.Integer, db.ForeignKey("customers.id"), index=True)
+    accounting_date = db.Column(db.Date, index=True)
+    reversal_of_journal_id = db.Column(db.Integer, db.ForeignKey("accounting_journal_entries.id"))
+    is_reversal = db.Column(db.Boolean, nullable=False, default=False)
     status = db.Column(db.String(20), nullable=False, default="DRAFT")
     posted_at = db.Column(db.DateTime)
     posted_by_id = db.Column(db.Integer, db.ForeignKey("users.id"))
@@ -491,9 +518,38 @@ class AccountingJournalEntry(db.Model):
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
     lines = relationship("AccountingJournalLine", back_populates="journal_entry", cascade="all, delete-orphan", order_by="AccountingJournalLine.line_no")
-    reversal_of = relationship("AccountingJournalEntry", remote_side=[id], backref="reversal_journals")
+    reversal_of = relationship("AccountingJournalEntry", remote_side=[id], foreign_keys=[reversal_of_id], backref="reversal_journals")
     created_by = relationship("User", foreign_keys=[created_by_id])
     posted_by = relationship("User", foreign_keys=[posted_by_id])
+
+
+class PaymentAllocation(db.Model):
+    __tablename__ = "payment_allocations"
+
+    id = db.Column(db.Integer, primary_key=True)
+    payment_id = db.Column(db.Integer, db.ForeignKey("payments.id"), nullable=False, index=True)
+    loan_id = db.Column(db.Integer, db.ForeignKey("loans.id"), nullable=False, index=True)
+    ledger_id = db.Column(db.Integer, db.ForeignKey("loan_ledger.id"), index=True)
+    allocation_type = db.Column(db.String(32), nullable=False)
+    amount = db.Column(Numeric(18, 2), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+    payment = relationship("Payment", backref="allocations")
+    loan = relationship("Loan")
+    ledger = relationship("LoanLedger")
+
+
+class AccountingPeriod(db.Model):
+    __tablename__ = "accounting_periods"
+
+    id = db.Column(db.Integer, primary_key=True)
+    period = db.Column(db.String(7), unique=True, nullable=False)
+    start_date = db.Column(db.Date, nullable=False)
+    end_date = db.Column(db.Date, nullable=False)
+    is_locked = db.Column(db.Boolean, nullable=False, default=False)
+    locked_at = db.Column(db.DateTime)
+    locked_by_id = db.Column(db.Integer, db.ForeignKey("users.id"))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
 
 
 class AccountingJournalLine(db.Model):
