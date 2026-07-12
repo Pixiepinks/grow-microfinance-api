@@ -16,6 +16,11 @@ class User(db.Model):
     name = db.Column(db.String(120), nullable=False)
     role = db.Column(db.String(20), nullable=False)
     is_active = db.Column(db.Boolean, default=True)
+    is_collector = db.Column(db.Boolean, nullable=False, default=False)
+    collector_code = db.Column(db.String(50), nullable=True, unique=True)
+    collector_status = db.Column(db.String(20), nullable=False, default="ACTIVE")
+    default_collection_account_id = db.Column(db.Integer, db.ForeignKey("accounting_accounts.id"), nullable=True)
+    can_collect_cash = db.Column(db.Boolean, nullable=False, default=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(
         db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
@@ -472,7 +477,7 @@ class Payment(db.Model):
     collection_account = relationship("AccountingAccount", foreign_keys=[collection_account_id])
 
 ACCOUNT_TYPES = ("ASSET", "LIABILITY", "EQUITY", "INCOME", "EXPENSE")
-ACCOUNT_SUBTYPES = ("CASH", "BANK", "COLLECTION_CLEARING", "LOAN_RECEIVABLE", "INTEREST_RECEIVABLE", "PENALTY_RECEIVABLE", "OTHER_CURRENT_ASSET", "FIXED_ASSET", "ACCOUNTS_PAYABLE", "BORROWING", "CAPITAL", "RETAINED_EARNINGS", "INTEREST_INCOME", "PENALTY_INCOME", "FEE_INCOME", "OPERATING_EXPENSE", "WRITE_OFF_EXPENSE", "SUSPENSE", "OTHER")
+ACCOUNT_SUBTYPES = ("CASH", "BANK", "COLLECTION_CLEARING", "COLLECTION_CLEARING_CONTROL", "LOAN_RECEIVABLE", "INTEREST_RECEIVABLE", "PENALTY_RECEIVABLE", "OTHER_CURRENT_ASSET", "FIXED_ASSET", "ACCOUNTS_PAYABLE", "BORROWING", "CAPITAL", "RETAINED_EARNINGS", "INTEREST_INCOME", "PENALTY_INCOME", "FEE_INCOME", "OPERATING_EXPENSE", "WRITE_OFF_EXPENSE", "SUSPENSE", "OTHER")
 NORMAL_BALANCES = ("DEBIT", "CREDIT")
 JOURNAL_STATUSES = ("DRAFT", "POSTED", "REVERSED")
 
@@ -482,7 +487,7 @@ class AccountingAccount(db.Model):
     __table_args__ = (
         db.CheckConstraint("account_type in ('ASSET','LIABILITY','EQUITY','INCOME','EXPENSE')", name="ck_accounting_accounts_type"),
         db.CheckConstraint("normal_balance in ('DEBIT','CREDIT')", name="ck_accounting_accounts_normal_balance"),
-        db.CheckConstraint("account_subtype in ('CASH','BANK','COLLECTION_CLEARING','LOAN_RECEIVABLE','INTEREST_RECEIVABLE','PENALTY_RECEIVABLE','OTHER_CURRENT_ASSET','FIXED_ASSET','ACCOUNTS_PAYABLE','BORROWING','CAPITAL','RETAINED_EARNINGS','INTEREST_INCOME','PENALTY_INCOME','FEE_INCOME','OPERATING_EXPENSE','WRITE_OFF_EXPENSE','SUSPENSE','OTHER')", name="ck_accounting_accounts_subtype"),
+        db.CheckConstraint("account_subtype in ('CASH','BANK','COLLECTION_CLEARING','COLLECTION_CLEARING_CONTROL','LOAN_RECEIVABLE','INTEREST_RECEIVABLE','PENALTY_RECEIVABLE','OTHER_CURRENT_ASSET','FIXED_ASSET','ACCOUNTS_PAYABLE','BORROWING','CAPITAL','RETAINED_EARNINGS','INTEREST_INCOME','PENALTY_INCOME','FEE_INCOME','OPERATING_EXPENSE','WRITE_OFF_EXPENSE','SUSPENSE','OTHER')", name="ck_accounting_accounts_subtype"),
     )
 
     id = db.Column(db.Integer, primary_key=True)

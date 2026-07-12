@@ -28,7 +28,7 @@ from .models import (
 CENT = Decimal("0.01")
 ACCOUNT_TYPES = {"ASSET", "LIABILITY", "EQUITY", "INCOME", "EXPENSE"}
 NORMAL_BALANCES = {"DEBIT", "CREDIT"}
-ACCOUNT_SUBTYPES = {"CASH", "BANK", "COLLECTION_CLEARING", "LOAN_RECEIVABLE", "INTEREST_RECEIVABLE", "PENALTY_RECEIVABLE", "OTHER_CURRENT_ASSET", "FIXED_ASSET", "ACCOUNTS_PAYABLE", "BORROWING", "CAPITAL", "RETAINED_EARNINGS", "INTEREST_INCOME", "PENALTY_INCOME", "FEE_INCOME", "OPERATING_EXPENSE", "WRITE_OFF_EXPENSE", "SUSPENSE", "OTHER"}
+ACCOUNT_SUBTYPES = {"CASH", "BANK", "COLLECTION_CLEARING", "COLLECTION_CLEARING_CONTROL", "LOAN_RECEIVABLE", "INTEREST_RECEIVABLE", "PENALTY_RECEIVABLE", "OTHER_CURRENT_ASSET", "FIXED_ASSET", "ACCOUNTS_PAYABLE", "BORROWING", "CAPITAL", "RETAINED_EARNINGS", "INTEREST_INCOME", "PENALTY_INCOME", "FEE_INCOME", "OPERATING_EXPENSE", "WRITE_OFF_EXPENSE", "SUSPENSE", "OTHER"}
 SYSTEM_MAPPINGS = {
     "DEFAULT_DISBURSEMENT_ACCOUNT": "1010",
     "DEFAULT_CASH_COLLECTION_ACCOUNT": "1000",
@@ -58,7 +58,7 @@ SYSTEM_MAPPINGS = {
 DEFAULT_ACCOUNTS = [
     ("1000", "Cash on Hand", "ASSET", "DEBIT", True, "CASH"),
     ("1010", "Main Bank Account", "ASSET", "DEBIT", True, "BANK"),
-    ("1050", "Collector Cash Clearing – Control", "ASSET", "DEBIT", True, "COLLECTION_CLEARING"),
+    ("1050", "Collector Cash Clearing – Control", "ASSET", "DEBIT", True, "COLLECTION_CLEARING_CONTROL"),
     ("1100", "Loan Principal Receivable", "ASSET", "DEBIT", True, "LOAN_RECEIVABLE"),
     ("1110", "Interest Receivable", "ASSET", "DEBIT", True, "INTEREST_RECEIVABLE"),
     ("1120", "Penalty Receivable", "ASSET", "DEBIT", True, "PENALTY_RECEIVABLE"),
@@ -83,7 +83,7 @@ SETTING_VALIDATION = {
     "DEFAULT_BANK_COLLECTION_ACCOUNT": ({"ASSET"}, {"BANK"}),
     "default_cash_on_hand_account": ({"ASSET"}, {"CASH"}),
     "default_bank_account": ({"ASSET"}, {"BANK"}),
-    "collector_clearing_control_account": ({"ASSET"}, {"COLLECTION_CLEARING"}),
+    "collector_clearing_control_account": ({"ASSET"}, {"COLLECTION_CLEARING_CONTROL", "COLLECTION_CLEARING"}),
     "LOAN_RECEIVABLE_ACCOUNT": ({"ASSET"}, {"LOAN_RECEIVABLE"}),
     "INTEREST_RECEIVABLE_ACCOUNT": ({"ASSET"}, {"INTEREST_RECEIVABLE"}),
     "PENALTY_RECEIVABLE_ACCOUNT": ({"ASSET"}, {"PENALTY_RECEIVABLE"}),
@@ -114,7 +114,7 @@ def seed_default_accounts():
     for code, name, typ, normal, system, category in DEFAULT_ACCOUNTS:
         acct = AccountingAccount.query.filter_by(account_code=code).first()
         if not acct:
-            db.session.add(AccountingAccount(account_code=code, account_name=name, account_type=typ, normal_balance=normal, is_system_account=system, cash_flow_category=("RECEIVABLE" if "RECEIVABLE" in category else category), account_subtype=category))
+            db.session.add(AccountingAccount(account_code=code, account_name=name, account_type=typ, normal_balance=normal, is_system_account=system, cash_flow_category=("RECEIVABLE" if "RECEIVABLE" in category else category), account_subtype=category, allow_manual_posting=(False if code == "1050" else True), is_collection_account=False))
         else:
             acct.is_system_account = bool(system) or acct.is_system_account
             # Seed correction is intentionally conservative for existing
@@ -126,6 +126,10 @@ def seed_default_accounts():
                 acct.account_subtype = category
             elif not getattr(acct, "account_subtype", None):
                 acct.account_subtype = category
+            if code == "1050":
+                acct.allow_manual_posting = False
+                acct.is_collection_account = False
+                acct.collector_id = None
             if getattr(acct, "cash_flow_category", None) in (None, "NONE") and category != "NONE":
                 acct.cash_flow_category = "RECEIVABLE" if "RECEIVABLE" in category else category
     db.session.flush()
@@ -1027,6 +1031,47 @@ def generate_deposit_number(deposit_date):
     return _number("GROW-DEP", CollectionDepositBatch, "deposit_number", deposit_date)
 
 
+
+def generate_next_collection_account_code():
+    control = resolve_system_account("collector_clearing_control_account")
+    try:
+        db.session.execute(text("select pg_advisory_xact_lock(hashtext(:p))"), {"p": "collection_account_code"})
+    except Exception:
+        pass
+    q = AccountingAccount.query.filter(
+        AccountingAccount.parent_account_id == control.id,
+        AccountingAccount.account_subtype == "COLLECTION_CLEARING",
+    )
+    max_code = int(control.account_code)
+    for acct in q.all():
+        if str(acct.account_code).isdigit():
+            max_code = max(max_code, int(acct.account_code))
+    while AccountingAccount.query.filter_by(account_code=str(max_code + 1)).first():
+        max_code += 1
+    return str(max_code + 1)
+
+def create_collector_collection_account(collector):
+    control = resolve_system_account("collector_clearing_control_account")
+    if control.is_collection_account or control.collector_id is not None:
+        raise AccountingError("Collector clearing control account cannot be linked to a collector")
+    existing = AccountingAccount.query.filter_by(collector_id=collector.id, is_collection_account=True, is_active=True).first()
+    if existing:
+        raise AccountingError("Only one active default collection account is allowed per collector")
+    acct = AccountingAccount(
+        account_code=generate_next_collection_account_code(),
+        account_name=f"Collection Account – {collector.name}",
+        account_type="ASSET", normal_balance="DEBIT",
+        parent_id=control.id, parent_account_id=control.id,
+        account_subtype="COLLECTION_CLEARING",
+        allow_manual_posting=True, is_active=True,
+        is_collection_account=True, collector_id=collector.id,
+        cash_flow_category="NONE",
+    )
+    db.session.add(acct)
+    db.session.flush()
+    collector.default_collection_account_id = acct.id
+    return acct
+
 def validate_collection_account(account, method, collector_id=None):
     if not account or not account.is_active:
         raise AccountingError("Collection account is inactive or missing")
@@ -1037,9 +1082,12 @@ def validate_collection_account(account, method, collector_id=None):
         raise AccountingError("CASH_OFFICE requires a Cash on Hand account")
     if method == "CASH_COLLECTOR":
         if not collector_id:
-            raise AccountingError("collector_id is required for CASH_COLLECTOR")
-        if account.account_type != "ASSET" or account.normal_balance != "DEBIT" or subtype != "COLLECTION_CLEARING" or not account.is_collection_account:
-            raise AccountingError("CASH_COLLECTOR requires a debit asset COLLECTION_CLEARING account")
+            raise AccountingError("Collector setup incomplete: collector_id is required for CASH_COLLECTOR")
+        collector = User.query.get(int(collector_id))
+        if not collector or not collector.is_collector or collector.collector_status != "ACTIVE" or not collector.can_collect_cash:
+            raise AccountingError("Collector setup incomplete: The selected collector is not active or cannot collect cash.")
+        if not account.allow_manual_posting or account.account_type != "ASSET" or account.normal_balance != "DEBIT" or subtype != "COLLECTION_CLEARING" or not account.is_collection_account:
+            raise AccountingError("Collector setup incomplete: The selected collector has no active collection account.")
         if account.collector_id != int(collector_id):
             raise AccountingError("Collection account is not linked to the collector")
     return account
