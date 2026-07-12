@@ -108,6 +108,23 @@ def _normalized_application_term_payload(data: dict, customer_id=None) -> tuple[
     if customer_id is not None:
         payload["customer_id"] = customer_id
 
+    # Preserve legacy application submissions that only supplied tenure_months.
+    # Flexible-term validation still applies once any new term/accounting field is present.
+    flexible_keys = {"term_type", "term_value", "loan_days", "repayment_frequency", "interest_rate", "interest_rate_basis", "interest_type"}
+    if not any(payload.get(k) not in (None, "") for k in flexible_keys):
+        if payload.get("applied_amount") in (None, "") or payload.get("tenure_months") in (None, ""):
+            return {"tenure_months": parse_int(payload.get("tenure_months")) or 0, "interest_rate": None}, [], []
+        legacy_payload = {
+            "approved_amount": payload.get("applied_amount"),
+            "term_type": "MONTHS",
+            "term_value": payload.get("tenure_months"),
+            "repayment_frequency": "MONTHLY",
+            "interest_rate": "0",
+            "interest_rate_basis": "FLAT_TERM",
+        }
+        terms, errors = _validate_and_calculate_terms(legacy_payload, allow_legacy=True)
+        return terms, [], errors
+
     missing = []
     term_type_present = payload.get("term_type") not in (None, "")
     if not term_type_present:

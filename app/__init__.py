@@ -274,6 +274,21 @@ def create_app():
     def health_check():
         return jsonify({"status": "ok"})
 
+    @app.cli.command("accrue-loan-interest")
+    @click.option("--as-of-date", default=None, help="Accrue due loan interest through YYYY-MM-DD; defaults to today.")
+    @click.option("--loan-id", type=int, default=None, help="Accrue one loan only.")
+    def accrue_loan_interest_cli(as_of_date, loan_id):
+        from datetime import date as date_cls
+        from .accounting import accrue_due_loan_interest
+        as_of = date_cls.fromisoformat(as_of_date) if as_of_date else date_cls.today()
+        summary = accrue_due_loan_interest(as_of, loan_id=loan_id, historical=True)
+        if summary.get("errors"):
+            app.logger.error("Loan interest accrual completed with errors: %s", summary)
+        db.session.commit()
+        click.echo({**summary, "total_interest_accrued": str(summary["total_interest_accrued"])})
+        if summary.get("errors"):
+            raise click.ClickException("Some accruals failed")
+
     return app
 
 

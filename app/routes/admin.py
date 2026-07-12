@@ -17,7 +17,7 @@ from ..models import (
     Payment,
     User,
 )
-from ..accounting import post_loan_disbursement, AccountingError
+from ..accounting import post_loan_disbursement, AccountingError, accrue_due_loan_interest, reverse_payment, reverse_loan_disbursement, money as acct_money
 from ..loan_ledger import (
     daily_interest_rate,
     generate_loan_ledger,
@@ -296,6 +296,15 @@ def _loan_to_dict(loan: Loan) -> dict:
             else None
         ),
         "status": loan.status,
+        "interest_accounting_method": loan.interest_accounting_method,
+        "historical_accrual_mode": loan.historical_accrual_mode,
+        "accrual_processed_through": loan.accrual_processed_through.isoformat() if loan.accrual_processed_through else None,
+        "accrued_interest": float(sum((acct_money(e.interest_amount) for e in loan.ledger_entries if e.interest_accrued), Decimal("0.00"))),
+        "unaccrued_due_interest": float(sum((acct_money(e.interest_amount) for e in loan.ledger_entries if (not e.interest_accrued and e.due_date and e.due_date <= date.today())), Decimal("0.00"))),
+        "future_interest": float(sum((acct_money(e.interest_amount) for e in loan.ledger_entries if e.due_date and e.due_date > date.today()), Decimal("0.00"))),
+        "interest_receivable_balance": float(sum((acct_money(e.interest_amount) - acct_money(e.interest_paid) for e in loan.ledger_entries if e.interest_accrued), Decimal("0.00"))),
+        "delay_interest_receivable_balance": float(sum((acct_money(e.delay_interest_accrued) - acct_money(e.delay_interest_paid) for e in loan.ledger_entries), Decimal("0.00"))),
+        "principal_receivable_balance": float(sum((acct_money(e.principal_amount) - acct_money(e.principal_paid) for e in loan.ledger_entries), Decimal("0.00"))),
     }
 
 
@@ -327,6 +336,15 @@ def _ledger_to_dict(entry: LoanLedger) -> dict:
         "delay_interest": float(entry.delay_interest or 0),
         "delay_interest_formatted": format_currency(entry.delay_interest or 0),
         "status": entry.status,
+        "interest_accrued": bool(entry.interest_accrued),
+        "interest_accrued_at": entry.interest_accrued_at.isoformat() if entry.interest_accrued_at else None,
+        "interest_accrual_journal_id": entry.interest_accrual_journal_id,
+        "principal_paid": float(entry.principal_paid or 0),
+        "interest_paid": float(entry.interest_paid or 0),
+        "delay_interest_paid": float(entry.delay_interest_paid or 0),
+        "delay_interest_accrued": float(entry.delay_interest_accrued or 0),
+        "unapplied_amount": float(entry.unapplied_amount or 0),
+        "due_status": "OVERDUE" if entry.due_date and entry.due_date < date.today() and entry.status != "PAID" else entry.status,
     }
 
 
@@ -450,3 +468,64 @@ def list_loan_application_documents():
         )
 
     return jsonify({"items": items})
+
+@admin_bp.route("/accounting/accrue-interest", methods=["POST"])
+@role_required(["admin"])
+def admin_accrue_interest():
+    data = request.get_json() or {}
+    as_of = date.fromisoformat(data.get("as_of_date") or date.today().isoformat())
+    try:
+        summary = accrue_due_loan_interest(as_of, data.get("loan_id"), historical=True, requested_by=int(get_jwt_identity()))
+        db.session.commit()
+        summary["total_interest_accrued"] = float(summary["total_interest_accrued"])
+        return jsonify(summary)
+    except AccountingError as exc:
+        db.session.rollback()
+        payload = exc.args[0] if exc.args and isinstance(exc.args[0], dict) else {"message": str(exc)}
+        return jsonify(payload), 422
+
+@admin_bp.route("/accounting/interest-accrual-status", methods=["GET"])
+@role_required(["admin"])
+def admin_interest_accrual_status():
+    q = LoanLedger.query.join(Loan)
+    if request.args.get("loan_id"): q = q.filter(LoanLedger.loan_id == int(request.args["loan_id"]))
+    if request.args.get("customer_id"): q = q.filter(Loan.customer_id == int(request.args["customer_id"]))
+    if request.args.get("date_from"): q = q.filter(LoanLedger.due_date >= date.fromisoformat(request.args["date_from"]))
+    if request.args.get("date_to"): q = q.filter(LoanLedger.due_date <= date.fromisoformat(request.args["date_to"]))
+    if request.args.get("accrued") is not None: q = q.filter(LoanLedger.interest_accrued.is_(request.args["accrued"].lower() == "true"))
+    if request.args.get("overdue") == "true": q = q.filter(LoanLedger.due_date < date.today(), LoanLedger.status != "PAID")
+    return jsonify([_ledger_to_dict(e) for e in q.order_by(LoanLedger.due_date).all()])
+
+@admin_bp.route("/loans/<int:loan_id>/historical-accruals", methods=["POST"])
+@role_required(["admin"])
+def admin_historical_accruals(loan_id):
+    data = request.get_json() or {}
+    as_of = date.fromisoformat(data.get("as_of_date") or date.today().isoformat())
+    summary = accrue_due_loan_interest(as_of, loan_id, historical=True, requested_by=int(get_jwt_identity()))
+    db.session.commit()
+    summary["total_interest_accrued"] = float(summary["total_interest_accrued"])
+    return jsonify(summary)
+
+@admin_bp.route("/payments/<int:payment_id>/reverse", methods=["POST"])
+@role_required(["admin"])
+def admin_reverse_payment(payment_id):
+    data = request.get_json() or {}
+    payment = Payment.query.get_or_404(payment_id)
+    try:
+        rev = reverse_payment(payment, date.fromisoformat(data.get("reversal_date") or date.today().isoformat()), data.get("reason"), int(get_jwt_identity()))
+        db.session.commit()
+        return jsonify({"reversal_journal_id": rev.id})
+    except AccountingError as exc:
+        db.session.rollback(); return jsonify({"message": str(exc)}), 422
+
+@admin_bp.route("/loans/<int:loan_id>/reverse-disbursement", methods=["POST"])
+@role_required(["admin"])
+def admin_reverse_disbursement(loan_id):
+    data = request.get_json() or {}
+    loan = Loan.query.get_or_404(loan_id)
+    try:
+        result = reverse_loan_disbursement(loan, date.fromisoformat(data.get("reversal_date") or date.today().isoformat()), data.get("reason"), int(get_jwt_identity()))
+        db.session.commit()
+        return jsonify(result)
+    except AccountingError as exc:
+        db.session.rollback(); return jsonify({"message": str(exc)}), 422

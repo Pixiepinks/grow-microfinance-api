@@ -19,6 +19,8 @@ from .models import (
     Loan,
     LoanLedger,
     Payment,
+    PaymentAllocation,
+    AccountingPeriod,
     LoanApplication,
     User,
 )
@@ -34,10 +36,16 @@ SYSTEM_MAPPINGS = {
     "CASH_ACCOUNT": "1000",
     "BANK_ACCOUNT": "1010",
     "LOAN_RECEIVABLE_ACCOUNT": "1100",
+    "LOAN_PRINCIPAL_RECEIVABLE": "1100",
     "INTEREST_RECEIVABLE_ACCOUNT": "1110",
+    "INTEREST_RECEIVABLE": "1110",
     "PENALTY_RECEIVABLE_ACCOUNT": "1120",
+    "DELAY_INTEREST_RECEIVABLE": "1120",
     "INTEREST_INCOME_ACCOUNT": "4000",
+    "LOAN_INTEREST_INCOME": "4000",
     "PENALTY_INCOME_ACCOUNT": "4010",
+    "DELAY_INTEREST_INCOME": "4010",
+    "UNAPPLIED_CUSTOMER_FUNDS": "1990",
     "PROCESSING_FEE_INCOME_ACCOUNT": "4020",
     "OTHER_FEE_INCOME_ACCOUNT": "4020",
     "LOAN_WRITE_OFF_EXPENSE_ACCOUNT": "5050",
@@ -77,6 +85,12 @@ SETTING_VALIDATION = {
     "PROCESSING_FEE_INCOME_ACCOUNT": ({"INCOME"}, {"FEE_INCOME", "OTHER"}),
     "LOAN_WRITE_OFF_EXPENSE_ACCOUNT": ({"EXPENSE"}, {"WRITE_OFF_EXPENSE", "OPERATING_EXPENSE", "OTHER"}),
     "SUSPENSE_ACCOUNT": ({"ASSET", "LIABILITY"}, {"SUSPENSE", "OTHER_CURRENT_ASSET", "OTHER"}),
+    "LOAN_PRINCIPAL_RECEIVABLE": ({"ASSET"}, {"LOAN_RECEIVABLE"}),
+    "INTEREST_RECEIVABLE": ({"ASSET"}, {"INTEREST_RECEIVABLE"}),
+    "DELAY_INTEREST_RECEIVABLE": ({"ASSET"}, {"PENALTY_RECEIVABLE"}),
+    "LOAN_INTEREST_INCOME": ({"INCOME"}, {"INTEREST_INCOME", "FEE_INCOME", "OTHER"}),
+    "DELAY_INTEREST_INCOME": ({"INCOME"}, {"PENALTY_INCOME", "FEE_INCOME", "OTHER"}),
+    "UNAPPLIED_CUSTOMER_FUNDS": ({"ASSET", "LIABILITY"}, {"SUSPENSE", "ACCOUNTS_PAYABLE", "OTHER"}),
     "RETAINED_EARNINGS_ACCOUNT": ({"EQUITY"}, {"RETAINED_EARNINGS"}),
 }
 
@@ -157,7 +171,7 @@ def create_draft_journal(journal_date, description, lines, reference_type="MANUA
     if idempotency_key:
         existing = AccountingJournalEntry.query.filter_by(idempotency_key=idempotency_key).first()
         if existing: return existing
-    entry = AccountingJournalEntry(journal_no=generate_journal_number(journal_date), journal_date=journal_date, description=description, reference_type=reference_type, reference_id=str(reference_id) if reference_id is not None else None, source_module=source_module, created_by_id=created_by_id, idempotency_key=idempotency_key, status="DRAFT")
+    entry = AccountingJournalEntry(journal_no=generate_journal_number(journal_date), journal_date=journal_date, accounting_date=journal_date, description=description, reference_type=reference_type, reference_id=str(reference_id) if reference_id is not None else None, source_type=reference_type, source_id=int(reference_id) if str(reference_id).isdigit() else None, source_module=source_module, created_by_id=created_by_id, idempotency_key=idempotency_key, status="DRAFT")
     db.session.add(entry); db.session.flush()
     for i, raw in enumerate(lines, 1): entry.lines.append(_line_from_payload(raw, i))
     validate_journal(entry)
@@ -185,7 +199,7 @@ def post_journal(entry, user_id=None):
 def reverse_journal(entry, journal_date, reason, user_id=None):
     if entry.status != "POSTED": raise AccountingError("Only POSTED journals can be reversed")
     reversal = create_draft_journal(journal_date, f"Reversal: {reason}", [{"account_id": l.account_id, "debit": l.credit, "credit": l.debit, "customer_id": l.customer_id, "loan_id": l.loan_id, "payment_id": l.payment_id, "collection_id": l.collection_id, "description": l.description} for l in entry.lines], "REVERSAL", entry.id, "ACCOUNTING", user_id, f"REVERSAL:{entry.id}")
-    reversal.reversal_of_id = entry.id; post_journal(reversal, user_id); entry.status = "REVERSED"; log_audit("JOURNAL_REVERSE", "AccountingJournalEntry", entry.id, user_id, reason); return reversal
+    reversal.reversal_of_id = entry.id; reversal.reversal_of_journal_id = entry.id; reversal.is_reversal = True; post_journal(reversal, user_id); entry.status = "REVERSED"; log_audit("JOURNAL_REVERSE", "AccountingJournalEntry", entry.id, user_id, reason); return reversal
 
 def validate_funding_account(account, *_args):
     if not account:
@@ -801,3 +815,168 @@ def report_csv(data, generated_by=None):
         for r in data['equity']['accounts']: w.writerow(['Equity',r['account_code'],r['account_name'],'','',f"Rs. {Decimal(r['amount']):,.2f}"])
         w.writerow(['Total Liabilities and Equity','','','','',data['total_liabilities_and_equity']])
     return out.getvalue()
+
+# Loan accrual accounting extensions
+LOAN_ACCRUAL_METHOD = "ACCRUAL_BY_INSTALLMENT"
+CASH_BASIS_METHOD = "CASH_BASIS"
+
+def get_setting(key, default=None):
+    setting = AccountingSetting.query.filter_by(setting_key=key).first()
+    return setting.setting_value if setting else default
+
+def is_accounting_period_open(accounting_date):
+    period = AccountingPeriod.query.filter(
+        AccountingPeriod.start_date <= accounting_date,
+        AccountingPeriod.end_date >= accounting_date,
+    ).first()
+    return not (period and period.is_locked), period
+
+def require_open_accounting_period(accounting_date):
+    allow = str(get_setting("allow_posting_to_locked_period", "false")).lower() == "true"
+    open_, period = is_accounting_period_open(accounting_date)
+    if not open_ and not allow:
+        raise AccountingError({"error":"Accounting period is locked", "accounting_date": accounting_date.isoformat(), "period": period.period})
+    return True
+
+def _loan_active_for_accrual(loan):
+    return str(loan.status).upper() in {"ACTIVE", "APPROVED", "STAFF_APPROVED"}
+
+def accrue_due_loan_interest(as_of_date, loan_id=None, historical=False, requested_by=None):
+    if isinstance(as_of_date, str):
+        as_of_date = date.fromisoformat(as_of_date)
+    summary = {"processed_installments": 0, "total_interest_accrued": Decimal("0.00"), "journal_ids": [], "skipped": [], "errors": []}
+    query = LoanLedger.query.join(Loan).filter(
+        LoanLedger.due_date <= as_of_date,
+        LoanLedger.interest_amount > 0,
+        LoanLedger.interest_accrued.is_(False),
+        Loan.interest_accounting_method == LOAN_ACCRUAL_METHOD,
+    )
+    if loan_id:
+        query = query.filter(LoanLedger.loan_id == loan_id)
+    for ledger in query.order_by(LoanLedger.due_date, LoanLedger.id).all():
+        loan = ledger.loan
+        if not _loan_active_for_accrual(loan):
+            summary["skipped"].append({"ledger_id": ledger.id, "reason": "loan_status"}); continue
+        existing = AccountingJournalEntry.query.filter_by(source_type="LOAN_INTEREST_ACCRUAL", source_id=ledger.id).first()
+        if existing:
+            ledger.interest_accrued = True; ledger.interest_accrual_journal_id = existing.id
+            summary["skipped"].append({"ledger_id": ledger.id, "reason": "existing_journal"}); continue
+        try:
+            require_open_accounting_period(ledger.due_date)
+            amount = money(ledger.interest_amount)
+            entry = create_draft_journal(ledger.due_date, f"Interest accrual – Loan {loan.loan_number} – Installment {ledger.installment_no}", [
+                {"account_id": resolve_system_account("INTEREST_RECEIVABLE").id, "debit": amount, "customer_id": loan.customer_id, "loan_id": loan.id},
+                {"account_id": resolve_system_account("LOAN_INTEREST_INCOME").id, "credit": amount, "customer_id": loan.customer_id, "loan_id": loan.id},
+            ], "LOAN_INTEREST_ACCRUAL", ledger.id, "LOANS", requested_by, f"LOAN_INTEREST_ACCRUAL:{ledger.id}")
+            entry.loan_id = loan.id; entry.customer_id = loan.customer_id; entry.accounting_date = ledger.due_date
+            post_journal(entry, requested_by)
+            ledger.interest_accrued = True; ledger.interest_accrued_at = datetime.utcnow(); ledger.interest_accrual_journal_id = entry.id
+            loan.accrual_processed_through = max(loan.accrual_processed_through or ledger.due_date, ledger.due_date)
+            summary["processed_installments"] += 1; summary["total_interest_accrued"] = money(summary["total_interest_accrued"] + amount); summary["journal_ids"].append(entry.id)
+        except Exception as exc:
+            summary["errors"].append({"ledger_id": ledger.id, "error": str(exc)})
+            if not historical:
+                raise
+    return summary
+
+def allocate_payment(loan, amount, paid_date):
+    if str(getattr(loan, "interest_accounting_method", LOAN_ACCRUAL_METHOD)) == LOAN_ACCRUAL_METHOD:
+        accrue_due_loan_interest(paid_date, loan.id, historical=True)
+    remaining = money(amount); principal=interest=penalty=unapplied=Decimal("0.00")
+    allocations=[]
+    for e in sorted(loan.ledger_entries, key=lambda x: (x.due_date, x.installment_no)):
+        if remaining <= 0: break
+        delay_due = money(Decimal(e.delay_interest_accrued or 0) - Decimal(e.delay_interest_paid or 0))
+        pay = min(remaining, delay_due); e.delay_interest_paid = money(Decimal(e.delay_interest_paid or 0)+pay); penalty += pay; remaining -= pay
+        if pay: allocations.append((e, "DELAY_INTEREST", pay))
+        interest_base = Decimal(e.interest_amount) if str(loan.interest_accounting_method) == CASH_BASIS_METHOD or e.interest_accrued else Decimal("0.00")
+        interest_due = money(interest_base - Decimal(e.interest_paid or 0))
+        pay = min(remaining, interest_due); e.interest_paid = money(Decimal(e.interest_paid or 0)+pay); interest += pay; remaining -= pay
+        if pay: allocations.append((e, "INTEREST", pay))
+        principal_due = money(Decimal(e.principal_amount) - Decimal(e.principal_paid or 0))
+        pay = min(remaining, principal_due); e.principal_paid = money(Decimal(e.principal_paid or 0)+pay); principal += pay; remaining -= pay
+        if pay: allocations.append((e, "PRINCIPAL", pay))
+        e.paid_amount = money(Decimal(e.principal_paid or 0)+Decimal(e.interest_paid or 0)+Decimal(e.delay_interest_paid or 0))
+        payable = money(Decimal(e.principal_amount)+Decimal(e.interest_amount)+Decimal(e.delay_interest_accrued or 0))
+        e.status = "PAID" if e.paid_amount >= payable else ("PARTIAL" if e.paid_amount > 0 else e.status)
+        if e.paid_amount > 0: e.paid_date = paid_date
+    if remaining > 0: unapplied = remaining
+    loan._pending_allocations = allocations + ([(None, "UNAPPLIED", unapplied)] if unapplied else [])
+    return money(principal), money(interest), money(penalty), money(unapplied)
+
+def post_loan_payment(payment, user_id=None, receipt_account=None):
+    existing = AccountingJournalEntry.query.filter_by(idempotency_key=f"LOAN_PAYMENT:{payment.id}").first()
+    if existing: return existing
+    total = money(payment.amount_collected); principal=money(payment.principal_paid); interest=money(payment.interest_paid); penalty=money(payment.penalty_paid); other=money(payment.other_fee_paid)
+    if money(principal+interest+penalty+other) != total: raise AccountingError("Payment allocation does not match amount collected")
+    receipt_account = validate_funding_account(receipt_account or resolve_system_account(_method_key(payment.payment_method) or "DEFAULT_CASH_COLLECTION_ACCOUNT"), payment.payment_method)
+    loan = payment.loan
+    lines=[{"account_id": receipt_account.id, "debit": total, "customer_id": loan.customer_id, "loan_id": loan.id, "payment_id": payment.id}]
+    method = getattr(loan, "interest_accounting_method", LOAN_ACCRUAL_METHOD)
+    credit_keys = [("DELAY_INTEREST_RECEIVABLE" if method == LOAN_ACCRUAL_METHOD else "DELAY_INTEREST_INCOME", penalty), ("INTEREST_RECEIVABLE" if method == LOAN_ACCRUAL_METHOD else "LOAN_INTEREST_INCOME", interest), ("LOAN_PRINCIPAL_RECEIVABLE", principal), ("UNAPPLIED_CUSTOMER_FUNDS", other)]
+    for key, amt in credit_keys:
+        if amt > 0: lines.append({"account_id": resolve_system_account(key).id, "credit": amt, "customer_id": loan.customer_id, "loan_id": loan.id, "payment_id": payment.id})
+    entry = create_draft_journal(payment.collection_date, "Loan payment", lines, "LOAN_PAYMENT", payment.id, "PAYMENTS", user_id, f"LOAN_PAYMENT:{payment.id}")
+    entry.loan_id = loan.id; entry.customer_id = loan.customer_id; entry.accounting_date = payment.collection_date
+    posted = post_journal(entry, user_id); payment.journal_id = posted.id
+    for ledger, typ, amt in getattr(loan, "_pending_allocations", []):
+        db.session.add(PaymentAllocation(payment_id=payment.id, loan_id=loan.id, ledger_id=ledger.id if ledger else None, allocation_type=typ, amount=money(amt)))
+    return posted
+
+def reverse_payment(payment, reversal_date, reason, user_id=None):
+    if not reason: raise AccountingError("Reversal reason is required")
+    if isinstance(reversal_date, str): reversal_date = date.fromisoformat(reversal_date)
+    require_open_accounting_period(reversal_date)
+    entry = AccountingJournalEntry.query.get(payment.journal_id) if payment.journal_id else AccountingJournalEntry.query.filter_by(reference_type="LOAN_PAYMENT", reference_id=str(payment.id)).first()
+    if not entry: raise AccountingError("Payment journal not found")
+    rev = reverse_journal(entry, reversal_date, reason, user_id)
+    for alloc in list(payment.allocations):
+        ledger = alloc.ledger
+        if ledger:
+            if alloc.allocation_type == "PRINCIPAL": ledger.principal_paid = money(Decimal(ledger.principal_paid or 0)-Decimal(alloc.amount))
+            elif alloc.allocation_type == "INTEREST": ledger.interest_paid = money(Decimal(ledger.interest_paid or 0)-Decimal(alloc.amount))
+            elif alloc.allocation_type == "DELAY_INTEREST": ledger.delay_interest_paid = money(Decimal(ledger.delay_interest_paid or 0)-Decimal(alloc.amount))
+            ledger.paid_amount = money(Decimal(ledger.principal_paid or 0)+Decimal(ledger.interest_paid or 0)+Decimal(ledger.delay_interest_paid or 0)); ledger.status = "PARTIAL" if ledger.paid_amount > 0 else "PENDING"
+    payment.reversed_at = datetime.utcnow(); payment.reversal_journal_id = rev.id; payment.reversal_reason = reason
+    log_audit("PAYMENT_REVERSE", "Payment", payment.id, user_id, reason)
+    return rev
+
+def reverse_loan_disbursement(loan, reversal_date, reason, user_id=None):
+    if not reason: raise AccountingError("Reversal reason is required")
+    if Payment.query.filter_by(loan_id=loan.id).filter(Payment.reversed_at.is_(None)).count():
+        raise AccountingError("Cannot reverse disbursement while unreversed payments exist")
+    require_open_accounting_period(reversal_date)
+    reversed_ids=[]
+    for ledger in sorted(loan.ledger_entries, key=lambda l: l.installment_no, reverse=True):
+        if ledger.interest_accrual_journal_id:
+            entry = AccountingJournalEntry.query.get(ledger.interest_accrual_journal_id)
+            if entry and entry.status == "POSTED":
+                rev=reverse_journal(entry, reversal_date, reason, user_id); reversed_ids.append(rev.id)
+            ledger.interest_accrued=False; ledger.interest_accrual_journal_id=None
+    entry = AccountingJournalEntry.query.get(loan.disbursement_journal_id) if loan.disbursement_journal_id else AccountingJournalEntry.query.filter_by(reference_type="LOAN_DISBURSEMENT", reference_id=str(loan.id)).first()
+    if entry and entry.status == "POSTED":
+        rev=reverse_journal(entry, reversal_date, reason, user_id); loan.reversal_journal_id=rev.id; reversed_ids.append(rev.id)
+    loan.reversed_at=datetime.utcnow(); loan.status="APPROVED"
+    log_audit("LOAN_DISBURSEMENT_REVERSE", "Loan", loan.id, user_id, reason)
+    return {"reversal_journal_ids": reversed_ids}
+
+def post_loan_disbursement(loan, user_id=None, funding_key="DEFAULT_DISBURSEMENT_ACCOUNT", funding_account=None, disbursement_date=None):
+    existing = AccountingJournalEntry.query.filter_by(idempotency_key=f"LOAN_DISBURSEMENT:{loan.id}").first()
+    if existing:
+        loan.disbursement_journal_id = existing.id
+        return existing
+    amount = money(loan.principal_amount)
+    funding_account = validate_funding_account(funding_account or resolve_system_account(funding_key))
+    journal_date = disbursement_date or loan.start_date or date.today()
+    require_open_accounting_period(journal_date)
+    entry = create_draft_journal(journal_date, "Loan disbursement", [
+        {"account_id": resolve_system_account("LOAN_PRINCIPAL_RECEIVABLE").id, "debit": amount, "customer_id": loan.customer_id, "loan_id": loan.id},
+        {"account_id": funding_account.id, "credit": amount, "customer_id": loan.customer_id, "loan_id": loan.id},
+    ], "LOAN_DISBURSEMENT", loan.id, "LOANS", user_id, f"LOAN_DISBURSEMENT:{loan.id}")
+    entry.loan_id = loan.id; entry.customer_id = loan.customer_id; entry.accounting_date = journal_date
+    posted = post_journal(entry, user_id); loan.disbursement_journal_id = posted.id
+    mode = getattr(loan, "historical_accrual_mode", None) or get_setting("backdated_loan_accounting_mode", "AUTO")
+    if journal_date < date.today() and mode == "AUTO":
+        as_of = min(date.today(), loan.maturity_date or loan.end_date or date.today())
+        accrue_due_loan_interest(as_of, loan.id, historical=True, requested_by=user_id)
+    return posted
