@@ -1,13 +1,13 @@
 """Payment accounting integrity constraints.
 
-Revision ID: 0030_payment_accounting_integrity
+Revision ID: 0030_payment_acct
 Revises: 0029_expand_acct_types
 Create Date: 2026-07-13
 """
 from alembic import op
 import sqlalchemy as sa
 
-revision = "0030_payment_accounting_integrity"
+revision = "0030_payment_acct"
 down_revision = "0029_expand_acct_types"
 branch_labels = None
 depends_on = None
@@ -26,7 +26,10 @@ def upgrade():
             "accounting_journal_entries",
             ["source_type", "source_id"],
             unique=True,
-            postgresql_where=sa.text("source_type is not null and source_id is not null and status != 'REVERSED'"),
+            postgresql_where=sa.text(
+                "source_type is not null and source_id is not null "
+                "and status != 'REVERSED'"
+            ),
         )
 
 
