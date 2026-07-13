@@ -111,32 +111,57 @@ def log_audit(action, entity_type, entity_id=None, user_id=None, details=None):
     db.session.add(AccountingAuditLog(action=action, entity_type=entity_type, entity_id=str(entity_id) if entity_id else None, user_id=user_id, details=str(details) if details is not None else None))
 
 def seed_default_accounts():
-    for code, name, typ, normal, system, category in DEFAULT_ACCOUNTS:
-        acct = AccountingAccount.query.filter_by(account_code=code).first()
-        if not acct:
-            db.session.add(AccountingAccount(account_code=code, account_name=name, account_type=typ, normal_balance=normal, is_system_account=system, cash_flow_category=("RECEIVABLE" if "RECEIVABLE" in category else category), account_subtype=category, allow_manual_posting=(False if code == "1050" else True), is_collection_account=False))
-        else:
+    try:
+        for code, name, typ, normal, system, category in DEFAULT_ACCOUNTS:
+            account_data = {
+                "account_code": code,
+                "account_name": name,
+                "account_type": typ,
+                "normal_balance": normal,
+                "is_system_account": system,
+                "cash_flow_category": "RECEIVABLE" if "RECEIVABLE" in category else category,
+                "account_subtype": category,
+                "allow_manual_posting": False if code == "1050" else True,
+                "is_collection_account": False,
+                "is_active": True,
+            }
+            with db.session.no_autoflush:
+                acct = AccountingAccount.query.filter_by(account_code=code).first()
+            if not acct:
+                db.session.add(AccountingAccount(**account_data))
+                continue
+
             acct.is_system_account = bool(system) or acct.is_system_account
-            # Seed correction is intentionally conservative for existing
-            # accounts: mark core accounts as system accounts and fill missing
-            # metadata, but do not mutate protected accounting identity fields.
             if not account_has_activity(acct):
+                acct.account_name = name
                 acct.account_type = typ
                 acct.normal_balance = normal
                 acct.account_subtype = category
             elif not getattr(acct, "account_subtype", None):
                 acct.account_subtype = category
             if code == "1050":
-                acct.allow_manual_posting = False
+                acct.account_name = "Collector Cash Clearing – Control"
+                acct.account_type = "ASSET"
+                acct.normal_balance = "DEBIT"
+                acct.account_subtype = "COLLECTION_CLEARING_CONTROL"
+                acct.cash_flow_category = "COLLECTION_CLEARING_CONTROL"
                 acct.is_collection_account = False
+                acct.is_system_account = True
+                acct.allow_manual_posting = False
+                acct.is_active = True
                 acct.collector_id = None
-            if getattr(acct, "cash_flow_category", None) in (None, "NONE") and category != "NONE":
+            elif getattr(acct, "cash_flow_category", None) in (None, "NONE") and category != "NONE":
                 acct.cash_flow_category = "RECEIVABLE" if "RECEIVABLE" in category else category
-    db.session.flush()
-    for key, code in SYSTEM_MAPPINGS.items():
-        setting = AccountingSetting.query.filter_by(setting_key=key).first()
-        if not setting:
-            db.session.add(AccountingSetting(setting_key=key, setting_value=code))
+        db.session.flush()
+        for key, code in SYSTEM_MAPPINGS.items():
+            with db.session.no_autoflush:
+                setting = AccountingSetting.query.filter_by(setting_key=key).first()
+            if not setting:
+                db.session.add(AccountingSetting(setting_key=key, setting_value=code))
+        db.session.flush()
+    except Exception:
+        db.session.rollback()
+        raise
 
 def resolve_system_account(key):
     seed_default_accounts()
@@ -1052,8 +1077,14 @@ def generate_next_collection_account_code():
 
 def create_collector_collection_account(collector):
     control = resolve_system_account("collector_clearing_control_account")
-    if control.is_collection_account or control.collector_id is not None:
-        raise AccountingError("Collector clearing control account cannot be linked to a collector")
+    if (
+        not control.is_active
+        or control.allow_manual_posting
+        or account_subtype(control) != "COLLECTION_CLEARING_CONTROL"
+        or control.is_collection_account
+        or control.collector_id is not None
+    ):
+        raise AccountingError("Collector clearing control account is not configured correctly")
     existing = AccountingAccount.query.filter_by(collector_id=collector.id, is_collection_account=True, is_active=True).first()
     if existing:
         raise AccountingError("Only one active default collection account is allowed per collector")
@@ -1062,7 +1093,7 @@ def create_collector_collection_account(collector):
         account_name=f"Collection Account – {collector.name}",
         account_type="ASSET", normal_balance="DEBIT",
         parent_id=control.id, parent_account_id=control.id,
-        account_subtype="COLLECTION_CLEARING",
+        account_subtype="COLLECTION_CLEARING", account_role="COLLECTOR_CASH",
         allow_manual_posting=True, is_active=True,
         is_collection_account=True, collector_id=collector.id,
         cash_flow_category="NONE",
