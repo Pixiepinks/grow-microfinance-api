@@ -1,6 +1,8 @@
 from datetime import date
 from decimal import Decimal
 from flask import Blueprint, request, jsonify
+from sqlalchemy.exc import IntegrityError
+import logging
 from flask_jwt_extended import get_jwt_identity
 from sqlalchemy.orm import joinedload
 
@@ -31,6 +33,18 @@ from ..loan_ledger import (
 from .utils import role_required
 
 admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
+logger = logging.getLogger(__name__)
+
+
+@admin_bp.before_request
+def log_collector_requests():
+    if request.path.startswith("/admin/collectors"):
+        logger.info(
+            "Collector request method=%s path=%s payload_keys=%s",
+            request.method,
+            request.path,
+            sorted((request.get_json(silent=True) or {}).keys()),
+        )
 
 
 @admin_bp.route("/staff", methods=["GET"])
@@ -654,6 +668,7 @@ def _collector_payload(user):
     account = AccountingAccount.query.get(user.default_collection_account_id) if user.default_collection_account_id else None
     return {
         "id": user.id,
+        "staff_id": user.id,
         "name": user.name,
         "employee_code": getattr(user, "employee_code", None),
         "collector_code": user.collector_code,
@@ -664,7 +679,7 @@ def _collector_payload(user):
     }
 
 
-@admin_bp.route("/collectors", methods=["GET"])
+@admin_bp.route("/collectors", methods=["GET"], strict_slashes=False)
 @role_required(["admin"])
 def list_collectors():
     q = User.query.filter(User.is_collector.is_(True))
@@ -679,25 +694,33 @@ def list_collectors():
     return jsonify({"items": [_collector_payload(u) for u in q.order_by(User.name).all()]})
 
 
-@admin_bp.route("/collectors", methods=["POST"])
+@admin_bp.route("/collectors", methods=["POST"], strict_slashes=False)
 @role_required(["admin"])
 def create_collector():
     from ..accounting import create_collector_collection_account
     data = request.get_json() or {}
     staff_id = data.get("staff_id")
     if not staff_id:
-        return jsonify({"message": "staff_id is required"}), 400
-    user = User.query.get_or_404(int(staff_id))
+        return jsonify({"error": "invalid_collector_setup", "message": "staff_id is required"}), 422
+    user = User.query.get(int(staff_id))
+    if not user:
+        return jsonify({"error": "invalid_staff_id", "message": "Submitted staff_id does not match an existing staff record."}), 422
     if user.role not in ("admin", "staff"):
-        return jsonify({"message": "Only staff/admin users can be collectors"}), 422
+        return jsonify({"error": "invalid_collector_setup", "message": "Only staff/admin users can be collectors"}), 422
     try:
+        status = (data.get("status") or data.get("collector_status") or "ACTIVE").upper()
+        if status not in ("ACTIVE", "INACTIVE", "SUSPENDED"):
+            raise AccountingError("Invalid collector_status")
+        collector_code = data.get("collector_code")
+        if collector_code and User.query.filter(User.collector_code == collector_code, User.id != user.id).first():
+            raise AccountingError("collector_code already exists")
+        if user.is_collector and user.collector_status == "ACTIVE" and status == "ACTIVE":
+            raise AccountingError("Selected staff is already an active collector")
         user.is_collector = True
         user.can_collect_cash = bool(data.get("can_collect_cash", True))
-        user.collector_status = (data.get("collector_status") or "ACTIVE").upper()
-        if user.collector_status not in ("ACTIVE", "INACTIVE", "SUSPENDED"):
-            raise AccountingError("Invalid collector_status")
-        if data.get("collector_code") is not None:
-            user.collector_code = data.get("collector_code")
+        user.collector_status = status
+        if collector_code is not None:
+            user.collector_code = collector_code
         if data.get("collection_account_id"):
             acct = AccountingAccount.query.get(int(data["collection_account_id"]))
             from ..accounting import validate_collection_account
@@ -707,9 +730,28 @@ def create_collector():
             create_collector_collection_account(user)
         db.session.commit()
         return jsonify(_collector_payload(user)), 201
-    except AccountingError as exc:
+    except (AccountingError, IntegrityError) as exc:
         db.session.rollback()
-        return jsonify({"error": "Collector setup incomplete", "message": str(exc)}), 422
+        logger.exception("Collector setup failed")
+        message = str(exc.orig) if isinstance(exc, IntegrityError) and getattr(exc, "orig", None) else str(exc)
+        return jsonify({"error": "Collector setup incomplete", "message": message}), 422
+
+
+@admin_bp.route("/collectors/staff-options", methods=["GET"], strict_slashes=False)
+@role_required(["admin"])
+def collector_staff_options():
+    users = User.query.filter(User.is_active.is_(True), User.role.in_(("admin", "staff"))).order_by(User.name).all()
+    items = []
+    for user in users:
+        already = bool(user.is_collector and user.collector_status == "ACTIVE")
+        items.append({
+            "staff_id": user.id,
+            "name": user.name,
+            "employee_code": getattr(user, "employee_code", None),
+            "mobile": getattr(user, "mobile", None),
+            "already_collector": already,
+        })
+    return jsonify({"items": items})
 
 
 @admin_bp.route("/collectors/<int:collector_id>", methods=["PATCH"])

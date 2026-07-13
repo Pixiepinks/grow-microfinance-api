@@ -91,3 +91,47 @@ def test_second_default_account_for_collector_blocked(app, client):
     assert first.status_code == 201
     second = client.patch(f"/admin/collectors/{viraj.id}", headers=_headers(app, admin), json={"create_collection_account": True})
     assert second.status_code == 422
+
+
+def test_collector_routes_support_trailing_slash_staff_options_and_invalid_staff(app, client):
+    admin = _user("admin", "Admin4", "collector-admin4@example.com")
+    staff = _user("staff", "Trailing", "trailing@example.com")
+    seed_default_accounts(); db.session.commit()
+
+    route_rules = {str(rule) for rule in app.url_map.iter_rules()}
+    assert "/admin/collectors" in route_rules
+    assert "/admin/collectors/staff-options" in route_rules
+    assert "/admin/collections/collectors/options" in route_rules
+
+    options = client.get("/admin/collectors/staff-options", headers=_headers(app, admin))
+    assert options.status_code == 200
+    assert any(item["staff_id"] == staff.id and item["already_collector"] is False for item in options.get_json()["items"])
+
+    invalid = client.post("/admin/collectors/", headers=_headers(app, admin), json={"staff_id": 999999})
+    assert invalid.status_code == 422
+    assert invalid.is_json
+    assert invalid.get_json()["error"] == "invalid_staff_id"
+
+    created = client.post(
+        "/admin/collectors/",
+        headers=_headers(app, admin),
+        json={"staff_id": staff.id, "collector_code": "COL-SLASH", "status": "ACTIVE", "can_collect_cash": True, "create_collection_account": True},
+    )
+    assert created.status_code == 201
+    body = created.get_json()
+    assert body["staff_id"] == staff.id
+    assert body["default_collection_account"]["code"] != "1050"
+
+
+def test_seed_default_accounts_is_idempotent_for_collector_control_account(app):
+    seed_default_accounts(); db.session.commit()
+    seed_default_accounts(); db.session.commit()
+
+    accounts = AccountingAccount.query.filter_by(account_code="1050").all()
+    assert len(accounts) == 1
+    acct = accounts[0]
+    assert acct.account_name == "Collector Cash Clearing – Control"
+    assert acct.account_subtype == "COLLECTION_CLEARING_CONTROL"
+    assert acct.cash_flow_category == "COLLECTION_CLEARING_CONTROL"
+    assert acct.allow_manual_posting is False
+    assert acct.is_system_account is True
