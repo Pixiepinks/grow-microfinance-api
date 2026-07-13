@@ -22,7 +22,7 @@ from ..models import (
     AccountingJournalLine,
     CollectionDepositBatch,
 )
-from ..accounting import post_loan_disbursement, AccountingError, accrue_due_loan_interest, reverse_payment, reverse_loan_disbursement, money as acct_money, preview_collection_deposit, create_collection_deposit, reverse_collection_deposit, collector_cash_position, account_subtype
+from ..accounting import post_loan_disbursement, AccountingError, accrue_due_loan_interest, reverse_payment, reverse_loan_disbursement, money as acct_money, preview_collection_deposit, create_collection_deposit, reverse_collection_deposit, collector_cash_position, account_subtype, allocate_payment, post_loan_payment, validate_collection_account, repair_unposted_payment
 from ..loan_ledger import (
     daily_interest_rate,
     generate_loan_ledger,
@@ -388,39 +388,94 @@ def get_loan_ledger(loan_id):
 @admin_bp.route("/loans/<int:loan_id>/ledger/<int:entry_id>/payment", methods=["POST"])
 @role_required(["admin"])
 def record_ledger_payment(loan_id, entry_id):
+    data = request.get_json(silent=True) or {}
+    logger.info(
+        "Record payment request path=%s method=%s loan_id=%s payload_keys=%s",
+        request.path,
+        request.method,
+        loan_id,
+        sorted(data.keys()),
+    )
     loan = Loan.query.get_or_404(loan_id)
-    entry = LoanLedger.query.filter_by(id=entry_id, loan_id=loan.id).first_or_404()
-    data = request.get_json() or {}
-    paid_amount = money(Decimal(str(data.get("paid_amount", "0"))))
-    paid_date = date.fromisoformat(data.get("paid_date"))
+    LoanLedger.query.filter_by(id=entry_id, loan_id=loan.id).first_or_404()
+    try:
+        paid_amount = acct_money(Decimal(str(data.get("paid_amount") or data.get("amount_collected") or "0")))
+        paid_date = date.fromisoformat(data.get("paid_date") or data.get("payment_date") or date.today().isoformat())
+    except Exception:
+        return jsonify({"message": "paid_amount and paid_date must be valid"}), 400
+    if paid_amount <= 0:
+        return jsonify({"message": "paid_amount must be greater than zero"}), 400
 
-    entry.paid_amount = paid_amount
-    entry.paid_date = paid_date
-    entry.delay_days = max((paid_date - entry.due_date).days, 0)
-    entry.delay_interest = money(
-        Decimal(entry.opening_balance)
-        * daily_interest_rate(loan)
-        * Decimal(entry.delay_days)
-    )
-    payable = money(
-        Decimal(entry.installment_amount) + Decimal(entry.delay_interest or 0)
-    )
-    if paid_amount >= payable:
-        entry.status = "PAID"
-    elif paid_amount > 0:
-        entry.status = "PARTIAL"
-    elif entry.delay_days > 0:
-        entry.status = "OVERDUE"
-    else:
-        entry.status = "PENDING"
+    method = (data.get("collection_method") or data.get("payment_method") or "CASH_OFFICE").upper()
+    if method == "CASH": method = "CASH_OFFICE"
+    if method == "BANK": method = "BANK_TRANSFER"
+    collector_id = data.get("collector_id")
+    account_id = data.get("collection_account_id") or data.get("receipt_account_id")
+    receipt_account = None
+    if account_id is not None:
+        try:
+            receipt_account = validate_collection_account(AccountingAccount.query.get(int(account_id)), method, collector_id)
+        except (AccountingError, TypeError, ValueError) as exc:
+            return jsonify({"error": "Collector setup incomplete", "message": str(exc)}), 422 if method == "CASH_COLLECTOR" else 400
+    elif method == "CASH_COLLECTOR":
+        return jsonify({"error": "Collector setup incomplete", "message": "The selected collector has no active posting collection account."}), 422
 
-    db.session.commit()
-    return jsonify(
-        {
-            "ledger": _ledger_to_dict(entry),
-            "totals": ledger_totals(loan),
-        }
-    )
+    try:
+        if not loan.ledger_entries:
+            generate_loan_ledger(loan)
+            db.session.flush()
+        entry = LoanLedger.query.filter_by(id=entry_id, loan_id=loan.id).first_or_404()
+        entry.delay_days = max((paid_date - entry.due_date).days, 0)
+        entry.delay_interest = money(Decimal(entry.opening_balance) * daily_interest_rate(loan) * Decimal(entry.delay_days))
+        entry.delay_interest_accrued = entry.delay_interest
+        principal_paid, interest_paid, penalty_paid, other_fee_paid = allocate_payment(loan, paid_amount, paid_date)
+        payment = Payment(
+            loan_id=loan.id, amount_collected=paid_amount, principal_paid=principal_paid,
+            interest_paid=interest_paid, penalty_paid=penalty_paid, other_fee_paid=other_fee_paid,
+            collection_date=paid_date, payment_date=paid_date, accounting_date=paid_date,
+            collected_by_id=int(get_jwt_identity()), collector_id=int(collector_id) if collector_id else None,
+            payment_method=method, collection_method=method, remarks=data.get("remarks"),
+            transaction_reference=data.get("transaction_reference"),
+            receipt_account_id=receipt_account.id if receipt_account else None,
+            collection_account_id=receipt_account.id if receipt_account else None,
+            bank_reference=data.get("transaction_reference"),
+        )
+        db.session.add(payment); db.session.flush()
+        journal = post_loan_payment(payment, int(get_jwt_identity()), receipt_account=receipt_account)
+        if not payment.journal_id:
+            raise AccountingError("Payment journal was not created")
+        db.session.commit()
+    except AccountingError as exc:
+        db.session.rollback(); logger.exception("Record payment accounting failure loan_id=%s", loan_id)
+        payload = exc.args[0] if exc.args and isinstance(exc.args[0], dict) else {"error": "payment_accounting_failed", "message": str(exc)}
+        return jsonify(payload), 422 if method == "CASH_COLLECTOR" else 400
+    payload = _payment_success_payload(payment, journal)
+    payload.update({"ledger": _ledger_to_dict(entry), "totals": ledger_totals(loan)})
+    return jsonify(payload)
+
+
+def _payment_success_payload(payment, journal):
+    acct = payment.collection_account
+    alloc = {"delay_interest": "0.00", "interest": "0.00", "principal": "0.00", "unapplied": "0.00"}
+    for a in payment.allocations:
+        key = {"DELAY_INTEREST": "delay_interest", "INTEREST": "interest", "PRINCIPAL": "principal", "UNAPPLIED": "unapplied"}.get(a.allocation_type)
+        if key: alloc[key] = f"{acct_money(Decimal(alloc[key]) + Decimal(a.amount)):.2f}"
+    return {"message": "Payment recorded", "payment_id": payment.id, "receipt_number": payment.receipt_number,
+            "journal_entry_id": payment.journal_id, "journal_number": journal.journal_no,
+            "collection_account": {"id": acct.id, "code": acct.account_code, "name": acct.account_name} if acct else None,
+            "allocation": alloc, "deposit_status": payment.deposit_status}
+
+
+@admin_bp.route("/payments/<int:payment_id>/repair-accounting", methods=["POST"], strict_slashes=False)
+@role_required(["admin"])
+def repair_payment_accounting(payment_id):
+    try:
+        result = repair_unposted_payment(payment_id, int(get_jwt_identity()))
+        db.session.commit()
+        return jsonify(result)
+    except AccountingError as exc:
+        db.session.rollback()
+        return jsonify(exc.args[0] if exc.args and isinstance(exc.args[0], dict) else {"message": str(exc)}), 422
 
 
 @admin_bp.route("/dashboard", methods=["GET"])
@@ -567,10 +622,17 @@ def _payment_summary(p):
     }
 
 
-@admin_bp.route("/collections/undeposited", methods=["GET"])
+@admin_bp.route("/collections/undeposited", methods=["GET"], strict_slashes=False)
 @role_required(["admin"])
 def undeposited_collections():
-    q = Payment.query.options(joinedload(Payment.loan).joinedload(Loan.customer)).filter(Payment.reversed_at.is_(None), Payment.deposit_status.in_(["UNDEPOSITED", "PARTIALLY_DEPOSITED"]))
+    q = Payment.query.options(joinedload(Payment.loan).joinedload(Loan.customer)).filter(
+        Payment.reversed_at.is_(None),
+        Payment.collection_method == "CASH_COLLECTOR",
+        Payment.status == "POSTED",
+        Payment.journal_id.isnot(None),
+        Payment.deposit_status.in_(["UNDEPOSITED", "PARTIALLY_DEPOSITED"]),
+        Payment.amount_collected > Payment.deposited_amount,
+    )
     if request.args.get("collector_id"): q = q.filter(Payment.collector_id == int(request.args["collector_id"]))
     if request.args.get("account_id"): q = q.filter(Payment.collection_account_id == int(request.args["account_id"]))
     if request.args.get("loan_id"): q = q.filter(Payment.loan_id == int(request.args["loan_id"]))
@@ -581,7 +643,7 @@ def undeposited_collections():
     return jsonify({"items": [_payment_summary(p) for p in q.order_by(Payment.collection_date, Payment.id).all()]})
 
 
-@admin_bp.route("/collection-deposits/preview", methods=["POST"])
+@admin_bp.route("/collection-deposits/preview", methods=["POST"], strict_slashes=False)
 @role_required(["admin"])
 def preview_deposit():
     try:
@@ -595,7 +657,7 @@ def _deposit_dict(b):
     return {"id": b.id, "deposit_number": b.deposit_number, "collector_id": b.collector_id, "collector": b.collector.name if b.collector else None, "collector_account_id": b.collector_account_id, "collector_account": b.collector_account.account_name if b.collector_account else None, "bank_account_id": b.bank_account_id, "bank_account": b.bank_account.account_name if b.bank_account else None, "deposit_date": b.deposit_date.isoformat(), "accounting_date": b.accounting_date.isoformat(), "total_amount": f"{acct_money(b.total_amount):.2f}", "bank_reference": b.bank_reference, "deposit_slip_reference": b.deposit_slip_reference, "remarks": b.remarks, "journal_entry_id": b.journal_entry_id, "status": b.status, "allocations": [{"payment_id": a.payment_id, "allocated_amount": f"{acct_money(a.allocated_amount):.2f}"} for a in b.allocations]}
 
 
-@admin_bp.route("/collection-deposits", methods=["POST"])
+@admin_bp.route("/collection-deposits", methods=["POST"], strict_slashes=False)
 @role_required(["admin"])
 def create_deposit():
     try:
@@ -607,7 +669,7 @@ def create_deposit():
         return jsonify(exc.args[0] if exc.args and isinstance(exc.args[0], dict) else {"message": str(exc)}), 422
 
 
-@admin_bp.route("/collection-deposits", methods=["GET"])
+@admin_bp.route("/collection-deposits", methods=["GET"], strict_slashes=False)
 @role_required(["admin"])
 def list_deposits():
     q = CollectionDepositBatch.query
@@ -618,13 +680,13 @@ def list_deposits():
     return jsonify({"items": [_deposit_dict(b) for b in q.order_by(CollectionDepositBatch.deposit_date.desc(), CollectionDepositBatch.id.desc()).all()]})
 
 
-@admin_bp.route("/collection-deposits/<int:deposit_id>", methods=["GET"])
+@admin_bp.route("/collection-deposits/<int:deposit_id>", methods=["GET"], strict_slashes=False)
 @role_required(["admin"])
 def get_deposit(deposit_id):
     return jsonify(_deposit_dict(CollectionDepositBatch.query.get_or_404(deposit_id)))
 
 
-@admin_bp.route("/collection-deposits/<int:deposit_id>/reverse", methods=["POST"])
+@admin_bp.route("/collection-deposits/<int:deposit_id>/reverse", methods=["POST"], strict_slashes=False)
 @role_required(["admin"])
 def reverse_deposit(deposit_id):
     data = request.get_json() or {}
@@ -636,7 +698,7 @@ def reverse_deposit(deposit_id):
         db.session.rollback(); return jsonify({"message": str(exc)}), 422
 
 
-@admin_bp.route("/collectors/<int:collector_id>/cash-position", methods=["GET"])
+@admin_bp.route("/collectors/<int:collector_id>/cash-position", methods=["GET"], strict_slashes=False)
 @role_required(["admin"])
 def collector_position(collector_id):
     as_of = date.fromisoformat(request.args["as_of_date"]) if request.args.get("as_of_date") else None
@@ -735,6 +797,23 @@ def create_collector():
         logger.exception("Collector setup failed")
         message = str(exc.orig) if isinstance(exc, IntegrityError) and getattr(exc, "orig", None) else str(exc)
         return jsonify({"error": "Collector setup incomplete", "message": message}), 422
+
+
+@admin_bp.route("/collectors/<int:collector_id>/collection-account", methods=["POST"], strict_slashes=False)
+@role_required(["admin"])
+def create_collector_account(collector_id):
+    from ..accounting import create_collector_collection_account
+    collector = User.query.get_or_404(collector_id)
+    try:
+        acct = create_collector_collection_account(collector)
+        db.session.commit()
+        return jsonify({
+            "collector_id": collector.id,
+            "collection_account": {"id": acct.id, "code": acct.account_code, "name": acct.account_name},
+        }), 201
+    except AccountingError as exc:
+        db.session.rollback()
+        return jsonify({"error": "Collector setup incomplete", "message": str(exc)}), 422
 
 
 @admin_bp.route("/collectors/staff-options", methods=["GET"], strict_slashes=False)

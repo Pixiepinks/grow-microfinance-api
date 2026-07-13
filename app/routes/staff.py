@@ -42,8 +42,12 @@ def list_customers():
 @staff_bp.route("/payments", methods=["POST"])
 @role_required(["admin", "staff"])
 def record_payment():
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
     loan_id = data.get("loan_id")
+    current_app.logger.info(
+        "Record payment request path=%s method=%s loan_id=%s payload_keys=%s",
+        request.path, request.method, loan_id, sorted(data.keys())
+    )
     payment_method = (data.get("collection_method") or data.get("payment_method") or "CASH_OFFICE").upper()
     if payment_method == "CASH": payment_method = "CASH_OFFICE"
     if payment_method == "BANK": payment_method = "BANK_TRANSFER"
@@ -53,7 +57,7 @@ def record_payment():
     collector_id = data.get("collector_id")
     account_id = data.get("collection_account_id") or data.get("receipt_account_id")
     if payment_method == "CASH_COLLECTOR" and (not collector_id or not account_id):
-        return jsonify({"error": "Collector setup incomplete", "message": "collector_id and collection_account_id are required for CASH_COLLECTOR payments."}), 422
+        return jsonify({"error": "Collector setup incomplete", "message": "The selected collector has no active posting collection account."}), 422
     if account_id is not None:
         try:
             receipt_account = validate_collection_account(AccountingAccount.query.get(int(account_id)), payment_method, collector_id)
@@ -122,14 +126,18 @@ def record_payment():
         )
         db.session.add(payment)
         db.session.flush()
-        post_loan_payment(payment, int(get_jwt_identity()), receipt_account=receipt_account)
+        journal = post_loan_payment(payment, int(get_jwt_identity()), receipt_account=receipt_account)
+        if not payment.journal_id:
+            raise AccountingError("Payment journal was not created")
         db.session.commit()
     except AccountingError as exc:
         db.session.rollback()
         status = 422 if payment_method == "CASH_COLLECTOR" else 400
         return jsonify({"error": "Collector setup incomplete", "message": str(exc)}), status
 
-    return jsonify({"message": "Payment recorded", "payment_id": payment.id})
+    acct = payment.collection_account
+    allocation = {"delay_interest": f"{money(payment.penalty_paid):.2f}", "interest": f"{money(payment.interest_paid):.2f}", "principal": f"{money(payment.principal_paid):.2f}", "unapplied": f"{money(payment.other_fee_paid):.2f}"}
+    return jsonify({"message": "Payment recorded", "payment_id": payment.id, "receipt_number": payment.receipt_number, "journal_entry_id": payment.journal_id, "journal_number": journal.journal_no, "collection_account": {"id": acct.id, "code": acct.account_code, "name": acct.account_name} if acct else None, "allocation": allocation, "deposit_status": payment.deposit_status})
 
 
 @staff_bp.route("/today-collections", methods=["GET"])
