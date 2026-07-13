@@ -20,6 +20,7 @@ from .models import (
     LoanLedger,
     Payment,
     PaymentAllocation,
+    CollectionDepositAllocation,
     AccountingPeriod,
     LoanApplication,
     User,
@@ -1087,7 +1088,11 @@ def create_collector_collection_account(collector):
         raise AccountingError("Collector clearing control account is not configured correctly")
     existing = AccountingAccount.query.filter_by(collector_id=collector.id, is_collection_account=True, is_active=True).first()
     if existing:
-        raise AccountingError("Only one active default collection account is allowed per collector")
+        if collector.default_collection_account_id == existing.id:
+            raise AccountingError("Only one active default collection account is allowed per collector")
+        collector.default_collection_account_id = existing.id
+        log_audit("COLLECTOR_ACCOUNT_LINK", "User", collector.id, None, {"account_id": existing.id})
+        return existing
     acct = AccountingAccount(
         account_code=generate_next_collection_account_code(),
         account_name=f"Collection Account – {collector.name}",
@@ -1101,6 +1106,7 @@ def create_collector_collection_account(collector):
     db.session.add(acct)
     db.session.flush()
     collector.default_collection_account_id = acct.id
+    log_audit("COLLECTOR_ACCOUNT_CREATE", "User", collector.id, None, {"account_id": acct.id, "account_code": acct.account_code})
     return acct
 
 def validate_collection_account(account, method, collector_id=None):
@@ -1115,11 +1121,15 @@ def validate_collection_account(account, method, collector_id=None):
         if not collector_id:
             raise AccountingError("Collector setup incomplete: collector_id is required for CASH_COLLECTOR")
         collector = User.query.get(int(collector_id))
-        if not collector or not collector.is_collector or collector.collector_status != "ACTIVE" or not collector.can_collect_cash:
+        if not collector or not collector.is_active or not collector.is_collector or collector.collector_status != "ACTIVE" or not collector.can_collect_cash:
             raise AccountingError("Collector setup incomplete: The selected collector is not active or cannot collect cash.")
+        if not collector.default_collection_account_id:
+            raise AccountingError("The selected collector has no active posting collection account.")
+        if account.id == resolve_system_account("collector_clearing_control_account").id:
+            raise AccountingError("Collector setup incomplete: control account 1050 cannot receive collector payments.")
         if not account.allow_manual_posting or account.account_type != "ASSET" or account.normal_balance != "DEBIT" or subtype != "COLLECTION_CLEARING" or not account.is_collection_account:
-            raise AccountingError("Collector setup incomplete: The selected collector has no active collection account.")
-        if account.collector_id != int(collector_id):
+            raise AccountingError("Collector setup incomplete: The selected collector has no active posting collection account.")
+        if account.collector_id != int(collector_id) or collector.default_collection_account_id != account.id:
             raise AccountingError("Collection account is not linked to the collector")
     return account
 
@@ -1158,9 +1168,11 @@ def post_loan_payment(payment, user_id=None, receipt_account=None):
     acct_method = getattr(loan, "interest_accounting_method", LOAN_ACCRUAL_METHOD)
     for key, amt in [("DELAY_INTEREST_RECEIVABLE" if acct_method == LOAN_ACCRUAL_METHOD else "DELAY_INTEREST_INCOME", penalty), ("INTEREST_RECEIVABLE" if acct_method == LOAN_ACCRUAL_METHOD else "LOAN_INTEREST_INCOME", interest), ("LOAN_PRINCIPAL_RECEIVABLE", principal), ("UNAPPLIED_CUSTOMER_FUNDS", other)]:
         if amt > 0: lines.append({"account_id": resolve_system_account(key).id, "credit": amt, "customer_id": loan.customer_id, "loan_id": loan.id, "payment_id": payment.id})
-    entry = create_draft_journal(pay_date, "Loan payment", lines, "LOAN_PAYMENT", payment.id, "PAYMENTS", user_id, f"LOAN_PAYMENT:{payment.id}")
+    customer_name = loan.customer.full_name if loan.customer else "Customer"
+    entry = create_draft_journal(pay_date, f"Loan payment – {loan.loan_number} – {customer_name}", lines, "LOAN_PAYMENT", payment.id, "PAYMENTS", user_id, f"LOAN_PAYMENT:{payment.id}")
     entry.loan_id = loan.id; entry.customer_id = loan.customer_id; entry.accounting_date = pay_date
     posted = post_journal(entry, user_id)
+    log_audit("PAYMENT_JOURNAL_CREATE", "Payment", payment.id, user_id, {"journal_id": posted.id, "amount": f"{total:.2f}"})
     payment.journal_id = posted.id; payment.payment_date = pay_date; payment.accounting_date = pay_date
     payment.collection_method = method; payment.collection_account_id = receipt_account.id
     payment.receipt_number = payment.receipt_number or generate_receipt_number(pay_date)
@@ -1170,6 +1182,36 @@ def post_loan_payment(payment, user_id=None, receipt_account=None):
         db.session.add(PaymentAllocation(payment_id=payment.id, loan_id=loan.id, ledger_id=ledger.id if ledger else None, allocation_type=typ, amount=money(amt)))
     return posted
 
+
+
+def repair_unposted_payment(payment_id, requested_by=None):
+    payment = Payment.query.get(payment_id)
+    if not payment:
+        raise AccountingError("Payment not found")
+    if payment.journal_id:
+        journal = AccountingJournalEntry.query.get(payment.journal_id)
+        return {"payment_id": payment.id, "journal_created": False, "journal_id": payment.journal_id, "journal_number": journal.journal_no if journal else None, "repaired": False, "message": "already repaired"}
+    if payment.reversed_at:
+        raise AccountingError("Cannot repair a reversed payment")
+    if money(payment.deposited_amount) > 0 or CollectionDepositAllocation.query.filter_by(payment_id=payment.id).first():
+        raise AccountingError("Cannot repair a payment that has deposit allocations")
+    loan = payment.loan
+    total = money(payment.amount_collected)
+    allocated = money(Decimal(payment.principal_paid or 0) + Decimal(payment.interest_paid or 0) + Decimal(payment.penalty_paid or 0) + Decimal(payment.other_fee_paid or 0))
+    if allocated != total:
+        raise AccountingError("Existing payment allocation is inconsistent; reverse and re-enter the payment")
+    if (payment.collection_method or payment.payment_method or "").upper() == "CASH_COLLECTOR":
+        validate_collection_account(payment.collection_account, "CASH_COLLECTOR", payment.collector_id)
+    if not payment.allocations:
+        raise AccountingError("Existing payment has no saved allocation rows; reverse and re-enter the payment")
+    if str(getattr(loan, "interest_accounting_method", LOAN_ACCRUAL_METHOD)) == LOAN_ACCRUAL_METHOD:
+        accrue_due_loan_interest(payment.accounting_date or payment.payment_date or payment.collection_date, loan.id, historical=True, requested_by=requested_by)
+    receipt_account = payment.collection_account or AccountingAccount.query.get(payment.receipt_account_id)
+    journal = post_loan_payment(payment, requested_by, receipt_account=receipt_account)
+    if not payment.journal_id:
+        raise AccountingError("Payment journal was not created")
+    log_audit("PAYMENT_ACCOUNTING_REPAIR", "Payment", payment.id, requested_by, {"journal_id": journal.id, "amount": f"{total:.2f}"})
+    return {"payment_id": payment.id, "journal_created": True, "journal_id": journal.id, "journal_number": journal.journal_no, "repaired": True}
 
 def _payment_deposit_status(payment):
     if payment.reversed_at: return "REVERSED"

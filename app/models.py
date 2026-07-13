@@ -2,7 +2,7 @@ from datetime import datetime, date
 from decimal import Decimal
 from werkzeug.security import generate_password_hash, check_password_hash
 from sqlalchemy.orm import relationship
-from sqlalchemy import Numeric, func
+from sqlalchemy import Numeric, func, Index
 
 from .extensions import db
 
@@ -519,6 +519,9 @@ class AccountingAccount(db.Model):
 
 class AccountingJournalEntry(db.Model):
     __tablename__ = "accounting_journal_entries"
+    __table_args__ = (
+        Index("uq_journal_source_posted", "source_type", "source_id", unique=True, postgresql_where=db.text("source_type is not null and source_id is not null and status != 'REVERSED'")),
+    )
 
     id = db.Column(db.Integer, primary_key=True)
     journal_no = db.Column(db.String(40), unique=True, index=True, nullable=False)
