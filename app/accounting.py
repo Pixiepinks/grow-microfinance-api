@@ -105,6 +105,25 @@ SETTING_VALIDATION = {
 class AccountingError(ValueError):
     pass
 
+
+class ValidationError(AccountingError):
+    def __init__(self, error, **payload):
+        super().__init__(error)
+        self.message = error
+        self.payload = {"error": error, **payload}
+        if "message" not in self.payload:
+            self.payload["message"] = error
+
+
+def parse_positive_int(value, field_name):
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        raise ValidationError(f"{field_name} must be a valid integer")
+    if result <= 0:
+        raise ValidationError(f"{field_name} must be greater than zero")
+    return result
+
 def money(value) -> Decimal:
     return Decimal(str(value or "0")).quantize(CENT, rounding=ROUND_HALF_UP)
 
@@ -235,7 +254,7 @@ def validate_journal(entry):
     for line in entry.lines:
         line.debit = money(line.debit); line.credit = money(line.credit)
         if (line.debit > 0 and line.credit > 0) or (line.debit == 0 and line.credit == 0): raise AccountingError("Each line must have either debit or credit")
-        acct = AccountingAccount.query.get(line.account_id)
+        acct = db.session.get(AccountingAccount, line.account_id)
         if not acct or not acct.is_active: raise AccountingError("Inactive or missing account cannot receive postings")
         if acct.children and not acct.allow_manual_posting: raise AccountingError("Parent account is not postable")
         debit += line.debit; credit += line.credit
@@ -1228,36 +1247,187 @@ def collector_cash_position(collector_id, as_of_date=None):
     return {"collections": money(collections), "deposits": money(deposits), "adjustments": Decimal("0.00"), "closing_balance": money(collections-deposits), "undeposited_payments": [p for p in payments if money(p.undeposited_amount) > 0]}
 
 
+def _validation_payload(exc):
+    if isinstance(exc, ValidationError):
+        return exc.payload
+    if exc.args and isinstance(exc.args[0], dict):
+        return exc.args[0]
+    return {"error": str(exc), "message": str(exc)}
+
+
+def _account_dict(account):
+    return {
+        "id": account.id,
+        "code": account.account_code,
+        "name": account.account_name,
+    }
+
+
+def _collector_dict(collector):
+    return {"id": collector.id, "name": collector.name}
+
+
+def _parse_deposit_date(value):
+    try:
+        parsed = date.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        raise ValidationError("deposit_date must be a valid ISO date")
+    if parsed > date.today():
+        raise ValidationError("Unsupported future deposit dates are not allowed")
+    try:
+        require_open_accounting_period(parsed)
+    except AccountingError as exc:
+        payload = _validation_payload(exc)
+        raise ValidationError(payload.get("error") or payload.get("message") or "Accounting period is not open", **{k: v for k, v in payload.items() if k not in {"error", "message"}})
+    return parsed
+
+
+def validate_collection_deposit_payload(data):
+    data = data or {}
+    required_fields = ["collector_id", "collector_account_id", "bank_account_id", "deposit_date", "allocations"]
+    missing = [field for field in required_fields if data.get(field) in (None, "", [])]
+    if missing:
+        message = "Collector collection account is required." if "collector_account_id" in missing else "Required collection deposit fields are missing."
+        raise ValidationError("Collection deposit validation failed", missing_fields=missing, message=message)
+
+    collector_id = parse_positive_int(data.get("collector_id"), "collector_id")
+    collector_account_id = parse_positive_int(data.get("collector_account_id"), "collector_account_id")
+    bank_account_id = parse_positive_int(data.get("bank_account_id"), "bank_account_id")
+    deposit_date = _parse_deposit_date(data.get("deposit_date"))
+
+    collector = db.session.get(User, collector_id)
+    if not collector:
+        raise ValidationError("Collector not found")
+    if not collector.is_active or collector.collector_status != "ACTIVE":
+        raise ValidationError("Collector must be active")
+    if not collector.can_collect_cash:
+        raise ValidationError("Collector is not permitted to collect cash")
+    if not collector.default_collection_account_id:
+        raise ValidationError("Collector default collection account is required")
+
+    collector_account = db.session.get(AccountingAccount, collector_account_id)
+    if not collector_account:
+        raise ValidationError("Collector collection account not found")
+    control = resolve_system_account("collector_clearing_control_account")
+    if collector_account.id == control.id or collector_account.account_code == "1050":
+        raise ValidationError("Control account 1050 cannot be used as a collector deposit account")
+    if not collector_account.is_active:
+        raise ValidationError("Collector collection account must be active")
+    if collector_account.account_type != "ASSET":
+        raise ValidationError("Collector collection account must be an ASSET account")
+    if account_subtype(collector_account) != "COLLECTION_CLEARING":
+        raise ValidationError("Collector collection account subtype must be COLLECTION_CLEARING")
+    if not collector_account.is_collection_account:
+        raise ValidationError("Collector collection account must be flagged as a collection account")
+    if not collector_account.allow_manual_posting:
+        raise ValidationError("Collector collection account must allow posting")
+    if collector_account.collector_id != collector.id:
+        raise ValidationError("Collection account is not linked to the collector")
+    if collector.default_collection_account_id != collector_account.id and not data.get("allow_non_default_collector_account"):
+        raise ValidationError("Submitted collector account must match the collector's default collection account")
+
+    bank = db.session.get(AccountingAccount, bank_account_id)
+    if not bank:
+        raise ValidationError("Bank account not found")
+    if not bank.is_active:
+        raise ValidationError("Bank account must be active")
+    if bank.account_type != "ASSET":
+        raise ValidationError("Bank account must be an ASSET account")
+    if account_subtype(bank) != "BANK":
+        raise ValidationError("Bank account subtype must be BANK")
+    if not bank.allow_manual_posting:
+        raise ValidationError("Bank account must allow posting")
+
+    allocations = data.get("allocations") or []
+    if not isinstance(allocations, list):
+        raise ValidationError("allocations must be a list")
+    seen = set(); total = Decimal("0.00"); rows = []
+    earliest_payment_date = None
+    for idx, raw in enumerate(allocations):
+        if not isinstance(raw, dict):
+            raise ValidationError("Each allocation must be an object", allocation_index=idx)
+        payment_id = parse_positive_int(raw.get("payment_id"), "payment_id")
+        if payment_id in seen:
+            raise ValidationError("Duplicate payment allocation submitted", payment_id=payment_id)
+        seen.add(payment_id)
+        amt = money(raw.get("amount"))
+        if amt <= 0:
+            raise ValidationError("Allocation amount must be greater than zero", payment_id=payment_id)
+        payment = db.session.get(Payment, payment_id)
+        if not payment:
+            raise ValidationError("Payment not found", payment_id=payment_id)
+        payment_date = payment.accounting_date or payment.payment_date or payment.collection_date
+        earliest_payment_date = payment_date if earliest_payment_date is None else min(earliest_payment_date, payment_date)
+        if payment.collector_id != collector.id:
+            raise ValidationError("Payment does not belong to selected collector", payment_id=payment_id)
+        if payment.collection_account_id != collector_account.id:
+            raise ValidationError("Payment collection account does not match selected collector account", payment_id=payment_id)
+        if (payment.collection_method or "").upper() != "CASH_COLLECTOR":
+            raise ValidationError("Payment collection method must be CASH_COLLECTOR", payment_id=payment_id)
+        if payment.status != "POSTED" or not payment.journal_id:
+            raise ValidationError("Payment must be posted with a journal before deposit", payment_id=payment_id)
+        if payment.reversed_at or payment.deposit_status in ("NOT_APPLICABLE", "REVERSED"):
+            raise ValidationError("Payment is not depositable", payment_id=payment_id)
+        if payment_date and payment_date > deposit_date:
+            raise ValidationError("Deposit date cannot be earlier than any selected payment date", payment_id=payment_id)
+        if amt > money(payment.undeposited_amount):
+            raise ValidationError("Allocation exceeds undeposited amount", payment_id=payment_id, undeposited_amount=f"{money(payment.undeposited_amount):.2f}")
+        total += amt; rows.append({"payment": payment, "amount": amt})
+    if total <= 0:
+        raise ValidationError("Deposit allocations are required")
+    balance = collector_cash_position(collector.id, deposit_date)["closing_balance"]
+    if total > money(balance):
+        raise ValidationError("Historical collector balance is insufficient as of deposit date", collector_balance=f"{money(balance):.2f}")
+    return {"collector": collector, "collector_account": collector_account, "bank_account": bank, "deposit_date": deposit_date, "total_amount": money(total), "rows": rows, "remaining_collector_balance": money(balance - total), "raw": data}
+
+
+def build_collection_deposit_preview(validated_data):
+    total = money(validated_data["total_amount"])
+    bank = validated_data["bank_account"]
+    collector_account = validated_data["collector_account"]
+    return {
+        "collector": _collector_dict(validated_data["collector"]),
+        "collector_account": _account_dict(collector_account),
+        "bank_account": _account_dict(bank),
+        "deposit_date": validated_data["deposit_date"].isoformat(),
+        "total_amount": float(total) if total % 1 else int(total),
+        "remaining_collector_balance": float(money(validated_data["remaining_collector_balance"])),
+        "journal_preview": {
+            "debits": [{"account_id": bank.id, "account_code": bank.account_code, "account_name": bank.account_name, "amount": float(total) if total % 1 else int(total)}],
+            "credits": [{"account_id": collector_account.id, "account_code": collector_account.account_code, "account_name": collector_account.account_name, "amount": float(total) if total % 1 else int(total)}],
+        },
+        "validation_errors": [],
+    }
+
+
 def preview_collection_deposit(data):
-    collector_id = int(data["collector_id"]); collector_account = AccountingAccount.query.get(int(data["collector_account_id"])); bank = AccountingAccount.query.get(int(data["bank_account_id"]))
-    validate_collection_account(collector_account, "CASH_COLLECTOR", collector_id)
-    if not bank or account_subtype(bank) != "BANK": raise AccountingError("bank_account_id must be an active bank account")
-    deposit_date = date.fromisoformat(data.get("deposit_date") or date.today().isoformat()); require_open_accounting_period(deposit_date)
-    seen=set(); total=Decimal("0.00"); errors=[]; rows=[]
-    for raw in data.get("allocations") or []:
-        pid=int(raw["payment_id"]); amt=money(raw.get("amount"))
-        if pid in seen: errors.append({"payment_id": pid, "message": "Duplicate deposit allocation"}); continue
-        seen.add(pid); p=Payment.query.get(pid)
-        if not p or p.collector_id != collector_id or p.collection_account_id != collector_account.id: errors.append({"payment_id": pid, "message": "Payment not eligible for this collector/account"}); continue
-        if p.reversed_at or p.deposit_status in ("NOT_APPLICABLE", "REVERSED"): errors.append({"payment_id": pid, "message": "Payment is not depositable"}); continue
-        if deposit_date < (p.accounting_date or p.collection_date): errors.append({"payment_id": pid, "message": "Deposit date cannot precede payment date"}); continue
-        if amt <= 0 or amt > money(p.undeposited_amount): errors.append({"payment_id": pid, "message": "Allocation exceeds undeposited amount"}); continue
-        total += amt; rows.append((p, amt))
-    return {"collector_account": collector_account, "bank_account": bank, "deposit_date": deposit_date, "total_amount": money(total), "rows": rows, "validation_errors": errors, "journal_preview": {"debit_account": bank.account_name, "credit_account": collector_account.account_name, "amount": f"{money(total):.2f}"}}
+    return build_collection_deposit_preview(validate_collection_deposit_payload(data))
 
 
 def create_collection_deposit(data, user_id=None):
     from .models import CollectionDepositBatch, CollectionDepositAllocation
-    preview = preview_collection_deposit(data)
-    if preview["validation_errors"]: raise AccountingError({"validation_errors": preview["validation_errors"]})
-    total = preview["total_amount"]
-    if total <= 0: raise AccountingError("Deposit allocations are required")
-    batch = CollectionDepositBatch(deposit_number=generate_deposit_number(preview["deposit_date"]), collector_id=int(data["collector_id"]), collector_account_id=preview["collector_account"].id, bank_account_id=preview["bank_account"].id, deposit_date=preview["deposit_date"], accounting_date=preview["deposit_date"], total_amount=total, bank_reference=data.get("bank_reference"), deposit_slip_reference=data.get("deposit_slip_reference"), remarks=data.get("remarks"), created_by=user_id, status="POSTED")
+    validated = validate_collection_deposit_payload(data)
+    total = validated["total_amount"]
+    batch = CollectionDepositBatch(
+        deposit_number=generate_deposit_number(validated["deposit_date"]), collector_id=validated["collector"].id,
+        collector_account_id=validated["collector_account"].id, bank_account_id=validated["bank_account"].id,
+        deposit_date=validated["deposit_date"], accounting_date=validated["deposit_date"], total_amount=total,
+        bank_reference=data.get("bank_reference"), deposit_slip_reference=data.get("deposit_slip_reference"), remarks=data.get("remarks"),
+        created_by=user_id, status="POSTED")
     db.session.add(batch); db.session.flush()
-    for p, amt in preview["rows"]:
-        db.session.add(CollectionDepositAllocation(deposit_batch_id=batch.id, payment_id=p.id, allocated_amount=amt)); p.deposited_amount=money(Decimal(p.deposited_amount or 0)+amt); p.deposit_status=_payment_deposit_status(p)
-    entry=create_draft_journal(batch.accounting_date, f"Collector deposit {batch.deposit_number}", [{"account_id": batch.bank_account_id, "debit": total}, {"account_id": batch.collector_account_id, "credit": total}], "COLLECTION_DEPOSIT", batch.id, "COLLECTIONS", user_id, f"COLLECTION_DEPOSIT:{batch.id}")
-    posted=post_journal(entry, user_id); batch.journal_entry_id=posted.id; log_audit("COLLECTION_DEPOSIT_POST", "CollectionDepositBatch", batch.id, user_id)
+    for row in validated["rows"]:
+        p = row["payment"]; amt = row["amount"]
+        db.session.add(CollectionDepositAllocation(deposit_batch_id=batch.id, payment_id=p.id, allocated_amount=amt))
+        p.deposited_amount = money(Decimal(p.deposited_amount or 0) + amt)
+        p.deposit_status = _payment_deposit_status(p)
+    entry = create_draft_journal(
+        batch.accounting_date, f"Collector deposit {batch.deposit_number}",
+        [{"account_id": batch.bank_account_id, "debit": total}, {"account_id": batch.collector_account_id, "credit": total}],
+        "COLLECTION_DEPOSIT", batch.id, "COLLECTIONS", user_id, f"COLLECTION_DEPOSIT:{batch.id}")
+    posted = post_journal(entry, user_id)
+    batch.journal_entry_id = posted.id
+    log_audit("COLLECTION_DEPOSIT_POST", "CollectionDepositBatch", batch.id, user_id)
+    batch._collector_account_balance_after = validated["remaining_collector_balance"]
     return batch
 
 

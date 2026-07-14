@@ -22,7 +22,7 @@ from ..models import (
     AccountingJournalLine,
     CollectionDepositBatch,
 )
-from ..accounting import post_loan_disbursement, AccountingError, accrue_due_loan_interest, reverse_payment, reverse_loan_disbursement, money as acct_money, preview_collection_deposit, create_collection_deposit, reverse_collection_deposit, collector_cash_position, account_subtype, allocate_payment, post_loan_payment, validate_collection_account, repair_unposted_payment, require_open_accounting_period
+from ..accounting import post_loan_disbursement, AccountingError, accrue_due_loan_interest, reverse_payment, reverse_loan_disbursement, money as acct_money, preview_collection_deposit, create_collection_deposit, reverse_collection_deposit, collector_cash_position, account_subtype, allocate_payment, post_loan_payment, validate_collection_account, repair_unposted_payment, require_open_accounting_period, ValidationError
 from ..loan_ledger import (
     daily_interest_rate,
     generate_loan_ledger,
@@ -677,9 +677,15 @@ def undeposited_collections():
 def preview_deposit():
     try:
         result = preview_collection_deposit(request.get_json() or {})
-        return jsonify({"total_amount": f"{result['total_amount']:.2f}", "journal_preview": result["journal_preview"], "validation_errors": result["validation_errors"]})
+        return jsonify(result)
+    except ValidationError as exc:
+        return jsonify(exc.payload), 422
     except AccountingError as exc:
-        return jsonify({"message": str(exc)}), 422
+        return jsonify(exc.args[0] if exc.args and isinstance(exc.args[0], dict) else {"message": str(exc), "error": str(exc)}), 422
+    except Exception:
+        db.session.rollback()
+        logger.exception("Unexpected collection deposit preview failure")
+        return jsonify({"error": "Internal server error", "message": "Unable to preview collection deposit."}), 500
 
 
 def _deposit_dict(b):
@@ -692,10 +698,26 @@ def create_deposit():
     try:
         batch = create_collection_deposit(request.get_json() or {}, int(get_jwt_identity()))
         db.session.commit()
-        return jsonify(_deposit_dict(batch)), 201
+        journal = batch.journal_entry
+        return jsonify({
+            "deposit_batch_id": batch.id,
+            "deposit_number": batch.deposit_number,
+            "journal_entry_id": batch.journal_entry_id,
+            "journal_number": journal.journal_no if journal else None,
+            "total_amount": float(acct_money(batch.total_amount)),
+            "collector_account_balance_after": float(acct_money(getattr(batch, "_collector_account_balance_after", 0))),
+            "status": batch.status,
+        }), 201
+    except ValidationError as exc:
+        db.session.rollback()
+        return jsonify(exc.payload), 422
     except AccountingError as exc:
         db.session.rollback()
-        return jsonify(exc.args[0] if exc.args and isinstance(exc.args[0], dict) else {"message": str(exc)}), 422
+        return jsonify(exc.args[0] if exc.args and isinstance(exc.args[0], dict) else {"message": str(exc), "error": str(exc)}), 422
+    except Exception:
+        db.session.rollback()
+        logger.exception("Unexpected collection deposit posting failure")
+        return jsonify({"error": "Internal server error", "message": "Unable to post collection deposit."}), 500
 
 
 @admin_bp.route("/collection-deposits", methods=["GET"], strict_slashes=False)
