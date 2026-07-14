@@ -1,5 +1,5 @@
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from flask import Blueprint, request, jsonify
 from sqlalchemy.exc import IntegrityError
 import logging
@@ -22,7 +22,7 @@ from ..models import (
     AccountingJournalLine,
     CollectionDepositBatch,
 )
-from ..accounting import post_loan_disbursement, AccountingError, accrue_due_loan_interest, reverse_payment, reverse_loan_disbursement, money as acct_money, preview_collection_deposit, create_collection_deposit, reverse_collection_deposit, collector_cash_position, account_subtype, allocate_payment, post_loan_payment, validate_collection_account, repair_unposted_payment
+from ..accounting import post_loan_disbursement, AccountingError, accrue_due_loan_interest, reverse_payment, reverse_loan_disbursement, money as acct_money, preview_collection_deposit, create_collection_deposit, reverse_collection_deposit, collector_cash_position, account_subtype, allocate_payment, post_loan_payment, validate_collection_account, repair_unposted_payment, require_open_accounting_period
 from ..loan_ledger import (
     daily_interest_rate,
     generate_loan_ledger,
@@ -398,29 +398,54 @@ def record_ledger_payment(loan_id, entry_id):
     )
     loan = Loan.query.get_or_404(loan_id)
     LoanLedger.query.filter_by(id=entry_id, loan_id=loan.id).first_or_404()
+
+    raw_paid_amount = data.get("paid_amount")
+    if raw_paid_amount is None:
+        raw_paid_amount = data.get("amount")
     try:
-        paid_amount = acct_money(Decimal(str(data.get("paid_amount") or data.get("amount_collected") or "0")))
-        paid_date = date.fromisoformat(data.get("paid_date") or data.get("payment_date") or date.today().isoformat())
-    except Exception:
-        return jsonify({"message": "paid_amount and paid_date must be valid"}), 400
-    if paid_amount <= 0:
-        return jsonify({"message": "paid_amount must be greater than zero"}), 400
+        paid_amount = acct_money(Decimal(str(raw_paid_amount)))
+    except (InvalidOperation, TypeError, ValueError):
+        return jsonify({"error": "Invalid payment amount", "message": "paid_amount must be a valid number"}), 422
+    if paid_amount <= Decimal("0"):
+        return jsonify({"error": "Invalid payment amount", "message": "paid_amount must be greater than zero"}), 422
+
+    try:
+        paid_date = date.fromisoformat(data.get("payment_date") or data.get("paid_date") or date.today().isoformat())
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid payment date", "message": "payment_date must be a valid ISO date"}), 422
+    if paid_date < loan.start_date:
+        return jsonify({"error": "Invalid payment date", "message": "payment_date cannot be before loan disbursement date"}), 422
 
     method = (data.get("collection_method") or data.get("payment_method") or "CASH_OFFICE").upper()
-    if method == "CASH": method = "CASH_OFFICE"
-    if method == "BANK": method = "BANK_TRANSFER"
+    if method == "CASH":
+        method = "CASH_OFFICE"
+    if method == "BANK":
+        method = "BANK_TRANSFER"
+
     collector_id = data.get("collector_id")
     account_id = data.get("collection_account_id") or data.get("receipt_account_id")
+    reference = data.get("reference") or data.get("transaction_reference")
+    remarks = data.get("remarks")
+    if reference is not None and not isinstance(reference, str):
+        return jsonify({"error": "Invalid reference", "message": "reference must be a string"}), 422
+    if remarks is not None and not isinstance(remarks, str):
+        return jsonify({"error": "Invalid remarks", "message": "remarks must be a string"}), 422
+    if method not in {"CASH_COLLECTOR", "BANK_TRANSFER", "CASH_OFFICE", "CHEQUE", "MOBILE_TRANSFER", "OTHER"}:
+        return jsonify({"error": "Invalid collection method", "message": "collection_method is not supported"}), 422
+
     receipt_account = None
     if account_id is not None:
         try:
             receipt_account = validate_collection_account(AccountingAccount.query.get(int(account_id)), method, collector_id)
         except (AccountingError, TypeError, ValueError) as exc:
-            return jsonify({"error": "Collector setup incomplete", "message": str(exc)}), 422 if method == "CASH_COLLECTOR" else 400
+            return jsonify({"error": "Collector setup incomplete", "message": str(exc)}), 422
     elif method == "CASH_COLLECTOR":
         return jsonify({"error": "Collector setup incomplete", "message": "The selected collector has no active posting collection account."}), 422
 
     try:
+        require_open_accounting_period(paid_date)
+        if str(getattr(loan, "interest_accounting_method", "ACCRUAL_BY_INSTALLMENT")) == "ACCRUAL_BY_INSTALLMENT":
+            accrue_due_loan_interest(paid_date, loan.id, historical=True, requested_by=int(get_jwt_identity()))
         if not loan.ledger_entries:
             generate_loan_ledger(loan)
             db.session.flush()
@@ -434,36 +459,40 @@ def record_ledger_payment(loan_id, entry_id):
             interest_paid=interest_paid, penalty_paid=penalty_paid, other_fee_paid=other_fee_paid,
             collection_date=paid_date, payment_date=paid_date, accounting_date=paid_date,
             collected_by_id=int(get_jwt_identity()), collector_id=int(collector_id) if collector_id else None,
-            payment_method=method, collection_method=method, remarks=data.get("remarks"),
-            transaction_reference=data.get("transaction_reference"),
+            payment_method=method, collection_method=method, remarks=remarks,
+            transaction_reference=reference,
             receipt_account_id=receipt_account.id if receipt_account else None,
             collection_account_id=receipt_account.id if receipt_account else None,
-            bank_reference=data.get("transaction_reference"),
+            bank_reference=reference,
         )
-        db.session.add(payment); db.session.flush()
+        db.session.add(payment)
+        db.session.flush()
         journal = post_loan_payment(payment, int(get_jwt_identity()), receipt_account=receipt_account)
         if not payment.journal_id:
             raise AccountingError("Payment journal was not created")
         db.session.commit()
-    except AccountingError as exc:
-        db.session.rollback(); logger.exception("Record payment accounting failure loan_id=%s", loan_id)
-        payload = exc.args[0] if exc.args and isinstance(exc.args[0], dict) else {"error": "payment_accounting_failed", "message": str(exc)}
-        return jsonify(payload), 422 if method == "CASH_COLLECTOR" else 400
+    except Exception as exc:
+        db.session.rollback()
+        logger.exception("Record payment accounting failure loan_id=%s", loan_id)
+        payload = exc.args[0] if isinstance(exc, AccountingError) and exc.args and isinstance(exc.args[0], dict) else {"error": "payment_accounting_failed", "message": str(exc)}
+        return jsonify(payload), 422 if method == "CASH_COLLECTOR" or isinstance(exc, AccountingError) else 400
     payload = _payment_success_payload(payment, journal)
     payload.update({"ledger": _ledger_to_dict(entry), "totals": ledger_totals(loan)})
     return jsonify(payload)
 
-
 def _payment_success_payload(payment, journal):
     acct = payment.collection_account
-    alloc = {"delay_interest": "0.00", "interest": "0.00", "principal": "0.00", "unapplied": "0.00"}
+    alloc = {"delay_interest": Decimal("0.00"), "interest": Decimal("0.00"), "principal": Decimal("0.00"), "unapplied": Decimal("0.00")}
     for a in payment.allocations:
         key = {"DELAY_INTEREST": "delay_interest", "INTEREST": "interest", "PRINCIPAL": "principal", "UNAPPLIED": "unapplied"}.get(a.allocation_type)
-        if key: alloc[key] = f"{acct_money(Decimal(alloc[key]) + Decimal(a.amount)):.2f}"
+        if key:
+            alloc[key] = acct_money(alloc[key] + Decimal(a.amount))
     return {"message": "Payment recorded", "payment_id": payment.id, "receipt_number": payment.receipt_number,
             "journal_entry_id": payment.journal_id, "journal_number": journal.journal_no,
+            "paid_amount": float(acct_money(payment.amount_collected)),
+            "allocation": {key: float(value) for key, value in alloc.items()},
             "collection_account": {"id": acct.id, "code": acct.account_code, "name": acct.account_name} if acct else None,
-            "allocation": alloc, "deposit_status": payment.deposit_status}
+            "deposit_status": payment.deposit_status}
 
 
 @admin_bp.route("/payments/<int:payment_id>/repair-accounting", methods=["POST"], strict_slashes=False)
