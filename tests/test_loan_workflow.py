@@ -5,7 +5,8 @@ from io import BytesIO
 from flask_jwt_extended import create_access_token
 
 from app.extensions import db
-from app.models import Customer, Loan, LoanApplication, LoanApplicationDocument, User
+from app.models import Customer, Loan, LoanApplication, LoanApplicationDocument, User, LoanLedger, Payment, AccountingJournalLine, AccountingJournalEntry
+from app.accounting import seed_default_accounts
 from app.routes.loan_applications import (
     STATUS_APPROVED,
     STATUS_REJECTED,
@@ -69,6 +70,153 @@ def _sample_application_payload():
         "business_type": "Retail",
     }
 
+
+
+def _ledger_payment_fixture(admin_user, loan_number="LN-LEDGER-PAY"):
+    seed_default_accounts()
+    customer_user = _create_user("customer", f"{loan_number} Customer", f"{loan_number.lower()}@example.com")
+    customer = _customer_profile(customer_user, code=f"CUST-{loan_number[-6:]}")
+    loan = Loan(
+        loan_number=loan_number,
+        customer_id=customer.id,
+        principal_amount=Decimal("1666.67"),
+        interest_rate=Decimal("0"),
+        total_days=1,
+        payment_interval_days=1,
+        daily_installment=Decimal("2100.00"),
+        total_payable=Decimal("2100.00"),
+        start_date=date(2026, 2, 20),
+        end_date=date(2026, 2, 20),
+        status="ACTIVE",
+        created_by_id=admin_user.id,
+        interest_accounting_method="CASH_BASIS",
+    )
+    db.session.add(loan)
+    db.session.flush()
+    ledger = LoanLedger(
+        loan_id=loan.id,
+        installment_no=1,
+        period_start_date=date(2026, 2, 20),
+        due_date=date(2026, 2, 20),
+        period_days=1,
+        opening_balance=Decimal("1666.67"),
+        principal_amount=Decimal("1666.67"),
+        interest_amount=Decimal("433.33"),
+        installment_amount=Decimal("2100.00"),
+        closing_balance=Decimal("0.00"),
+        paid_amount=Decimal("0.00"),
+        status="PENDING",
+    )
+    db.session.add(ledger)
+    db.session.commit()
+    return loan, ledger
+
+
+def test_ledger_payment_accepts_paid_amount(app, client):
+    admin_user = _create_user("admin", "Ledger Paid Amount Admin", "ledger-paid@example.com")
+    loan, ledger = _ledger_payment_fixture(admin_user, "LN-LEDGER-PAID")
+
+    response = client.post(
+        f"/admin/loans/{loan.id}/ledger/{ledger.id}/payment",
+        headers=_auth_headers(app, admin_user),
+        json={"paid_amount": 2100, "payment_date": "2026-02-20"},
+    )
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["paid_amount"] == 2100.0
+    assert body["allocation"] == {"delay_interest": 0.0, "interest": 433.33, "principal": 1666.67, "unapplied": 0.0}
+    assert body["journal_entry_id"]
+
+
+def test_ledger_payment_accepts_amount_fallback(app, client):
+    admin_user = _create_user("admin", "Ledger Amount Admin", "ledger-amount@example.com")
+    loan, ledger = _ledger_payment_fixture(admin_user, "LN-LEDGER-AMOUNT")
+
+    response = client.post(
+        f"/admin/loans/{loan.id}/ledger/{ledger.id}/payment",
+        headers=_auth_headers(app, admin_user),
+        json={"amount": 2100, "payment_date": "2026-02-20"},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["paid_amount"] == 2100.0
+
+
+def test_ledger_payment_requires_amount(app, client):
+    admin_user = _create_user("admin", "Ledger Missing Amount Admin", "ledger-missing@example.com")
+    loan, ledger = _ledger_payment_fixture(admin_user, "LN-LEDGER-MISSING")
+
+    response = client.post(
+        f"/admin/loans/{loan.id}/ledger/{ledger.id}/payment",
+        headers=_auth_headers(app, admin_user),
+        json={"payment_date": "2026-02-20"},
+    )
+
+    assert response.status_code == 422
+    assert response.get_json()["message"] == "paid_amount must be a valid number"
+
+
+def test_ledger_payment_rejects_zero_amount(app, client):
+    admin_user = _create_user("admin", "Ledger Zero Amount Admin", "ledger-zero@example.com")
+    loan, ledger = _ledger_payment_fixture(admin_user, "LN-LEDGER-ZERO")
+
+    response = client.post(
+        f"/admin/loans/{loan.id}/ledger/{ledger.id}/payment",
+        headers=_auth_headers(app, admin_user),
+        json={"paid_amount": 0, "payment_date": "2026-02-20"},
+    )
+
+    assert response.status_code == 422
+    assert response.get_json()["message"] == "paid_amount must be greater than zero"
+
+
+def test_ledger_payment_cash_collector_creates_balanced_journal(app, client):
+    admin_user = _create_user("admin", "Ledger Collector Admin", "ledger-collector-admin@example.com")
+    collector = _create_user("staff", "Ledger Collector", "ledger-collector@example.com")
+    setup = client.post(
+        "/admin/collectors",
+        headers=_auth_headers(app, admin_user),
+        json={"staff_id": collector.id, "collector_code": "COL-LEDGER", "create_collection_account": True},
+    )
+    assert setup.status_code == 201
+    account_id = setup.get_json()["default_collection_account"]["id"]
+    loan, ledger = _ledger_payment_fixture(admin_user, "LN-LEDGER-COLLECT")
+
+    response = client.post(
+        f"/admin/loans/{loan.id}/ledger/{ledger.id}/payment",
+        headers=_auth_headers(app, admin_user),
+        json={"paid_amount": 2100, "payment_date": "2026-02-20", "collection_method": "CASH_COLLECTOR", "collector_id": collector.id, "collection_account_id": account_id},
+    )
+
+    assert response.status_code == 200
+    body = response.get_json()
+    lines = AccountingJournalLine.query.filter_by(journal_entry_id=body["journal_entry_id"]).all()
+    assert sum(Decimal(line.debit or 0) for line in lines) == sum(Decimal(line.credit or 0) for line in lines) == Decimal("2100.00")
+    assert any(line.account_id == account_id and Decimal(line.debit or 0) == Decimal("2100.00") for line in lines)
+    assert body["deposit_status"] == "UNDEPOSITED"
+
+
+def test_ledger_payment_rolls_back_when_journal_creation_fails(app, client, monkeypatch):
+    admin_user = _create_user("admin", "Ledger Rollback Admin", "ledger-rollback@example.com")
+    loan, ledger = _ledger_payment_fixture(admin_user, "LN-LEDGER-ROLLBACK")
+
+    def fail_post(*_args, **_kwargs):
+        raise RuntimeError("journal failed")
+
+    monkeypatch.setattr("app.routes.admin.post_loan_payment", fail_post)
+    response = client.post(
+        f"/admin/loans/{loan.id}/ledger/{ledger.id}/payment",
+        headers=_auth_headers(app, admin_user),
+        json={"paid_amount": 2100, "payment_date": "2026-02-20"},
+    )
+
+    assert response.status_code == 400
+    assert Payment.query.count() == 0
+    assert AccountingJournalEntry.query.filter_by(source_type="LOAN_PAYMENT").count() == 0
+    db.session.refresh(ledger)
+    assert ledger.paid_amount == Decimal("0.00")
+    assert ledger.status == "PENDING"
 
 def test_customer_submission_sets_submitted_status(app, client):
     customer_user = _create_user("customer", "Customer One", "customer1@example.com")
