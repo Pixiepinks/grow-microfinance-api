@@ -723,34 +723,112 @@ def seed_default_report_classifications():
 
 def _fmt(value): return f"{money(value):.2f}"
 def _today(): return date.today()
-def _posted_filter(): return func.upper(AccountingJournalEntry.status).in_(["POSTED", "REVERSED"])
+def _normal_account_type(value):
+    typ = (value or "").strip().upper()
+    return {"REVENUE": "INCOME", "CAPITAL": "EQUITY"}.get(typ, typ)
+
+
+def _normal_account_subtype(account):
+    return (account_subtype(account) or "OTHER").strip().upper()
+
+
+def _normal_balance_for(account):
+    normal = (account.normal_balance or "").strip().upper()
+    if normal in NORMAL_BALANCES:
+        return normal
+    return "DEBIT" if _normal_account_type(account.account_type) in ("ASSET", "EXPENSE") else "CREDIT"
+
+
+def _posted_filter():
+    # Include posted reversal pairs so reversed activity nets to zero in shared balances.
+    return func.upper(AccountingJournalEntry.status).in_(["POSTED", "REVERSED"])
+
+
+def _journal_accounting_date():
+    return func.coalesce(AccountingJournalEntry.accounting_date, AccountingJournalEntry.journal_date)
+
 
 def _account_depth(account):
     depth=0; p=account.parent
     while p: depth += 1; p = p.parent
     return depth
 
+
 def _signed_balance(account, debit, credit):
     debit=money(debit); credit=money(credit)
-    return money(debit-credit) if account.normal_balance == "DEBIT" else money(credit-debit)
+    return money(debit-credit) if _normal_balance_for(account) == "DEBIT" else money(credit-debit)
+
 
 def _side_amounts(account, signed):
-    signed=money(signed)
-    side = account.normal_balance if signed >= 0 else ("CREDIT" if account.normal_balance == "DEBIT" else "DEBIT")
+    signed=money(signed); normal=_normal_balance_for(account)
+    side = normal if signed >= 0 else ("CREDIT" if normal == "DEBIT" else "DEBIT")
     return (abs(signed), Decimal("0.00"), side) if side == "DEBIT" else (Decimal("0.00"), abs(signed), side)
+
 
 def _sum_by_account(date_to=None, date_from=None, account_types=None):
     q = db.session.query(AccountingJournalLine.account_id, func.coalesce(func.sum(AccountingJournalLine.debit), 0), func.coalesce(func.sum(AccountingJournalLine.credit), 0)).join(AccountingJournalEntry).filter(_posted_filter())
-    if date_from: q = q.filter(AccountingJournalEntry.journal_date >= date_from)
-    if date_to: q = q.filter(AccountingJournalEntry.journal_date <= date_to)
-    if account_types: q = q.join(AccountingAccount).filter(AccountingAccount.account_type.in_(account_types))
+    acct_date = _journal_accounting_date()
+    if date_from: q = q.filter(acct_date >= date_from)
+    if date_to: q = q.filter(acct_date <= date_to)
+    if account_types:
+        normalized = [_normal_account_type(t) for t in account_types]
+        q = q.join(AccountingAccount).filter(func.upper(func.trim(AccountingAccount.account_type)).in_(normalized))
     return {r[0]: (money(r[1]), money(r[2])) for r in q.group_by(AccountingJournalLine.account_id).all()}
+
+
+def get_account_balances(date_from=None, date_to=None, as_of_date=None, include_zero=False):
+    """Authoritative account balance engine for all financial reports."""
+    if as_of_date is None:
+        as_of_date = date_to or _today()
+    opening_to = (date_from - timedelta(days=1)) if date_from else None
+    opening_map = _sum_by_account(date_to=opening_to) if date_from else {}
+    period_map = _sum_by_account(date_from=date_from, date_to=date_to or as_of_date)
+    accounts = AccountingAccount.query.filter_by(is_active=True).order_by(AccountingAccount.account_code).all()
+    balances=[]
+    zero = Decimal("0.00")
+    for a in accounts:
+        od, oc = opening_map.get(a.id, (zero, zero))
+        pd, pc = period_map.get(a.id, (zero, zero))
+        closing_signed = _signed_balance(a, od + pd, oc + pc)
+        opening_signed = _signed_balance(a, od, oc)
+        opening_debit, opening_credit, _ = _side_amounts(a, opening_signed)
+        closing_debit, closing_credit, side = _side_amounts(a, closing_signed)
+        if not include_zero and all(money(v) == zero for v in (opening_debit, opening_credit, pd, pc, closing_debit, closing_credit)):
+            continue
+        balances.append({
+            "account_id": a.id,
+            "account": a,
+            "account_code": a.account_code,
+            "account_name": a.account_name,
+            "account_type": _normal_account_type(a.account_type),
+            "account_subtype": _normal_account_subtype(a),
+            "normal_balance": _normal_balance_for(a),
+            "opening_debit": money(opening_debit),
+            "opening_credit": money(opening_credit),
+            "period_debit": money(pd),
+            "period_credit": money(pc),
+            "closing_debit": money(closing_debit),
+            "closing_credit": money(closing_credit),
+            "signed_closing_balance": money(closing_signed),
+            "balance_side": side,
+            "financial_statement_group": a.financial_statement_group,
+            "display_order": a.financial_statement_order,
+            "is_parent": bool(a.children),
+            "depth": _account_depth(a),
+            "parent_id": a.parent_id,
+        })
+    return balances
+
 
 def _warnings(extra_issues=None):
     issues = reconciliation_issues()
+    missing_types = {"MISSING_DISBURSEMENT_JOURNAL", "MISSING_PAYMENT_JOURNAL", "MISSING_DEPOSIT_JOURNAL", "MISSING_ACCRUAL_JOURNAL"}
+    missing = [i for i in issues if i.get("issue_type") in missing_types]
     warnings=[]
-    if any(i.get("issue_type") in ("MISSING_DISBURSEMENT_JOURNAL", "MISSING_PAYMENT_JOURNAL") for i in issues):
-        warnings.append({"code":"INCOMPLETE_ACCOUNTING_HISTORY","message":"Some operational transactions have no accounting journals."})
+    if missing:
+        warning={"code":"UNPOSTED_OPERATIONAL_TRANSACTIONS","count":len(missing),"message":"Some operational transactions have no accounting journals.","reconciliation_filter":{"issue_types":sorted(missing_types)}}
+        warnings.append(warning)
+        warnings.append({**warning, "code":"INCOMPLETE_ACCOUNTING_HISTORY"})
     for issue in extra_issues or []:
         code = issue.get("type") or issue.get("issue_type")
         if code in ("UNCLASSIFIED_ACCOUNT", "UNBALANCED_TRIAL_BALANCE", "UNBALANCED_FINANCIAL_POSITION", "JOURNAL_TOTAL_MISMATCH"):
@@ -761,6 +839,7 @@ def _warnings(extra_issues=None):
             seen.add(w["code"]); out.append(w)
     return out
 
+
 def _validate_posted_journals():
     issues=[]
     for e in AccountingJournalEntry.query.filter(_posted_filter()).all():
@@ -769,90 +848,93 @@ def _validate_posted_journals():
             issues.append({"type":"POSTED_JOURNAL_TOTAL_MISMATCH","journal_id":e.id})
     return issues
 
+
 def trial_balance_report(as_of_date=None, date_from=None, include_zero_balances=False, account_type=None, account_id=None, comparative_as_of_date=None):
     seed_default_report_classifications(); as_of_date = as_of_date or _today()
-    accounts_q = AccountingAccount.query
-    if account_type: accounts_q=accounts_q.filter_by(account_type=account_type)
-    if account_id: accounts_q=accounts_q.filter_by(id=int(account_id))
-    accounts=accounts_q.order_by(AccountingAccount.account_code).all()
-    opening_map = _sum_by_account(date_to=(date_from - timedelta(days=1)) if date_from else None) if date_from else {}
-    period_map = _sum_by_account(date_from=date_from, date_to=as_of_date) if date_from else _sum_by_account(date_to=as_of_date)
-    comp_map = _sum_by_account(date_to=comparative_as_of_date) if comparative_as_of_date else {}
+    balances = get_account_balances(date_from=date_from, as_of_date=as_of_date, include_zero=include_zero_balances)
+    if account_type:
+        balances=[b for b in balances if b["account_type"] == _normal_account_type(account_type)]
+    if account_id:
+        balances=[b for b in balances if b["account_id"] == int(account_id)]
+    comp_map = {b["account_id"]: b["signed_closing_balance"] for b in get_account_balances(as_of_date=comparative_as_of_date, include_zero=True)} if comparative_as_of_date else {}
     rows=[]; totals={k:Decimal('0.00') for k in ['opening_debit','opening_credit','period_debit','period_credit','closing_debit','closing_credit']}
-    for a in accounts:
-        od,oc = opening_map.get(a.id, (Decimal('0.00'), Decimal('0.00'))); pd,pc = period_map.get(a.id, (Decimal('0.00'), Decimal('0.00')))
-        opening_signed=_signed_balance(a, od, oc); closing_signed=_signed_balance(a, od+pd, oc+pc)
-        opening_debit, opening_credit, _ = _side_amounts(a, opening_signed); closing_debit, closing_credit, side = _side_amounts(a, closing_signed)
-        if not include_zero_balances and not any([opening_debit, opening_credit, pd, pc, closing_debit, closing_credit]): continue
-        for k,v in [('opening_debit',opening_debit),('opening_credit',opening_credit),('period_debit',pd),('period_credit',pc),('closing_debit',closing_debit),('closing_credit',closing_credit)]: totals[k]+=money(v)
-        cd,cc = comp_map.get(a.id, (Decimal('0.00'), Decimal('0.00'))); comp=_signed_balance(a, cd, cc) if comparative_as_of_date else None
-        rows.append({"account_id":a.id,"account_code":a.account_code,"account_name":a.account_name,"account_type":a.account_type,"account_subtype":account_subtype(a),"normal_balance":a.normal_balance,"opening_debit":_fmt(opening_debit),"opening_credit":_fmt(opening_credit),"period_debit":_fmt(pd),"period_credit":_fmt(pc),"closing_debit":_fmt(closing_debit),"closing_credit":_fmt(closing_credit),"net_balance":_fmt(closing_signed),"balance_side":side,"comparative_net_balance": _fmt(comp) if comparative_as_of_date else None,"is_parent":bool(a.children),"depth":_account_depth(a),"parent_id":a.parent_id,"display_order":a.financial_statement_order,"parent_totals_included":False,"drilldown":{"account_id":a.id,"date_from":date_from.isoformat() if date_from else None,"date_to":as_of_date.isoformat()}})
+    for b in balances:
+        for k in totals: totals[k] += money(b[k])
+        rows.append({k: (_fmt(v) if isinstance(v, Decimal) else v) for k,v in b.items() if k != "account"} | {"net_balance":_fmt(b["signed_closing_balance"]),"comparative_net_balance": _fmt(comp_map.get(b["account_id"], Decimal("0.00"))) if comparative_as_of_date else None,"parent_totals_included":False,"drilldown":{"account_id":b["account_id"],"date_from":date_from.isoformat() if date_from else None,"date_to":as_of_date.isoformat()}})
     diff=money(totals['closing_debit']-totals['closing_credit']); issues=_validate_posted_journals()
     if diff != 0: issues.append({"type":"UNBALANCED_TRIAL_BALANCE","difference":_fmt(diff)})
-    return {"report":"TRIAL_BALANCE","as_of_date":as_of_date.isoformat(),"date_from":date_from.isoformat() if date_from else None,"accounts":rows,"totals":{f"total_{k}":_fmt(v) for k,v in totals.items()} | {"difference":_fmt(diff),"is_balanced":diff==0},"validation":{"is_valid":not issues,"difference":_fmt(diff),"issues":issues},"warnings":_warnings(issues),"has_activity":bool(rows),"is_empty":not bool(rows)}
+    return {"report":"TRIAL_BALANCE","as_of_date":as_of_date.isoformat(),"date_from":date_from.isoformat() if date_from else None,"accounts":rows,"totals":{f"total_{k}":_fmt(v) for k,v in totals.items()} | {"difference":_fmt(diff),"is_balanced":abs(diff)<=Decimal("0.01")},"validation":{"is_valid":not issues,"difference":_fmt(diff),"issues":issues},"warnings":_warnings(issues),"has_activity":bool(rows),"is_empty":not bool(rows)}
 
-def _account_amounts(types, date_from=None, date_to=None): return _sum_by_account(date_from=date_from, date_to=date_to, account_types=types)
 
 def _variance(amount, comp):
     var=money(amount-comp); pct=None if comp==0 else money((var/abs(comp))*Decimal('100'))
     return _fmt(var), (_fmt(pct) if pct is not None else None)
 
+
+def _income_group(account_type, group, subtype):
+    if group in FINANCIAL_STATEMENT_GROUPS:
+        return group
+    return None
+
+
 def income_statement_report(date_from, date_to, comparative_date_from=None, comparative_date_to=None, include_zero_balances=False):
-    seed_default_report_classifications(); data=_account_amounts(['INCOME','EXPENSE'], date_from, date_to); comp=_account_amounts(['INCOME','EXPENSE'], comparative_date_from, comparative_date_to) if comparative_date_from and comparative_date_to else {}
-    sections_i={}; sections_e={}; total_i=total_e=tax=Decimal('0.00'); issues=[]
-    for a in AccountingAccount.query.filter(AccountingAccount.account_type.in_(['INCOME','EXPENSE'])).order_by(AccountingAccount.financial_statement_order, AccountingAccount.account_code).all():
-        d,c=data.get(a.id,(Decimal('0.00'),Decimal('0.00'))); amount=money(c-d) if a.account_type=='INCOME' else money(d-c)
-        cd,cc=comp.get(a.id,(Decimal('0.00'),Decimal('0.00'))); camount=money(cc-cd) if a.account_type=='INCOME' else money(cd-cc)
-        if not include_zero_balances and amount==0 and camount==0: continue
-        group=a.financial_statement_group if a.financial_statement_group in FINANCIAL_STATEMENT_GROUPS else None
-        if group is None: issues.append({"type":"UNCLASSIFIED_ACCOUNT","account_id":a.id})
-        var,pct=_variance(amount,camount); row={"account_id":a.id,"account_code":a.account_code,"account_name":a.account_name,"amount":_fmt(amount),"comparative_amount":_fmt(camount) if comp else None,"variance":var if comp else None,"variance_percent":pct if comp else None,"drilldown":{"account_id":a.id,"date_from":date_from.isoformat(),"date_to":date_to.isoformat()}}
-        bucket=sections_i if a.account_type=='INCOME' else sections_e; name=(INCOME_SECTION_NAMES if a.account_type=='INCOME' else EXPENSE_SECTION_NAMES).get(group, (INCOME_SECTION_NAMES if a.account_type=='INCOME' else EXPENSE_SECTION_NAMES)[None])
-        bucket.setdefault(name, []).append(row)
-        if a.account_type=='INCOME': total_i += amount
+    seed_default_report_classifications(); balances=get_account_balances(date_from=date_from, date_to=date_to, include_zero=True)
+    comp={b["account_id"]: b for b in get_account_balances(date_from=comparative_date_from, date_to=comparative_date_to, include_zero=True)} if comparative_date_from and comparative_date_to else {}
+    sections_i={}; sections_e={}; total_i=total_e=tax=Decimal('0.00'); issues=[]; income_rows=[]; expense_rows=[]
+    for b in balances:
+        typ=b["account_type"]
+        if typ not in ("INCOME", "EXPENSE"): continue
+        amount=money(b["period_credit"]-b["period_debit"]) if typ=='INCOME' else money(b["period_debit"]-b["period_credit"])
+        cb=comp.get(b["account_id"]); camount=Decimal("0.00")
+        if cb: camount=money(cb["period_credit"]-cb["period_debit"]) if typ=='INCOME' else money(cb["period_debit"]-cb["period_credit"])
+        if not include_zero_balances and amount == Decimal("0.00") and camount == Decimal("0.00"): continue
+        group=_income_group(typ, b.get("financial_statement_group"), b["account_subtype"])
+        var,pct=_variance(amount,camount); row={"account_id":b["account_id"],"account_code":b["account_code"],"account_name":b["account_name"],"amount":_fmt(amount),"comparative_amount":_fmt(camount) if comp else None,"variance":var if comp else None,"variance_percent":pct if comp else None,"drilldown":{"account_id":b["account_id"],"date_from":date_from.isoformat(),"date_to":date_to.isoformat()}}
+        if typ=='INCOME':
+            name=INCOME_SECTION_NAMES.get(group, INCOME_SECTION_NAMES[None]); sections_i.setdefault(name, []).append(row); total_i += amount; income_rows.append(row)
         else:
-            total_e += amount
+            name=EXPENSE_SECTION_NAMES.get(group, EXPENSE_SECTION_NAMES[None]); sections_e.setdefault(name, []).append(row); total_e += amount; expense_rows.append(row)
             if group == 'TAX_EXPENSE': tax += amount
-    def pack(sections): return [{"section_name":k,"accounts":v,"total":_fmt(sum(Decimal(x['amount']) for x in v))} for k,v in sections.items()]
-    net=money(total_i-total_e); diff=money(total_i-total_e-net)
-    return {"report":"INCOME_STATEMENT","date_from":date_from.isoformat(),"date_to":date_to.isoformat(),"income":{"sections":pack(sections_i),"total_income":_fmt(total_i)},"expenses":{"sections":pack(sections_e),"total_expenses":_fmt(total_e)},"profit_before_tax":_fmt(total_i-total_e+tax),"tax_expense":_fmt(tax),"net_profit":_fmt(net),"net_profit_loss":_fmt(net),"validation":{"is_valid":diff==0 and not issues,"difference":_fmt(diff),"issues":issues},"warnings":_warnings(issues),"has_activity":bool(sections_i or sections_e),"is_empty":not bool(sections_i or sections_e)}
+    def pack(sections): return [{"section_name":k,"name":k,"accounts":v,"total":_fmt(sum(Decimal(x['amount']) for x in v))} for k,v in sections.items()]
+    income_sections=pack(sections_i); expense_sections=pack(sections_e); net=money(total_i-total_e); diff=money(total_i-total_e-net)
+    has_activity = total_i != 0 or total_e != 0 or len(income_rows) > 0 or len(expense_rows) > 0
+    return {"report":"INCOME_STATEMENT","date_from":date_from.isoformat(),"date_to":date_to.isoformat(),"income_sections":income_sections,"expense_sections":expense_sections,"income":{"sections":income_sections,"total_income":_fmt(total_i)},"expenses":{"sections":expense_sections,"total_expenses":_fmt(total_e)},"total_income":_fmt(total_i),"total_expenses":_fmt(total_e),"profit_before_tax":_fmt(total_i-total_e+tax),"tax_expense":_fmt(tax),"net_profit":_fmt(net),"net_profit_loss":_fmt(net),"validation":{"is_valid":diff==0 and not issues,"difference":_fmt(diff),"issues":issues},"warnings":_warnings(issues),"has_activity":has_activity,"is_empty":not has_activity}
 
-def _balance_sheet_account_rows(types, as_of_date, comparative_as_of_date=None, include_zero_balances=False):
-    data=_sum_by_account(date_to=as_of_date, account_types=types); comp=_sum_by_account(date_to=comparative_as_of_date, account_types=types) if comparative_as_of_date else {}; rows=[]
-    for a in AccountingAccount.query.filter(AccountingAccount.account_type.in_(types)).order_by(AccountingAccount.financial_statement_order, AccountingAccount.account_code).all():
-        d,c=data.get(a.id,(Decimal('0.00'),Decimal('0.00'))); amount=_signed_balance(a,d,c)
-        cd,cc=comp.get(a.id,(Decimal('0.00'),Decimal('0.00'))); camount=_signed_balance(a,cd,cc)
-        has_activity = bool(d or c or cd or cc)
-        if not include_zero_balances and amount==0 and camount==0: continue
-        rows.append({"account_id":a.id,"account_code":a.account_code,"account_name":a.account_name,"account_type":a.account_type,"account_subtype":account_subtype(a),"financial_statement_group":a.financial_statement_group,"amount":_fmt(amount),"debit":_fmt(d),"credit":_fmt(c),"has_activity":has_activity,"comparative_amount":_fmt(camount) if comparative_as_of_date else None,"drilldown":{"account_id":a.id,"date_from":None,"date_to":as_of_date.isoformat()}})
-    return rows
 
-def statement_of_financial_position_report(as_of_date=None, comparative_as_of_date=None, include_zero_balances=False):
-    seed_default_report_classifications(); as_of_date=as_of_date or _today(); rows=_balance_sheet_account_rows(['ASSET','LIABILITY','EQUITY'], as_of_date, comparative_as_of_date, include_zero_balances)
+CURRENT_ASSET_SUBTYPES={"CASH","BANK","COLLECTION_CLEARING","COLLECTION_CLEARING_CONTROL","LOAN_RECEIVABLE","INTEREST_RECEIVABLE","PENALTY_RECEIVABLE","ACCOUNTS_RECEIVABLE","OTHER_CURRENT_ASSET","SUSPENSE"}
+NON_CURRENT_ASSET_SUBTYPES={"FIXED_ASSET","INTANGIBLE_ASSET","LONG_TERM_RECEIVABLE"}
+NON_CURRENT_LIABILITY_SUBTYPES={"LONG_TERM_BORROWING"}
+
+
+def _balance_row(b, amount=None):
+    amt = b["signed_closing_balance"] if amount is None else money(amount)
+    return {"account_id":b["account_id"],"account_code":b["account_code"],"account_name":b["account_name"],"account_type":b["account_type"],"account_subtype":b["account_subtype"],"financial_statement_group":b.get("financial_statement_group"),"amount":_fmt(amt),"debit":_fmt(b["closing_debit"]),"credit":_fmt(b["closing_credit"]),"has_activity": any(money(b[k]) != Decimal("0.00") for k in ("period_debit","period_credit","closing_debit","closing_credit")),"drilldown":{"account_id":b["account_id"],"date_from":None}}
+
+
+def statement_of_financial_position_report(as_of_date=None, comparative_as_of_date=None, include_zero_balances=False, reclassify_credit_bank_balances=True):
+    seed_default_report_classifications(); as_of_date=as_of_date or _today(); balances=get_account_balances(as_of_date=as_of_date, include_zero=include_zero_balances)
     ca=[]; nca=[]; cl=[]; ncl=[]; eq=[]
-    for r in rows:
-        amount=Decimal(r['amount']); group=r['financial_statement_group']
-        if r['account_type']=='ASSET' and r.get('account_subtype')=='BANK' and amount < 0:
-            adj=dict(r)
-            adj['account_name']=f"Bank Overdraft — {r['account_name']}"
-            adj['amount']=_fmt(abs(amount))
-            if comparative_as_of_date and adj.get("comparative_amount") is not None:
-                adj["comparative_amount"] = _fmt(abs(Decimal(adj["comparative_amount"])))
-            adj['original_account_type']=r['account_type']
-            adj['presentation_section']='CURRENT_LIABILITY'
-            adj['presentation_adjustment']='BANK_OVERDRAFT_RECLASSIFICATION'
-            adj['financial_statement_group']='CURRENT_LIABILITY'
-            cl.append(adj)
-        elif r['account_type']=='ASSET' and group=='NON_CURRENT_ASSET': nca.append(r)
-        elif r['account_type']=='ASSET': ca.append(r)
-        elif r['account_type']=='LIABILITY' and group=='NON_CURRENT_LIABILITY': ncl.append(r)
-        elif r['account_type']=='LIABILITY': cl.append(r)
-        elif r['account_type']=='EQUITY': eq.append(r)
-    pl=income_statement_report(date(1900,1,1), as_of_date)['net_profit']; pl_dec=Decimal(pl)
-    ta=sum(Decimal(r['amount']) for r in ca+nca); tl=sum(Decimal(r['amount']) for r in cl+ncl); eq_accounts=sum(Decimal(r['amount']) for r in eq); te=money(eq_accounts+pl_dec); diff=money(ta-(tl+te)); issues=[]
-    if diff != 0: issues.append({"type":"UNBALANCED_FINANCIAL_POSITION","difference":_fmt(diff)})
-    has_activity=any(r.get('has_activity') for r in rows)
-    return {"report":"STATEMENT_OF_FINANCIAL_POSITION","as_of_date":as_of_date.isoformat(),"assets":{"current_assets":{"accounts":ca,"total":_fmt(sum(Decimal(r['amount']) for r in ca))},"non_current_assets":{"accounts":nca,"total":_fmt(sum(Decimal(r['amount']) for r in nca))},"total_assets":_fmt(ta)},"liabilities":{"current_liabilities":{"accounts":cl,"total":_fmt(sum(Decimal(r['amount']) for r in cl))},"non_current_liabilities":{"accounts":ncl,"total":_fmt(sum(Decimal(r['amount']) for r in ncl))},"total_liabilities":_fmt(tl)},"equity":{"accounts":eq,"retained_earnings":"0.00","current_period_profit_loss":_fmt(pl_dec),"total_equity":_fmt(te),"policy":"BANK accounts with credit balances are presented as current liability bank overdrafts using BANK_OVERDRAFT_RECLASSIFICATION; current period profit/loss is cumulative posted income less expenses through the as-of date until year-end closing is implemented."},"total_liabilities_and_equity":_fmt(tl+te),"difference":_fmt(diff),"is_balanced":diff==0,"financial_position_balanced":diff==0,"validation":{"is_valid":not issues,"difference":_fmt(diff),"issues":issues},"warnings":_warnings(issues),"has_activity":has_activity,"is_empty":not bool(rows)}
+    for b in balances:
+        typ=b["account_type"]; subtype=b["account_subtype"]; amount=b["signed_closing_balance"]
+        if typ not in ("ASSET","LIABILITY","EQUITY"): continue
+        if not include_zero_balances and amount == Decimal("0.00"): continue
+        row=_balance_row(b, abs(amount) if typ in ("LIABILITY","EQUITY") else amount); row["drilldown"]["date_to"] = as_of_date.isoformat()
+        group=b.get("financial_statement_group")
+        if typ=='ASSET' and reclassify_credit_bank_balances and subtype=='BANK' and b["closing_credit"] > Decimal("0.00") and b["closing_debit"] == Decimal("0.00"):
+            adj=dict(row); adj['account_name']=f"Bank Overdraft – {b['account_name']}"; adj['amount']=_fmt(b["closing_credit"]); adj['original_account_type']='ASSET'; adj['presentation_section']='CURRENT_LIABILITY'; adj['presentation_adjustment']='BANK_OVERDRAFT_RECLASSIFICATION'; adj['financial_statement_group']='CURRENT_LIABILITY'; cl.append(adj)
+        elif typ=='ASSET' and (group=='NON_CURRENT_ASSET' or subtype in NON_CURRENT_ASSET_SUBTYPES): nca.append(row)
+        elif typ=='ASSET': ca.append(row)
+        elif typ=='LIABILITY' and (group=='NON_CURRENT_LIABILITY' or subtype in NON_CURRENT_LIABILITY_SUBTYPES): ncl.append(row)
+        elif typ=='LIABILITY': cl.append(row)
+        elif typ=='EQUITY': eq.append(row)
+    earnings_balances=get_account_balances(as_of_date=as_of_date, include_zero=True)
+    current_earnings=sum((money(b["period_credit"]-b["period_debit"]) for b in earnings_balances if b["account_type"]=='INCOME'), Decimal("0.00")) - sum((money(b["period_debit"]-b["period_credit"]) for b in earnings_balances if b["account_type"]=='EXPENSE'), Decimal("0.00"))
+    if include_zero_balances or current_earnings != Decimal("0.00"):
+        eq.append({"account_code":"CURRENT_EARNINGS","account_name":"Current Period Earnings","amount":_fmt(current_earnings)})
+    ta=sum(Decimal(r['amount']) for r in ca+nca); tl=sum(Decimal(r['amount']) for r in cl+ncl); te=sum(Decimal(r['amount']) for r in eq); diff=money(ta-(tl+te)); issues=[]
+    if abs(diff) > Decimal("0.01"): issues.append({"type":"UNBALANCED_FINANCIAL_POSITION","difference":_fmt(diff)})
+    has_activity=bool(ca or nca or cl or ncl or eq)
+    return {"report":"STATEMENT_OF_FINANCIAL_POSITION","as_of_date":as_of_date.isoformat(),"assets":{"current_assets":{"accounts":ca,"total":_fmt(sum(Decimal(r['amount']) for r in ca))},"non_current_assets":{"accounts":nca,"total":_fmt(sum(Decimal(r['amount']) for r in nca))},"total_assets":_fmt(ta)},"liabilities":{"current_liabilities":{"accounts":cl,"total":_fmt(sum(Decimal(r['amount']) for r in cl))},"non_current_liabilities":{"accounts":ncl,"total":_fmt(sum(Decimal(r['amount']) for r in ncl))},"total_liabilities":_fmt(tl)},"equity":{"accounts":eq,"retained_earnings":"0.00","current_period_profit_loss":_fmt(current_earnings),"total_equity":_fmt(te),"policy":"BANK accounts with credit balances are presented as current liability bank overdrafts when reclassify_credit_bank_balances is true; current period earnings are cumulative posted income less expenses through the as-of date until year-end closing is implemented."},"total_liabilities_and_equity":_fmt(tl+te),"difference":_fmt(diff),"balanced":abs(diff)<=Decimal("0.01"),"is_balanced":abs(diff)<=Decimal("0.01"),"financial_position_balanced":abs(diff)<=Decimal("0.01"),"validation":{"is_valid":not issues,"difference":_fmt(diff),"issues":issues},"warnings":_warnings(issues),"has_activity":has_activity,"is_empty":not has_activity}
 
 def reports_summary(date_from=None, date_to=None, as_of_date=None):
     as_of_date=as_of_date or date_to or _today(); date_from=date_from or date(as_of_date.year,1,1); date_to=date_to or as_of_date
