@@ -1299,6 +1299,83 @@ def preview_loan_disbursement(loan, charges=None, funding_account=None, disburse
     for c in credits: c["amount"]=money(c["amount"])
     return {"gross_principal_amount":principal,"charges":result["charges"],"total_disbursement_deductions":result["total_deductions"],"net_disbursed_amount":result["net_disbursed_amount"],"journal_preview":{"debits":[{"account_code":resolve_system_account("LOAN_PRINCIPAL_RECEIVABLE").account_code,"account_name":resolve_system_account("LOAN_PRINCIPAL_RECEIVABLE").account_name,"account":resolve_system_account("LOAN_PRINCIPAL_RECEIVABLE").account_name,"amount":principal}],"credits":credits,"total_debit":principal,"total_credit":money(sum(c["amount"] for c in credits)),"balanced":principal==money(sum(c["amount"] for c in credits))},"charge_lines":result["charge_lines"]}
 
+
+def _json_ready_disbursement_preview(preview):
+    converted = dict(preview)
+    converted.pop("charge_lines", None)
+    for key in ("gross_principal_amount", "total_disbursement_deductions", "net_disbursed_amount"):
+        converted[key] = float(money(converted[key]))
+    for charge in converted.get("charges", []):
+        if "amount" not in charge:
+            charge["amount"] = charge.get("gross_amount", charge.get("net_charge_amount", 0))
+        charge["amount"] = float(money(charge["amount"]))
+        if "gross_amount" in charge:
+            charge["gross_amount"] = float(money(charge["gross_amount"]))
+        if "tax_amount" in charge:
+            charge["tax_amount"] = float(money(charge["tax_amount"]))
+        if "net_charge_amount" in charge:
+            charge["net_charge_amount"] = float(money(charge["net_charge_amount"]))
+    journal = converted["journal_preview"]
+    for side in ("debits", "credits"):
+        for line in journal[side]:
+            line["amount"] = float(money(line["amount"]))
+    journal["total_debit"] = float(money(journal["total_debit"]))
+    journal["total_credit"] = float(money(journal["total_credit"]))
+    return converted
+
+
+def preview_loan_application_disbursement(application_id, payload=None, requested_by=None):
+    payload = payload or {}
+    application_id = parse_positive_int(application_id, "application_id")
+    application = LoanApplication.query.get(application_id)
+    if application is None:
+        raise LookupError("Loan application not found")
+    if application.status != "APPROVED":
+        raise ValidationError("Only APPROVED applications can be disbursed", status=application.status)
+
+    funding_account_id = payload.get("funding_account_id")
+    funding_account = None
+    if funding_account_id is not None:
+        funding_account = AccountingAccount.query.get(parse_positive_int(funding_account_id, "funding_account_id"))
+    funding_account = validate_funding_account(funding_account or resolve_system_account("DEFAULT_DISBURSEMENT_ACCOUNT"), payload.get("transaction_method"))
+
+    raw_charges = payload.get("charges") or []
+    if not isinstance(raw_charges, list):
+        raise ValidationError("charges must be a list")
+    charges = []
+    for idx, charge in enumerate(raw_charges):
+        if not isinstance(charge, dict):
+            raise ValidationError(f"charges[{idx}] must be an object")
+        clean_charge = dict(charge)
+        clean_charge["charge_type_id"] = parse_positive_int(charge.get("charge_type_id"), f"charges[{idx}].charge_type_id")
+        charges.append(clean_charge)
+
+    if payload.get("disbursement_date"):
+        try:
+            disbursement_date = date.fromisoformat(str(payload["disbursement_date"]))
+        except ValueError as exc:
+            raise ValidationError("disbursement_date must be YYYY-MM-DD") from exc
+    else:
+        disbursement_date = date.today()
+    require_open_accounting_period(disbursement_date)
+
+    principal = money(application.approved_amount or application.applied_amount)
+    if principal <= 0:
+        raise ValidationError("approved principal must be greater than zero")
+
+    preview_subject = type("DisbursementPreviewSubject", (), {})()
+    preview_subject.id = None
+    preview_subject.customer_id = application.customer_id
+    preview_subject.principal_amount = principal
+    preview_subject.gross_principal_amount = principal
+    preview = preview_loan_disbursement(preview_subject, charges, funding_account, disbursement_date)
+    result = _json_ready_disbursement_preview(preview)
+    result["application_id"] = application.id
+    result["validation_errors"] = []
+    if result["journal_preview"]["balanced"] is not True:
+        raise ValidationError("journal is not balanced")
+    return result
+
 def reverse_loan_disbursement(loan, reversal_date, reason, user_id=None):
     if not reason: raise AccountingError("Reversal reason is required")
     if Payment.query.filter_by(loan_id=loan.id).filter(Payment.reversed_at.is_(None)).count():

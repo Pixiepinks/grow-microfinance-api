@@ -19,7 +19,7 @@ from ..extensions import db
 from ..models import Customer, Loan, LoanApplication, LoanApplicationDocument
 from ..loan_ledger import generate_loan_ledger, money
 from ..loan_terms import calculate_flat_term_amounts, resolve_loan_term
-from ..accounting import seed_disbursement_settings, AccountingError, post_loan_disbursement, validate_funding_account
+from ..accounting import seed_disbursement_settings, AccountingError, post_loan_disbursement, validate_funding_account, preview_loan_application_disbursement
 from ..models import AccountingAccount
 from .utils import role_required
 
@@ -1165,7 +1165,7 @@ def generate_loan_number() -> str:
     return f"GROW-LOAN-{date_str}-{(daily_count or 0) + 1:04d}"
 
 
-@loan_app_bp.route("/<int:application_id>/disburse", methods=["POST"])
+@loan_app_bp.route("/<int:application_id>/disburse", methods=["POST"], strict_slashes=False)
 @role_required(["admin"])
 def disburse_application(application_id):
     application = LoanApplication.query.get_or_404(application_id)
@@ -1183,6 +1183,17 @@ def disburse_application(application_id):
             return jsonify({"message": str(exc)}), 400
 
     disbursement_date = date.fromisoformat(data.get("disbursement_date")) if data.get("disbursement_date") else date.today()
+    try:
+        preview_loan_application_disbursement(application.id, data, get_jwt_identity())
+    except AccountingError as exc:
+        if getattr(exc, "payload", None):
+            return jsonify(exc.payload), 422
+        if str(exc) == "Documentation Charge is required for this loan.":
+            return jsonify({"error": "Required disbursement charge missing", "message": str(exc)}), 422
+        return jsonify({"message": str(exc), "error": str(exc)}), 422
+    except LookupError:
+        return jsonify({"error": "not_found", "message": "Loan application not found"}), 404
+
     missing_fields = _missing_disbursement_term_fields(application)
     if missing_fields:
         return jsonify({"error": "Loan term information is incomplete", "missing_fields": missing_fields}), 422
