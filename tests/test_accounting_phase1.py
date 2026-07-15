@@ -186,3 +186,78 @@ def test_general_ledger_draft_excluded_opening_and_running_balances(app, client)
     assert no_date.status_code == 200
     assert no_date.get_json()["opening_balance"] == "0.00"
     assert len(no_date.get_json()["transactions"]) == 2
+
+
+def _post_balanced_journal(client, headers, debit_account, credit_account):
+    resp = client.post("/admin/accounting/journals", headers=headers, json={
+        "journal_date": date.today().isoformat(),
+        "description": "posted account activity",
+        "status": "POSTED",
+        "lines": [
+            {"account_id": debit_account.id, "debit": "10.00"},
+            {"account_id": credit_account.id, "credit": "10.00"},
+        ],
+    })
+    assert resp.status_code == 201
+
+
+def test_account_update_rename_ordinary_income_account(app, client):
+    admin = _user("admin"); seed_default_accounts(); db.session.commit(); headers = _headers(app, admin)
+    acct = AccountingAccount.query.filter_by(account_code="4030").first()
+    resp = client.patch(f"/admin/accounting/accounts/{acct.id}", headers=headers, json={"account_name": "Updated Documentation Fee Income"})
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["account_name"] == "Updated Documentation Fee Income"
+    assert body["account_role"] == "DOCUMENTATION_FEE_INCOME"
+
+
+def test_account_update_edit_expense_account_name(app, client):
+    admin = _user("admin"); seed_default_accounts(); db.session.commit(); headers = _headers(app, admin)
+    acct = AccountingAccount.query.filter_by(account_code="5010").first()
+    resp = client.patch(f"/admin/accounting/accounts/{acct.id}", headers=headers, json={"account_name": "Updated Rent Expense"})
+    assert resp.status_code == 200
+    assert resp.get_json()["account_name"] == "Updated Rent Expense"
+
+
+def test_account_update_blocks_type_change_after_posted_transactions(app, client):
+    admin = _user("admin"); seed_default_accounts(); db.session.commit(); headers = _headers(app, admin)
+    income = AccountingAccount.query.filter_by(account_code="4030").first()
+    cash = AccountingAccount.query.filter_by(account_code="1000").first()
+    _post_balanced_journal(client, headers, cash, income)
+    resp = client.patch(f"/admin/accounting/accounts/{income.id}", headers=headers, json={"account_type": "EXPENSE"})
+    assert resp.status_code == 422
+    assert resp.get_json()["error"] == "Account structure change blocked"
+
+
+def test_account_update_collection_account_without_collector_is_rejected(app, client):
+    admin = _user("admin"); seed_default_accounts(); db.session.commit(); headers = _headers(app, admin)
+    parent = AccountingAccount.query.filter_by(account_code="1050").first()
+    acct = AccountingAccount(account_code="1058", account_name="Collector Clearing", account_type="ASSET", normal_balance="DEBIT", account_subtype="COLLECTION_CLEARING", is_collection_account=True, collector_id=admin.id, parent_account_id=parent.id, allow_manual_posting=True)
+    db.session.add(acct); db.session.commit()
+    resp = client.patch(f"/admin/accounting/accounts/{acct.id}", headers=headers, json={"collector_id": None})
+    assert resp.status_code == 422
+
+
+def test_account_update_assign_collector_to_ordinary_income_is_rejected(app, client):
+    admin = _user("admin"); seed_default_accounts(); db.session.commit(); headers = _headers(app, admin)
+    acct = AccountingAccount.query.filter_by(account_code="4030").first()
+    resp = client.patch(f"/admin/accounting/accounts/{acct.id}", headers=headers, json={"collector_id": admin.id})
+    assert resp.status_code == 422
+
+
+def test_account_update_duplicate_account_code_is_rejected(app, client):
+    admin = _user("admin"); seed_default_accounts(); db.session.commit(); headers = _headers(app, admin)
+    acct = AccountingAccount.query.filter_by(account_code="4030").first()
+    resp = client.patch(f"/admin/accounting/accounts/{acct.id}", headers=headers, json={"account_code": " 1000 "})
+    assert resp.status_code == 422
+    assert resp.get_json()["error"] == "Duplicate account code"
+
+
+def test_account_serializer_includes_editor_metadata(app, client):
+    admin = _user("admin"); seed_default_accounts(); db.session.commit(); headers = _headers(app, admin)
+    acct = AccountingAccount.query.filter_by(account_code="4030").first()
+    resp = client.get(f"/admin/accounting/accounts/{acct.id}", headers=headers)
+    assert resp.status_code == 200
+    body = resp.get_json()
+    for key in ["account_subtype", "account_role", "is_collection_account", "collector_id", "parent_account_id", "has_posted_transactions"]:
+        assert key in body
