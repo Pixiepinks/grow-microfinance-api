@@ -126,3 +126,93 @@ def test_disbursement_configuration_status_reports_ready(app, client):
         "destination_account_code": "4030",
     }
     assert payload["missing"] == []
+
+
+def _approved_application_with_terms():
+    application, customer = _application()
+    application.loan_type = "GROW_BUSINESS"
+    application.term_type = "DAYS"
+    application.term_value = 63
+    application.loan_days = 63
+    application.repayment_frequency = "WEEKLY"
+    application.number_of_installments = 9
+    application.installment_count = 9
+    application.installment_amount = Decimal("2100.00")
+    application.total_repayment = Decimal("18900.00")
+    application.total_interest = Decimal("3900.00")
+    application.interest_rate = Decimal("26")
+    application.interest_type = "FLAT"
+    application.interest_rate_basis = "FLAT_TERM"
+    db.session.commit()
+    return application, customer
+
+
+def test_admin_disbursement_application_routes_are_registered(app):
+    routes = {
+        rule.rule: rule.methods
+        for rule in app.url_map.iter_rules()
+        if "disbursement" in rule.rule or rule.rule.endswith("/disburse")
+    }
+    assert "/admin/loan-applications/<int:application_id>/disbursement-preview" in routes
+    assert "POST" in routes["/admin/loan-applications/<int:application_id>/disbursement-preview"]
+    assert "/admin/loan-applications/<int:application_id>/disburse" in routes
+    assert "POST" in routes["/admin/loan-applications/<int:application_id>/disburse"]
+    assert "/loan-applications/<int:application_id>/disburse" in routes
+    assert "POST" in routes["/loan-applications/<int:application_id>/disburse"]
+
+
+def test_application_disbursement_preview_valid_unknown_fee_and_trailing_slash(app, client):
+    with app.app_context():
+        seed_disbursement_settings()
+        application, _customer = _approved_application_with_terms()
+        application_id = application.id
+        bank = AccountingAccount.query.filter_by(account_code="1010").one()
+        doc_fee = DisbursementChargeType.query.filter_by(code="DOC_FEE").one()
+        headers = _admin_headers(app)
+        payload = {
+            "disbursement_date": "2026-07-15",
+            "funding_account_id": bank.id,
+            "transaction_method": "BANK_TRANSFER",
+            "reference": "Required for bank transfer",
+            "charges": [{"charge_type_id": doc_fee.id, "amount": 400}],
+        }
+
+    response = client.post(f"/admin/loan-applications/{application_id}/disbursement-preview", headers=headers, json=payload)
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["application_id"] == application_id
+    assert body["net_disbursed_amount"] == 14600.0
+    assert body["journal_preview"]["balanced"] is True
+    assert body["journal_preview"]["total_debit"] == 15000.0
+    assert body["journal_preview"]["total_credit"] == 15000.0
+
+    trailing = client.post(f"/admin/loan-applications/{application_id}/disbursement-preview/", headers=headers, json=payload)
+    assert trailing.status_code == 200
+    assert trailing.get_json()["net_disbursed_amount"] == 14600.0
+
+    missing = client.post("/admin/loan-applications/999999/disbursement-preview", headers=headers, json=payload)
+    assert missing.status_code == 404
+    assert missing.get_json()["error"] == "not_found"
+
+
+def test_final_application_disbursement_posts_charges_and_journal(app, client):
+    with app.app_context():
+        seed_disbursement_settings()
+        application, _customer = _approved_application_with_terms()
+        application_id = application.id
+        bank = AccountingAccount.query.filter_by(account_code="1010").one()
+        doc_fee = DisbursementChargeType.query.filter_by(code="DOC_FEE").one()
+        headers = _admin_headers(app)
+        payload = {"disbursement_date": "2026-07-15", "funding_account_id": bank.id, "transaction_method": "BANK_TRANSFER", "reference": "REF", "charges": [{"charge_type_id": doc_fee.id, "amount": 400}]}
+
+    response = client.post(f"/admin/loan-applications/{application_id}/disburse", headers=headers, json=payload)
+    assert response.status_code == 201
+    body = response.get_json()
+    with app.app_context():
+        loan = Loan.query.get(body["loan_id"])
+        assert loan is not None
+        assert loan.net_disbursed_amount == Decimal("14600.00")
+        assert loan.total_disbursement_deductions == Decimal("400.00")
+        assert len(loan.ledger_entries) == 9
+        assert loan.disbursement_journal_id is not None
+        assert len(loan.disbursement_deductions) == 1

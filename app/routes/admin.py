@@ -25,7 +25,7 @@ from ..models import (
     DisbursementChargeType,
     AccountingSetting,
 )
-from ..accounting import post_loan_disbursement, AccountingError, accrue_due_loan_interest, reverse_payment, reverse_loan_disbursement, money as acct_money, preview_collection_deposit, create_collection_deposit, reverse_collection_deposit, collector_cash_position, account_subtype, allocate_payment, post_loan_payment, validate_collection_account, repair_unposted_payment, require_open_accounting_period, ValidationError, preview_loan_disbursement, CALCULATION_METHODS, is_funding_account, is_active_account, is_posting_account
+from ..accounting import post_loan_disbursement, AccountingError, accrue_due_loan_interest, reverse_payment, reverse_loan_disbursement, money as acct_money, preview_collection_deposit, create_collection_deposit, reverse_collection_deposit, collector_cash_position, account_subtype, allocate_payment, post_loan_payment, validate_collection_account, repair_unposted_payment, require_open_accounting_period, ValidationError, preview_loan_disbursement, preview_loan_application_disbursement, CALCULATION_METHODS, is_funding_account, is_active_account, is_posting_account
 from ..loan_ledger import (
     daily_interest_rate,
     generate_loan_ledger,
@@ -336,34 +336,62 @@ def get_loan(loan_id):
 
 
 
-@admin_bp.route("/loans/<int:loan_id>/disbursement-preview", methods=["POST"])
+def _preview_error_response(exc):
+    if isinstance(exc, ValidationError):
+        return jsonify(exc.payload), 422
+    if str(exc) == "Documentation Charge is required for this loan.":
+        return jsonify({"error": "Required disbursement charge missing", "message": str(exc)}), 422
+    return jsonify({"error": str(exc), "message": str(exc)}), 422
+
+
+@admin_bp.route("/loan-applications/<int:application_id>/disbursement-preview", methods=["POST"], strict_slashes=False)
 @role_required(["admin"])
-def loan_disbursement_preview(loan_id):
-    loan = Loan.query.get_or_404(loan_id)
-    data = request.get_json(silent=True) or {}
+def application_disbursement_preview(application_id):
     try:
-        funding_account = None
-        if data.get("funding_account_id") is not None:
-            funding_account = AccountingAccount.query.get(int(data["funding_account_id"]))
-        disbursement_date = date.fromisoformat(data.get("disbursement_date")) if data.get("disbursement_date") else (loan.start_date or date.today())
-        require_open_accounting_period(disbursement_date)
-        preview = preview_loan_disbursement(loan, data.get("charges") or [], funding_account, disbursement_date)
-        def dec(v): return float(v) if isinstance(v, Decimal) else v
-        preview.pop("charge_lines", None)
-        preview["gross_principal_amount"] = dec(preview["gross_principal_amount"])
-        preview["total_disbursement_deductions"] = dec(preview["total_disbursement_deductions"])
-        preview["net_disbursed_amount"] = dec(preview["net_disbursed_amount"])
-        for side in ("debits", "credits"):
-            for line in preview["journal_preview"][side]: line["amount"] = dec(line["amount"])
-        preview["journal_preview"]["total_debit"] = dec(preview["journal_preview"]["total_debit"])
-        preview["journal_preview"]["total_credit"] = dec(preview["journal_preview"]["total_credit"])
-        return jsonify(preview)
+        return jsonify(preview_loan_application_disbursement(application_id, request.get_json(silent=True) or {}, get_jwt_identity())), 200
+    except LookupError:
+        return jsonify({"error": "not_found", "message": "Loan application not found"}), 404
     except AccountingError as exc:
-        if str(exc) == "Documentation Charge is required for this loan.":
-            return jsonify({"error": "Required disbursement charge missing", "message": str(exc)}), 422
-        return jsonify({"error": str(exc), "message": str(exc)}), 422
-    except (TypeError, ValueError):
-        return jsonify({"error": "Invalid disbursement preview payload"}), 400
+        return _preview_error_response(exc)
+
+
+@admin_bp.route("/loan-applications/<int:application_id>/disburse", methods=["POST"], strict_slashes=False)
+@role_required(["admin"])
+def admin_disburse_application(application_id):
+    from .loan_applications import disburse_application
+
+    return disburse_application(application_id)
+
+
+@admin_bp.route("/loans/<int:record_id>/disbursement-preview", methods=["POST"], strict_slashes=False)
+@role_required(["admin"])
+def loan_disbursement_preview(record_id):
+    loan = Loan.query.get(record_id)
+    if loan is not None:
+        data = request.get_json(silent=True) or {}
+        try:
+            funding_account = None
+            if data.get("funding_account_id") is not None:
+                funding_account = AccountingAccount.query.get(int(data["funding_account_id"]))
+            disbursement_date = date.fromisoformat(data.get("disbursement_date")) if data.get("disbursement_date") else (loan.start_date or date.today())
+            require_open_accounting_period(disbursement_date)
+            preview = preview_loan_disbursement(loan, data.get("charges") or [], funding_account, disbursement_date)
+            from ..accounting import _json_ready_disbursement_preview
+            result = _json_ready_disbursement_preview(preview)
+            result["deprecation_warning"] = "Use POST /admin/loan-applications/{application_id}/disbursement-preview before disbursement."
+            return jsonify(result), 200
+        except AccountingError as exc:
+            return _preview_error_response(exc)
+        except (TypeError, ValueError):
+            return jsonify({"error": "Invalid disbursement preview payload"}), 400
+    try:
+        result = preview_loan_application_disbursement(record_id, request.get_json(silent=True) or {}, get_jwt_identity())
+        result["deprecation_warning"] = "Use POST /admin/loan-applications/{application_id}/disbursement-preview before disbursement."
+        return jsonify(result), 200
+    except LookupError:
+        return jsonify({"error": "not_found", "message": "Loan or loan application not found"}), 404
+    except AccountingError as exc:
+        return _preview_error_response(exc)
 
 def _loan_to_dict(loan: Loan) -> dict:
     config = loan_config_summary(loan)
