@@ -25,6 +25,11 @@ class User(db.Model):
     updated_at = db.Column(
         db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
     )
+    must_change_password = db.Column(db.Boolean, nullable=False, default=False)
+    password_changed_at = db.Column(db.DateTime, nullable=True)
+    token_version = db.Column(db.Integer, nullable=False, default=0)
+    failed_login_attempts = db.Column(db.Integer, nullable=False, default=0)
+    locked_until = db.Column(db.DateTime, nullable=True)
 
     customer_profile = relationship("Customer", back_populates="user", uselist=False)
     created_loans = relationship(
@@ -50,6 +55,27 @@ class User(db.Model):
     def check_password(self, password: str) -> bool:
         return check_password_hash(self.password_hash, password)
 
+
+class PasswordHistory(db.Model):
+    __tablename__ = "password_history"
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False, index=True)
+    password_hash = db.Column(db.String(255), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+    def check_password(self, password: str) -> bool:
+        return check_password_hash(self.password_hash, password)
+
+
+class RevokedToken(db.Model):
+    __tablename__ = "revoked_tokens"
+
+    id = db.Column(db.Integer, primary_key=True)
+    jti = db.Column(db.String(36), nullable=False, unique=True, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=True, index=True)
+    token_type = db.Column(db.String(16), nullable=True)
+    revoked_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
 
 class Customer(db.Model):
     __tablename__ = "customers"
