@@ -1,4 +1,5 @@
 import os
+import time
 import click
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -47,8 +48,24 @@ def create_app():
 
     @app.before_request
     def handle_preflight_requests():
+        request._started_at = time.monotonic()
+        app.logger.info("START request method=%s path=%s", request.method, request.path)
         if request.method == "OPTIONS":
             return "", 204
+
+    @app.after_request
+    def log_request_completion(response):
+        started = getattr(request, "_started_at", None)
+        elapsed_ms = round((time.monotonic() - started) * 1000, 2) if started else None
+        app.logger.info("END request method=%s path=%s status=%s elapsed_ms=%s", request.method, request.path, response.status_code, elapsed_ms)
+        return response
+
+    @app.teardown_request
+    def cleanup_session(exception=None):
+        if exception is not None:
+            db.session.rollback()
+        if not app.config.get("TESTING"):
+            db.session.remove()
 
     @app.errorhandler(HTTPException)
     def handle_http_exception(exc):

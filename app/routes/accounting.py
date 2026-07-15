@@ -1,4 +1,5 @@
 from datetime import date
+import time
 from flask import Blueprint, Response, jsonify, request, current_app
 from flask_jwt_extended import get_jwt_identity
 
@@ -43,20 +44,46 @@ def _error(exc):
     return jsonify({"success": False, "message": str(exc), "error_code": "ACCOUNTING_ERROR"}), 400
 
 @accounting_bp.before_request
-def _ensure_seeded():
-    seed_default_report_classifications()
-    db.session.flush()
+def _log_accounting_request_start():
+    request._accounting_started = time.monotonic()
+    current_app.logger.info("START request method=%s path=%s", request.method, request.path)
+
+
+@accounting_bp.after_request
+def _log_accounting_request_end(response):
+    started = getattr(request, "_accounting_started", None)
+    elapsed_ms = round((time.monotonic() - started) * 1000, 2) if started else None
+    current_app.logger.info("END request method=%s path=%s status=%s elapsed_ms=%s", request.method, request.path, response.status_code, elapsed_ms)
+    return response
+
+def _account_option(account):
+    return {
+        "id": account.id,
+        "account_code": account.account_code,
+        "account_name": account.account_name,
+        "account_type": account.account_type,
+        "account_subtype": account_subtype(account),
+        "posting_allowed": bool(account.allow_manual_posting),
+        "is_active": bool(account.is_active),
+        "account_role": account.account_role,
+    }
+
 
 @accounting_bp.route("/accounts", methods=["GET"])
 @role_required(["admin"])
 def list_accounts():
+    current_app.logger.info("Accounting accounts milestone=loading active accounts")
     q = AccountingAccount.query
     if request.args.get("account_type"): q=q.filter_by(account_type=request.args["account_type"])
-    if request.args.get("active") is not None: q=q.filter_by(is_active=request.args.get("active").lower()=="true")
+    if request.args.get("active") is not None: q=q.filter(AccountingAccount.is_active.is_(request.args.get("active").lower()=="true"))
     if request.args.get("parent_id"): q=q.filter_by(parent_id=request.args.get("parent_id"))
     if request.args.get("search"):
         s=f"%{request.args['search']}%"; q=q.filter((AccountingAccount.account_code.ilike(s)) | (AccountingAccount.account_name.ilike(s)))
-    return jsonify([{"id":a.id,"account_code":a.account_code,"account_name":a.account_name,"account_type":a.account_type,"normal_balance":a.normal_balance,"parent_id":a.parent_id,"description":a.description,"is_system_account":a.is_system_account,"is_active":a.is_active,"allow_manual_posting":a.allow_manual_posting,"cash_flow_category":a.cash_flow_category,"account_subtype":account_subtype(a),"financial_statement_group":a.financial_statement_group,"financial_statement_order":a.financial_statement_order,"cash_flow_group":a.cash_flow_group} for a in q.order_by(AccountingAccount.account_code).all()])
+    current_app.logger.info("Accounting accounts milestone=serializing response")
+    accounts = q.order_by(AccountingAccount.account_code).limit(500).all()
+    response = [_account_option(a) for a in accounts]
+    current_app.logger.info("Accounting accounts milestone=completed count=%s", len(response))
+    return jsonify(response)
 
 @accounting_bp.route("/accounts", methods=["POST"])
 @role_required(["admin"])
@@ -88,7 +115,10 @@ def delete_account(account_id):
 @accounting_bp.route("/settings", methods=["GET"])
 @role_required(["admin"])
 def get_settings():
-    return jsonify({"settings": accounting_settings_payload()})
+    current_app.logger.info("Accounting settings milestone=loading accounting settings")
+    settings = accounting_settings_payload()
+    current_app.logger.info("Accounting settings milestone=completed configured=%s", settings.get("configured"))
+    return jsonify({"settings": settings})
 
 @accounting_bp.route("/settings", methods=["PUT"])
 @role_required(["admin"])

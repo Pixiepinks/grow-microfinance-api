@@ -1,6 +1,6 @@
 from datetime import date
 from decimal import Decimal, InvalidOperation
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, current_app
 from sqlalchemy.exc import IntegrityError
 import logging
 from flask_jwt_extended import get_jwt_identity
@@ -22,6 +22,8 @@ from ..models import (
     AccountingJournalLine,
     CollectionDepositBatch,
     LoanDisbursementDeduction,
+    DisbursementChargeType,
+    AccountingSetting,
 )
 from ..accounting import post_loan_disbursement, AccountingError, accrue_due_loan_interest, reverse_payment, reverse_loan_disbursement, money as acct_money, preview_collection_deposit, create_collection_deposit, reverse_collection_deposit, collector_cash_position, account_subtype, allocate_payment, post_loan_payment, validate_collection_account, repair_unposted_payment, require_open_accounting_period, ValidationError, preview_loan_disbursement
 from ..loan_ledger import (
@@ -35,6 +37,52 @@ from .utils import role_required
 
 admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
 logger = logging.getLogger(__name__)
+
+def _compact_account(account):
+    if not account:
+        return None
+    return {"id": account.id, "code": account.account_code, "name": account.account_name}
+
+
+def _charge_destination_account(charge_type):
+    return charge_type.income_account or charge_type.payable_account or charge_type.expense_account or charge_type.tax_payable_account
+
+
+def _charge_type_payload(charge_type):
+    destination = _charge_destination_account(charge_type)
+    return {
+        "id": charge_type.id,
+        "code": charge_type.code,
+        "name": charge_type.name,
+        "description": charge_type.description,
+        "calculation_method": charge_type.calculation_method,
+        "default_amount": float(charge_type.default_amount) if charge_type.default_amount is not None else None,
+        "default_rate": float(charge_type.default_rate) if charge_type.default_rate is not None else None,
+        "accounting_treatment": charge_type.accounting_treatment,
+        "tax_method": charge_type.tax_method,
+        "tax_rate": float(charge_type.tax_rate) if charge_type.tax_rate is not None else None,
+        "included_in_principal": bool(charge_type.included_in_principal),
+        "deducted_from_disbursement": bool(charge_type.deducted_from_disbursement),
+        "refundable": bool(charge_type.refundable),
+        "display_order": charge_type.display_order,
+        "destination_account": _compact_account(destination),
+    }
+
+
+def _setting_bool(settings, key, default=False):
+    setting = settings.get(key)
+    if setting is None:
+        return default
+    return str(setting.setting_value).lower() in {"1", "true", "yes", "on"}
+
+
+def _term_display(application):
+    if application.term_type and application.term_value:
+        unit = "days" if application.term_type == "DAYS" else "months"
+        return f"{application.term_value} {unit}"
+    if application.loan_days:
+        return f"{application.loan_days} days"
+    return f"{application.tenure_months} months" if application.tenure_months else None
 
 
 @admin_bp.before_request
@@ -653,6 +701,79 @@ def admin_reverse_payment(payment_id):
         return jsonify({"reversal_journal_id": rev.id})
     except AccountingError as exc:
         db.session.rollback(); return jsonify({"message": str(exc)}), 422
+
+@admin_bp.route("/disbursement-charge-types", methods=["GET"])
+@role_required(["admin"])
+def list_disbursement_charge_types():
+    current_app.logger.info("Disbursement charge types milestone=loading charge types")
+    charges = (
+        DisbursementChargeType.query
+        .options(
+            joinedload(DisbursementChargeType.income_account),
+            joinedload(DisbursementChargeType.payable_account),
+            joinedload(DisbursementChargeType.expense_account),
+            joinedload(DisbursementChargeType.tax_payable_account),
+        )
+        .filter(DisbursementChargeType.active.is_(True))
+        .order_by(DisbursementChargeType.display_order, DisbursementChargeType.code)
+        .limit(100)
+        .all()
+    )
+    current_app.logger.info("Disbursement charge types milestone=completed count=%s", len(charges))
+    return jsonify({"charge_types": [_charge_type_payload(charge) for charge in charges]})
+
+
+@admin_bp.route("/loan-applications/<int:application_id>/disbursement-options", methods=["GET"])
+@role_required(["admin"])
+def loan_application_disbursement_options(application_id):
+    try:
+        current_app.logger.info("Disbursement options milestone=loading application")
+        application = LoanApplication.query.options(joinedload(LoanApplication.customer)).get_or_404(application_id)
+        current_app.logger.info("Disbursement options milestone=loading active funding accounts")
+        funding_accounts = (
+            AccountingAccount.query
+            .filter(AccountingAccount.is_active.is_(True), AccountingAccount.account_type == "ASSET", AccountingAccount.allow_manual_posting.is_(True))
+            .order_by(AccountingAccount.account_code)
+            .limit(500)
+            .all()
+        )
+        funding_accounts = [a for a in funding_accounts if account_subtype(a) in {"CASH", "BANK"}]
+        current_app.logger.info("Disbursement options milestone=loading charge types")
+        charges = (
+            DisbursementChargeType.query
+            .options(joinedload(DisbursementChargeType.income_account), joinedload(DisbursementChargeType.payable_account), joinedload(DisbursementChargeType.expense_account), joinedload(DisbursementChargeType.tax_payable_account))
+            .filter(DisbursementChargeType.active.is_(True))
+            .order_by(DisbursementChargeType.display_order, DisbursementChargeType.code)
+            .limit(100)
+            .all()
+        )
+        current_app.logger.info("Disbursement options milestone=resolving account mappings")
+        settings = {s.setting_key: s for s in AccountingSetting.query.filter(AccountingSetting.setting_key.in_(["allow_manual_disbursement_charges", "require_disbursement_charge_approval", "allow_zero_net_disbursement"])).all()}
+        current_app.logger.info("Disbursement options milestone=serializing response")
+        payload = {
+            "application": {
+                "id": application.id,
+                "application_number": application.application_number,
+                "gross_principal_amount": float(application.approved_amount or application.applied_amount),
+                "customer_name": application.customer.full_name if application.customer else application.full_name,
+                "term_display": _term_display(application),
+                "repayment_frequency": application.repayment_frequency,
+            },
+            "funding_accounts": [_compact_account(account) for account in funding_accounts],
+            "charge_types": [_charge_type_payload(charge) for charge in charges],
+            "settings": {
+                "allow_manual_disbursement_charges": _setting_bool(settings, "allow_manual_disbursement_charges", True),
+                "require_disbursement_charge_approval": _setting_bool(settings, "require_disbursement_charge_approval", False),
+                "allow_zero_net_disbursement": _setting_bool(settings, "allow_zero_net_disbursement", False),
+            },
+        }
+        current_app.logger.info("Disbursement options milestone=completed")
+        return jsonify(payload)
+    except Exception:
+        db.session.rollback()
+        current_app.logger.exception("Disbursement setup could not be loaded for application %s", application_id)
+        return jsonify({"error": "Disbursement setup could not be loaded", "message": "Accounting configuration is unavailable."}), 500
+
 
 @admin_bp.route("/loans/<int:loan_id>/reverse-disbursement", methods=["POST"])
 @role_required(["admin"])

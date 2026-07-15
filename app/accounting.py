@@ -566,13 +566,32 @@ def resolve_system_account(key):
     return account
 
 def accounting_settings_payload():
-    seed_default_accounts()
-    payload = {}
+    """Return persisted accounting settings without mutating data during GET requests."""
+    settings = {s.setting_key: s.setting_value for s in AccountingSetting.query.filter(AccountingSetting.setting_key.in_(list(SETTING_VALIDATION))).limit(len(SETTING_VALIDATION)).all()}
+    accounts_by_id = {}
+    accounts_by_code = {}
+    if settings:
+        ids = [int(v) for v in settings.values() if str(v).isdigit()]
+        codes = [str(v) for v in settings.values() if not str(v).isdigit()]
+        if ids:
+            accounts_by_id = {a.id: a for a in AccountingAccount.query.filter(AccountingAccount.id.in_(ids)).all()}
+        if codes:
+            accounts_by_code = {a.account_code: a for a in AccountingAccount.query.filter(AccountingAccount.account_code.in_(codes)).all()}
+    payload = {"configured": True, "missing_settings": []}
     for key in SETTING_VALIDATION:
-        try:
-            payload[key] = serialize_account(resolve_system_account(key))
-        except AccountingError:
+        value = settings.get(key)
+        account = accounts_by_id.get(int(value)) if value and str(value).isdigit() else accounts_by_code.get(str(value)) if value else None
+        if account:
+            payload[key] = serialize_account(account)
+            payload[f"{key}_id"] = account.id
+        else:
             payload[key] = None
+            payload["configured"] = False
+            payload["missing_settings"].append(key)
+    for key in DISBURSEMENT_SETTING_DEFAULTS:
+        setting = AccountingSetting.query.filter_by(setting_key=key).first()
+        if setting is not None:
+            payload[key] = setting.setting_value
     return payload
 
 def update_accounting_settings(data, user_id=None):
