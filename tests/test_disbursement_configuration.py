@@ -195,6 +195,44 @@ def test_application_disbursement_preview_valid_unknown_fee_and_trailing_slash(a
     assert missing.get_json()["error"] == "not_found"
 
 
+
+def test_application_disbursement_preview_response_contract_and_read_only(app, client):
+    with app.app_context():
+        seed_disbursement_settings()
+        application, _customer = _approved_application_with_terms()
+        application_id = application.id
+        bank = AccountingAccount.query.filter_by(account_code="1010").one()
+        doc_fee = DisbursementChargeType.query.filter_by(code="DOC_FEE").one()
+        loan_count = Loan.query.count()
+        receivable_id = AccountingAccount.query.filter_by(account_code="1100").one().id
+        bank_id = bank.id
+        doc_income = AccountingAccount.query.filter_by(account_code="4030").one()
+        doc_income_id = doc_income.id
+        headers = _admin_headers(app)
+        payload = {"disbursement_date": "2026-07-15", "funding_account_id": bank.id, "transaction_method": "BANK_TRANSFER", "reference": "REF", "charges": [{"charge_type_id": doc_fee.id, "amount": 400}]}
+
+    response = client.post(f"/admin/loan-applications/{application_id}/disbursement-preview", headers=headers, json=payload)
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert set(body.keys()) == {"application_id", "gross_principal_amount", "total_disbursement_deductions", "net_disbursed_amount", "charges", "journal_preview", "validation_errors"}
+    assert set(body["journal_preview"].keys()) == {"debits", "credits", "total_debit", "total_credit", "balanced"}
+    assert body["validation_errors"] == []
+    assert isinstance(body["journal_preview"]["debits"], list)
+    assert isinstance(body["journal_preview"]["credits"], list)
+    assert body["journal_preview"]["debits"] == [{"account_id": receivable_id, "account_code": "1100", "account_name": "Loan Principal Receivable", "amount": 15000.0}]
+    assert body["journal_preview"]["credits"] == [
+        {"account_id": bank_id, "account_code": "1010", "account_name": "Main Bank Account", "amount": 14600.0},
+        {"account_id": doc_income_id, "account_code": "4030", "account_name": "Documentation Fee Income", "amount": 400.0},
+    ]
+    assert body["journal_preview"]["total_debit"] == body["journal_preview"]["total_credit"] == 15000.0
+    assert body["journal_preview"]["balanced"] is True
+    assert body["charges"]
+    assert set(body["charges"][0]["destination_account"].keys()) == {"id", "account_code", "account_name"}
+
+    with app.app_context():
+        assert Loan.query.count() == loan_count
+
 def test_final_application_disbursement_posts_charges_and_journal(app, client):
     with app.app_context():
         seed_disbursement_settings()

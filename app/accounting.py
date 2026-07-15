@@ -1246,9 +1246,14 @@ def _destination_account_for_charge(charge_type):
         raise AccountingError(f"Destination account does not allow posting for charge type {charge_type.code}")
     return acct
 
+def _account_to_preview_dict(account):
+    return {"id":account.id,"account_code":account.account_code,"account_name":account.account_name}
+
 def _charge_to_dict(line):
     acct=line["destination_account"]; tax=line.get("tax_account"); ct=line["charge_type"]
-    return {"charge_type_id":ct.id,"code":ct.code,"name":ct.name,"description":line["description"],"gross_amount":float(line["gross_amount"]),"tax_amount":float(line["tax_amount"]),"net_charge_amount":float(line["net_charge_amount"]),"calculation_method":line["calculation_method"],"rate":float(line["rate"]) if line.get("rate") is not None else None,"accounting_treatment":line["accounting_treatment"],"destination_account":{"id":acct.id,"code":acct.account_code,"name":acct.account_name},"tax_account":{"id":tax.id,"code":tax.account_code,"name":tax.account_name} if tax else None}
+    destination_account = _account_to_preview_dict(acct)
+    tax_account = _account_to_preview_dict(tax) if tax else None
+    return {"charge_type_id":ct.id,"code":ct.code,"name":ct.name,"amount":line["gross_amount"],"description":line["description"],"gross_amount":line["gross_amount"],"tax_amount":line["tax_amount"],"net_charge_amount":line["net_charge_amount"],"calculation_method":line["calculation_method"],"rate":line["rate"] if line.get("rate") is not None else None,"accounting_treatment":line["accounting_treatment"],"destination_account":destination_account,"tax_account":tax_account}
 
 def calculate_disbursement_charges(principal_amount, selected_charges, allow_exceeding_principal=None, allow_zero_net=None):
     principal=money(principal_amount)
@@ -1291,37 +1296,72 @@ def calculate_disbursement_charges(principal_amount, selected_charges, allow_exc
 
 def preview_loan_disbursement(loan, charges=None, funding_account=None, disbursement_date=None):
     principal=money(getattr(loan,"gross_principal_amount",None) or loan.principal_amount); funding_account=validate_funding_account(funding_account or resolve_system_account("DEFAULT_DISBURSEMENT_ACCOUNT")); result=calculate_disbursement_charges(principal, charges or [])
-    credits=[{"account_code":funding_account.account_code,"account_name":funding_account.account_name,"account":funding_account.account_name,"account_id":funding_account.id,"amount":result["net_disbursed_amount"]}]; grouped={}
+    loan_receivable = resolve_system_account("LOAN_PRINCIPAL_RECEIVABLE")
+    credits=[{"account_id":funding_account.id,"account_code":funding_account.account_code,"account_name":funding_account.account_name,"amount":result["net_disbursed_amount"]}]; grouped={}
     for line in result["charge_lines"]:
-        grouped[line["destination_account"].id]=grouped.get(line["destination_account"].id,{"account_code":line["destination_account"].account_code,"account_name":line["destination_account"].account_name,"account":line["destination_account"].account_name,"account_id":line["destination_account"].id,"amount":Decimal("0.00")}); grouped[line["destination_account"].id]["amount"]+=line["net_charge_amount"]
-        if line["tax_amount"]>0: grouped[line["tax_account"].id]=grouped.get(line["tax_account"].id,{"account":line["tax_account"].account_name,"account_id":line["tax_account"].id,"amount":Decimal("0.00")}); grouped[line["tax_account"].id]["amount"]+=line["tax_amount"]
+        dest = line["destination_account"]
+        grouped[dest.id]=grouped.get(dest.id,{"account_id":dest.id,"account_code":dest.account_code,"account_name":dest.account_name,"amount":Decimal("0.00")}); grouped[dest.id]["amount"]+=line["net_charge_amount"]
+        if line["tax_amount"]>0:
+            tax = line["tax_account"]
+            grouped[tax.id]=grouped.get(tax.id,{"account_id":tax.id,"account_code":tax.account_code,"account_name":tax.account_name,"amount":Decimal("0.00")}); grouped[tax.id]["amount"]+=line["tax_amount"]
     credits += list(grouped.values())
     for c in credits: c["amount"]=money(c["amount"])
-    return {"gross_principal_amount":principal,"charges":result["charges"],"total_disbursement_deductions":result["total_deductions"],"net_disbursed_amount":result["net_disbursed_amount"],"journal_preview":{"debits":[{"account_code":resolve_system_account("LOAN_PRINCIPAL_RECEIVABLE").account_code,"account_name":resolve_system_account("LOAN_PRINCIPAL_RECEIVABLE").account_name,"account":resolve_system_account("LOAN_PRINCIPAL_RECEIVABLE").account_name,"amount":principal}],"credits":credits,"total_debit":principal,"total_credit":money(sum(c["amount"] for c in credits)),"balanced":principal==money(sum(c["amount"] for c in credits))},"charge_lines":result["charge_lines"]}
+    total_credit = money(sum(c["amount"] for c in credits))
+    return {"gross_principal_amount":principal,"charges":result["charges"],"total_disbursement_deductions":result["total_deductions"],"net_disbursed_amount":result["net_disbursed_amount"],"journal_preview":{"debits":[{"account_id":loan_receivable.id,"account_code":loan_receivable.account_code,"account_name":loan_receivable.account_name,"amount":principal}],"credits":credits,"total_debit":principal,"total_credit":total_credit,"balanced":principal==total_credit},"charge_lines":result["charge_lines"]}
+
+
+def serialize_disbursement_preview(preview, *, application_id=None, validation_errors=None):
+    converted = dict(preview or {})
+    converted.pop("charge_lines", None)
+    journal = dict(converted.get("journal_preview") or {})
+    debit_lines = list(journal.get("debits") or [])
+    credit_lines = list(journal.get("credits") or [])
+
+    def _money_float(value):
+        return float(money(value or 0))
+
+    def _line(line):
+        return {
+            "account_id": line.get("account_id"),
+            "account_code": line.get("account_code"),
+            "account_name": line.get("account_name") or line.get("account"),
+            "amount": _money_float(line.get("amount")),
+        }
+
+    charges = []
+    for charge in converted.get("charges", []) or []:
+        item = dict(charge)
+        item["amount"] = _money_float(item.get("amount", item.get("gross_amount", item.get("net_charge_amount", 0))))
+        for key in ("gross_amount", "tax_amount", "net_charge_amount", "rate"):
+            if item.get(key) is not None:
+                item[key] = float(item[key])
+        for acct_key in ("destination_account", "tax_account"):
+            acct = item.get(acct_key)
+            if acct:
+                item[acct_key] = {"id":acct.get("id"),"account_code":acct.get("account_code") or acct.get("code"),"account_name":acct.get("account_name") or acct.get("name")}
+        charges.append(item)
+
+    debits = [_line(line) for line in debit_lines]
+    credits = [_line(line) for line in credit_lines]
+    total_debit = _money_float(journal.get("total_debit", sum(Decimal(str(line["amount"])) for line in debits)))
+    total_credit = _money_float(journal.get("total_credit", sum(Decimal(str(line["amount"])) for line in credits)))
+    response = {
+        "gross_principal_amount": _money_float(converted.get("gross_principal_amount")),
+        "total_disbursement_deductions": _money_float(converted.get("total_disbursement_deductions")),
+        "net_disbursed_amount": _money_float(converted.get("net_disbursed_amount")),
+        "charges": charges,
+        "journal_preview": {"debits": debits, "credits": credits, "total_debit": total_debit, "total_credit": total_credit, "balanced": bool(journal.get("balanced", total_debit == total_credit))},
+        "validation_errors": list(validation_errors or converted.get("validation_errors") or []),
+    }
+    if application_id is not None:
+        response["application_id"] = application_id
+    elif "application_id" in converted:
+        response["application_id"] = converted["application_id"]
+    return response
 
 
 def _json_ready_disbursement_preview(preview):
-    converted = dict(preview)
-    converted.pop("charge_lines", None)
-    for key in ("gross_principal_amount", "total_disbursement_deductions", "net_disbursed_amount"):
-        converted[key] = float(money(converted[key]))
-    for charge in converted.get("charges", []):
-        if "amount" not in charge:
-            charge["amount"] = charge.get("gross_amount", charge.get("net_charge_amount", 0))
-        charge["amount"] = float(money(charge["amount"]))
-        if "gross_amount" in charge:
-            charge["gross_amount"] = float(money(charge["gross_amount"]))
-        if "tax_amount" in charge:
-            charge["tax_amount"] = float(money(charge["tax_amount"]))
-        if "net_charge_amount" in charge:
-            charge["net_charge_amount"] = float(money(charge["net_charge_amount"]))
-    journal = converted["journal_preview"]
-    for side in ("debits", "credits"):
-        for line in journal[side]:
-            line["amount"] = float(money(line["amount"]))
-    journal["total_debit"] = float(money(journal["total_debit"]))
-    journal["total_credit"] = float(money(journal["total_credit"]))
-    return converted
+    return serialize_disbursement_preview(preview)
 
 
 def preview_loan_application_disbursement(application_id, payload=None, requested_by=None):
@@ -1369,9 +1409,7 @@ def preview_loan_application_disbursement(application_id, payload=None, requeste
     preview_subject.principal_amount = principal
     preview_subject.gross_principal_amount = principal
     preview = preview_loan_disbursement(preview_subject, charges, funding_account, disbursement_date)
-    result = _json_ready_disbursement_preview(preview)
-    result["application_id"] = application.id
-    result["validation_errors"] = []
+    result = serialize_disbursement_preview(preview, application_id=application.id, validation_errors=[])
     if result["journal_preview"]["balanced"] is not True:
         raise ValidationError("journal is not balanced")
     return result
