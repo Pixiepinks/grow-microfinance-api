@@ -24,6 +24,8 @@ from .models import (
     AccountingPeriod,
     LoanApplication,
     User,
+    DisbursementChargeType,
+    LoanDisbursementDeduction,
 )
 
 CENT = Decimal("0.01")
@@ -50,7 +52,12 @@ SYSTEM_MAPPINGS = {
     "PENALTY_INCOME_ACCOUNT": "4010",
     "DELAY_INTEREST_INCOME": "4010",
     "UNAPPLIED_CUSTOMER_FUNDS": "1990",
+    "DOCUMENTATION_FEE_INCOME": "4030",
     "PROCESSING_FEE_INCOME_ACCOUNT": "4020",
+    "PROCESSING_FEE_INCOME": "4020",
+    "INSURANCE_PAYABLE": "2200",
+    "STAMP_DUTY_PAYABLE": "2210",
+    "OUTPUT_TAX_PAYABLE": "2220",
     "OTHER_FEE_INCOME_ACCOUNT": "4020",
     "LOAN_WRITE_OFF_EXPENSE_ACCOUNT": "5050",
     "SUSPENSE_ACCOUNT": "1990",
@@ -70,6 +77,12 @@ DEFAULT_ACCOUNTS = [
     ("4000", "Interest Income", "INCOME", "CREDIT", True, "INTEREST_INCOME"),
     ("4010", "Penalty Income", "INCOME", "CREDIT", True, "PENALTY_INCOME"),
     ("4020", "Processing Fee Income", "INCOME", "CREDIT", True, "FEE_INCOME"),
+    ("4030", "Documentation Fee Income", "INCOME", "CREDIT", True, "FEE_INCOME"),
+    ("4040", "Investigation Fee Income", "INCOME", "CREDIT", True, "FEE_INCOME"),
+    ("2200", "Insurance Premium Payable", "LIABILITY", "CREDIT", True, "ACCOUNTS_PAYABLE"),
+    ("2210", "Stamp Duty Payable", "LIABILITY", "CREDIT", True, "ACCOUNTS_PAYABLE"),
+    ("2220", "VAT Payable", "LIABILITY", "CREDIT", True, "ACCOUNTS_PAYABLE"),
+    ("2230", "Other Statutory Charges Payable", "LIABILITY", "CREDIT", True, "ACCOUNTS_PAYABLE"),
     ("5000", "Salary Expense", "EXPENSE", "DEBIT", False, "OPERATING_EXPENSE"),
     ("5010", "Rent Expense", "EXPENSE", "DEBIT", False, "OPERATING_EXPENSE"),
     ("5020", "Utilities Expense", "EXPENSE", "DEBIT", False, "OPERATING_EXPENSE"),
@@ -90,6 +103,12 @@ SETTING_VALIDATION = {
     "PENALTY_RECEIVABLE_ACCOUNT": ({"ASSET"}, {"PENALTY_RECEIVABLE"}),
     "INTEREST_INCOME_ACCOUNT": ({"INCOME"}, {"INTEREST_INCOME", "FEE_INCOME", "OTHER"}),
     "PENALTY_INCOME_ACCOUNT": ({"INCOME"}, {"PENALTY_INCOME", "FEE_INCOME", "OTHER"}),
+    "default_documentation_fee_account": ({"INCOME"}, {"FEE_INCOME", "OTHER"}),
+    "default_processing_fee_account": ({"INCOME"}, {"FEE_INCOME", "OTHER"}),
+    "default_insurance_payable_account": ({"LIABILITY"}, {"ACCOUNTS_PAYABLE", "OTHER"}),
+    "default_stamp_duty_payable_account": ({"LIABILITY"}, {"ACCOUNTS_PAYABLE", "OTHER"}),
+    "default_tax_payable_account": ({"LIABILITY"}, {"ACCOUNTS_PAYABLE", "OTHER"}),
+    "DOCUMENTATION_FEE_INCOME": ({"INCOME"}, {"FEE_INCOME", "OTHER"}),
     "PROCESSING_FEE_INCOME_ACCOUNT": ({"INCOME"}, {"FEE_INCOME", "OTHER"}),
     "LOAN_WRITE_OFF_EXPENSE_ACCOUNT": ({"EXPENSE"}, {"WRITE_OFF_EXPENSE", "OPERATING_EXPENSE", "OTHER"}),
     "SUSPENSE_ACCOUNT": ({"ASSET", "LIABILITY"}, {"SUSPENSE", "OTHER_CURRENT_ASSET", "OTHER"}),
@@ -183,11 +202,27 @@ def seed_default_accounts():
         db.session.rollback()
         raise
 
+
+DISBURSEMENT_SETTING_DEFAULTS = {"default_documentation_fee_account":"4030","default_processing_fee_account":"4020","default_insurance_payable_account":"2200","default_stamp_duty_payable_account":"2210","default_tax_payable_account":"2220","allow_manual_disbursement_charges":"true","require_disbursement_charge_approval":"false","allow_zero_net_disbursement":"false","allow_deductions_exceeding_principal":"false","default_charge_tax_method":"NO_TAX","show_charges_on_customer_receipt":"true"}
+
+def setting_bool(key, default=False):
+    return str(get_setting(key, str(default).lower())).lower() in {"1","true","yes","on"}
+
+def seed_disbursement_settings():
+    seed_default_accounts()
+    for key, value in DISBURSEMENT_SETTING_DEFAULTS.items():
+        if not AccountingSetting.query.filter_by(setting_key=key).first():
+            db.session.add(AccountingSetting(setting_key=key, setting_value=value))
+    db.session.flush()
+
 def resolve_system_account(key):
     seed_default_accounts()
     setting = AccountingSetting.query.filter_by(setting_key=key).first()
-    code = setting.setting_value if setting else SYSTEM_MAPPINGS[key]
-    account = AccountingAccount.query.filter_by(account_code=code).first()
+    code = setting.setting_value if setting else SYSTEM_MAPPINGS.get(key)
+    account = None
+    if code:
+        account = AccountingAccount.query.get(int(code)) if str(code).isdigit() else None
+        account = account or AccountingAccount.query.filter_by(account_code=str(code)).first()
     if not account:
         raise AccountingError(f"System account {key} is not configured")
     return account
@@ -1094,6 +1129,64 @@ def reverse_payment(payment, reversal_date, reason, user_id=None):
     log_audit("PAYMENT_REVERSE", "Payment", payment.id, user_id, reason)
     return rev
 
+
+CALCULATION_METHODS = {"FIXED_AMOUNT", "PERCENTAGE_OF_PRINCIPAL", "MANUAL_AMOUNT"}
+ACCOUNTING_TREATMENTS = {"INCOME", "PAYABLE", "EXPENSE_RECOVERY", "TAX", "OTHER"}
+TAX_METHODS = {"NO_TAX", "TAX_EXCLUSIVE", "TAX_INCLUSIVE"}
+
+def _destination_account_for_charge(charge_type):
+    acct = charge_type.income_account if charge_type.accounting_treatment == "INCOME" else (charge_type.payable_account or charge_type.tax_payable_account if charge_type.accounting_treatment in {"PAYABLE", "TAX"} else (charge_type.expense_account or charge_type.income_account or charge_type.payable_account))
+    if not acct or not acct.is_active: raise AccountingError(f"Destination account is required for charge type {charge_type.code}")
+    return acct
+
+def _charge_to_dict(line):
+    acct=line["destination_account"]; tax=line.get("tax_account"); ct=line["charge_type"]
+    return {"charge_type_id":ct.id,"code":ct.code,"name":ct.name,"description":line["description"],"gross_amount":float(line["gross_amount"]),"tax_amount":float(line["tax_amount"]),"net_charge_amount":float(line["net_charge_amount"]),"calculation_method":line["calculation_method"],"rate":float(line["rate"]) if line.get("rate") is not None else None,"accounting_treatment":line["accounting_treatment"],"destination_account":{"id":acct.id,"code":acct.account_code,"name":acct.account_name},"tax_account":{"id":tax.id,"code":tax.account_code,"name":tax.account_name} if tax else None}
+
+def calculate_disbursement_charges(principal_amount, selected_charges, allow_exceeding_principal=None, allow_zero_net=None):
+    seed_disbursement_settings(); principal=money(principal_amount)
+    if principal <= 0: raise AccountingError("gross principal must be greater than zero")
+    allow_exceeding_principal = setting_bool("allow_deductions_exceeding_principal", False) if allow_exceeding_principal is None else allow_exceeding_principal
+    allow_zero_net = setting_bool("allow_zero_net_disbursement", False) if allow_zero_net is None else allow_zero_net
+    lines=[]; subtotal=tax_total=total=Decimal("0.00")
+    for raw in selected_charges or []:
+        ct=DisbursementChargeType.query.get(raw.get("charge_type_id"))
+        if not ct or not ct.active: raise AccountingError("unsupported charge type")
+        if ct.included_in_principal: raise AccountingError("capitalized disbursement charges are not enabled for this workflow")
+        if not ct.deducted_from_disbursement: continue
+        rate=raw.get("rate", ct.default_rate)
+        if ct.calculation_method=="PERCENTAGE_OF_PRINCIPAL":
+            if rate is None or Decimal(str(rate)) < 0: raise AccountingError("invalid rate")
+            gross=money(principal*Decimal(str(rate))/Decimal("100"))
+        elif ct.calculation_method=="FIXED_AMOUNT": gross=money(raw.get("amount", ct.default_amount))
+        elif ct.calculation_method=="MANUAL_AMOUNT": gross=money(raw.get("amount"))
+        else: raise AccountingError("unsupported charge type")
+        if gross < 0: raise AccountingError("negative charge amounts are not allowed")
+        dest=_destination_account_for_charge(ct); tax_method=raw.get("tax_method") or ct.tax_method or get_setting("default_charge_tax_method", "NO_TAX")
+        if tax_method not in TAX_METHODS: raise AccountingError("unsupported tax method")
+        tax_rate=Decimal(str(raw.get("tax_rate", ct.tax_rate or 0)))
+        if tax_rate < 0: raise AccountingError("invalid tax rate")
+        tax_acct=ct.tax_payable_account or (resolve_system_account("default_tax_payable_account") if tax_method != "NO_TAX" and tax_rate > 0 else None)
+        if tax_method=="TAX_INCLUSIVE" and tax_rate>0: net=money(gross/(Decimal("1")+tax_rate/Decimal("100"))); tax=money(gross-net)
+        elif tax_method=="TAX_EXCLUSIVE" and tax_rate>0: net=gross; tax=money(gross*tax_rate/Decimal("100")); gross=money(net+tax)
+        else: net=gross; tax=Decimal("0.00")
+        subtotal+=net; tax_total+=tax; total+=gross
+        lines.append({"charge_type":ct,"description":raw.get("description") or ct.name,"gross_amount":gross,"tax_amount":tax,"net_charge_amount":net,"calculation_method":ct.calculation_method,"rate":Decimal(str(rate)) if rate is not None else None,"accounting_treatment":ct.accounting_treatment,"destination_account":dest,"tax_account":tax_acct})
+    net_disb=money(principal-total)
+    if total > principal and not allow_exceeding_principal: raise AccountingError("total deductions cannot exceed gross principal")
+    if net_disb <= 0 and not allow_zero_net: raise AccountingError("net disbursed amount must be greater than zero")
+    return {"charge_lines":lines,"charges":[_charge_to_dict(l) for l in lines],"subtotal_before_tax":money(subtotal),"tax_amount":money(tax_total),"total_deductions":money(total),"total_disbursement_deductions":money(total),"net_disbursement":net_disb,"net_disbursed_amount":net_disb}
+
+def preview_loan_disbursement(loan, charges=None, funding_account=None, disbursement_date=None):
+    principal=money(getattr(loan,"gross_principal_amount",None) or loan.principal_amount); funding_account=validate_funding_account(funding_account or resolve_system_account("DEFAULT_DISBURSEMENT_ACCOUNT")); result=calculate_disbursement_charges(principal, charges or [])
+    credits=[{"account":funding_account.account_name,"account_id":funding_account.id,"amount":result["net_disbursed_amount"]}]; grouped={}
+    for line in result["charge_lines"]:
+        grouped[line["destination_account"].id]=grouped.get(line["destination_account"].id,{"account":line["destination_account"].account_name,"account_id":line["destination_account"].id,"amount":Decimal("0.00")}); grouped[line["destination_account"].id]["amount"]+=line["net_charge_amount"]
+        if line["tax_amount"]>0: grouped[line["tax_account"].id]=grouped.get(line["tax_account"].id,{"account":line["tax_account"].account_name,"account_id":line["tax_account"].id,"amount":Decimal("0.00")}); grouped[line["tax_account"].id]["amount"]+=line["tax_amount"]
+    credits += list(grouped.values())
+    for c in credits: c["amount"]=money(c["amount"])
+    return {"gross_principal_amount":principal,"charges":result["charges"],"total_disbursement_deductions":result["total_deductions"],"net_disbursed_amount":result["net_disbursed_amount"],"journal_preview":{"debits":[{"account":resolve_system_account("LOAN_PRINCIPAL_RECEIVABLE").account_name,"amount":principal}],"credits":credits,"total_debit":principal,"total_credit":money(sum(c["amount"] for c in credits))},"charge_lines":result["charge_lines"]}
+
 def reverse_loan_disbursement(loan, reversal_date, reason, user_id=None):
     if not reason: raise AccountingError("Reversal reason is required")
     if Payment.query.filter_by(loan_id=loan.id).filter(Payment.reversed_at.is_(None)).count():
@@ -1109,25 +1202,38 @@ def reverse_loan_disbursement(loan, reversal_date, reason, user_id=None):
     entry = AccountingJournalEntry.query.get(loan.disbursement_journal_id) if loan.disbursement_journal_id else AccountingJournalEntry.query.filter_by(reference_type="LOAN_DISBURSEMENT", reference_id=str(loan.id)).first()
     if entry and entry.status == "POSTED":
         rev=reverse_journal(entry, reversal_date, reason, user_id); loan.reversal_journal_id=rev.id; reversed_ids.append(rev.id)
+        for deduction in LoanDisbursementDeduction.query.filter_by(loan_id=loan.id, status="POSTED").all():
+            deduction.status="REVERSED"; deduction.reversed_at=datetime.utcnow(); deduction.reversal_journal_id=rev.id
     loan.reversed_at=datetime.utcnow(); loan.status="APPROVED"
     log_audit("LOAN_DISBURSEMENT_REVERSE", "Loan", loan.id, user_id, reason)
     return {"reversal_journal_ids": reversed_ids}
 
-def post_loan_disbursement(loan, user_id=None, funding_key="DEFAULT_DISBURSEMENT_ACCOUNT", funding_account=None, disbursement_date=None):
+def post_loan_disbursement(loan, user_id=None, funding_key="DEFAULT_DISBURSEMENT_ACCOUNT", funding_account=None, disbursement_date=None, charges=None, loan_application_id=None, transaction_method=None, reference=None, remarks=None):
     existing = AccountingJournalEntry.query.filter_by(idempotency_key=f"LOAN_DISBURSEMENT:{loan.id}").first()
     if existing:
         loan.disbursement_journal_id = existing.id
         return existing
-    amount = money(loan.principal_amount)
+    gross = money(getattr(loan, "gross_principal_amount", None) or loan.principal_amount)
+    loan.gross_principal_amount = gross; loan.principal_amount = gross
     funding_account = validate_funding_account(funding_account or resolve_system_account(funding_key))
-    journal_date = disbursement_date or loan.start_date or date.today()
-    require_open_accounting_period(journal_date)
-    entry = create_draft_journal(journal_date, "Loan disbursement", [
-        {"account_id": resolve_system_account("LOAN_PRINCIPAL_RECEIVABLE").id, "debit": amount, "customer_id": loan.customer_id, "loan_id": loan.id},
-        {"account_id": funding_account.id, "credit": amount, "customer_id": loan.customer_id, "loan_id": loan.id},
-    ], "LOAN_DISBURSEMENT", loan.id, "LOANS", user_id, f"LOAN_DISBURSEMENT:{loan.id}")
+    journal_date = disbursement_date or loan.start_date or date.today(); require_open_accounting_period(journal_date)
+    preview = preview_loan_disbursement(loan, charges or [], funding_account, journal_date)
+    net = money(preview["net_disbursed_amount"]); deductions = money(preview["total_disbursement_deductions"])
+    lines = [{"account_id": resolve_system_account("LOAN_PRINCIPAL_RECEIVABLE").id, "debit": gross, "customer_id": loan.customer_id, "loan_id": loan.id}]
+    if net > 0: lines.append({"account_id": funding_account.id, "credit": net, "customer_id": loan.customer_id, "loan_id": loan.id})
+    grouped={}
+    for c in preview["charge_lines"]:
+        grouped[c["destination_account"].id]=grouped.get(c["destination_account"].id, Decimal("0.00"))+c["net_charge_amount"]
+        if c["tax_amount"]>0: grouped[c["tax_account"].id]=grouped.get(c["tax_account"].id, Decimal("0.00"))+c["tax_amount"]
+    for account_id, amount in grouped.items():
+        if money(amount)>0: lines.append({"account_id":account_id,"credit":money(amount),"customer_id":loan.customer_id,"loan_id":loan.id})
+    entry = create_draft_journal(journal_date, "Loan disbursement", lines, "LOAN_DISBURSEMENT", loan.id, "LOANS", user_id, f"LOAN_DISBURSEMENT:{loan.id}")
     entry.loan_id = loan.id; entry.customer_id = loan.customer_id; entry.accounting_date = journal_date
     posted = post_journal(entry, user_id); loan.disbursement_journal_id = posted.id
+    for c in preview["charge_lines"]:
+        db.session.add(LoanDisbursementDeduction(loan_id=loan.id, loan_application_id=loan_application_id, charge_type_id=c["charge_type"].id, description=c["description"], gross_amount=c["gross_amount"], tax_amount=c["tax_amount"], net_charge_amount=c["net_charge_amount"], calculation_method=c["calculation_method"], rate=c["rate"], accounting_treatment=c["accounting_treatment"], destination_account_id=c["destination_account"].id, tax_account_id=c["tax_account"].id if c.get("tax_account") else None, status="POSTED", journal_entry_id=posted.id, created_by=user_id))
+    loan.total_disbursement_deductions=deductions; loan.net_disbursed_amount=net; loan.disbursement_charge_count=len(preview["charge_lines"]); loan.disbursement_deductions_posted=bool(preview["charge_lines"])
+    log_audit("DISBURSEMENT_CHARGES_POSTED", "Loan", loan.id, user_id, {"gross_principal_amount": str(gross), "total_deductions": str(deductions), "net_disbursed_amount": str(net), "transaction_method": transaction_method, "reference": reference, "remarks": remarks})
     mode = getattr(loan, "historical_accrual_mode", None) or get_setting("backdated_loan_accounting_mode", "AUTO")
     if journal_date < date.today() and mode == "AUTO":
         as_of = min(date.today(), loan.maturity_date or loan.end_date or date.today())

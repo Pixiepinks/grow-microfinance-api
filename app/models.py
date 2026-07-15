@@ -267,6 +267,11 @@ class Loan(db.Model):
     historical_accrual_mode = db.Column(db.String(16), nullable=False, default="AUTO")
     accrual_processed_through = db.Column(db.Date)
     disbursement_journal_id = db.Column(db.Integer, db.ForeignKey("accounting_journal_entries.id"))
+    gross_principal_amount = db.Column(Numeric(18, 2))
+    total_disbursement_deductions = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    net_disbursed_amount = db.Column(Numeric(18, 2))
+    disbursement_charge_count = db.Column(db.Integer, nullable=False, default=0)
+    disbursement_deductions_posted = db.Column(db.Boolean, nullable=False, default=False)
     reversed_at = db.Column(db.DateTime)
     reversal_journal_id = db.Column(db.Integer, db.ForeignKey("accounting_journal_entries.id"))
 
@@ -401,6 +406,9 @@ class LoanApplication(db.Model):
     has_existing_loans = db.Column(db.Boolean, default=False)
     existing_loan_details = db.Column(db.Text)
     extra_data = db.Column(db.JSON, default=dict)
+    proposed_disbursement_deductions = db.Column(db.JSON, default=list)
+    estimated_total_deductions = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    estimated_net_disbursement = db.Column(Numeric(18, 2))
 
     customer = relationship("Customer", back_populates="loan_applications")
     created_by = relationship(
@@ -430,6 +438,78 @@ class LoanApplicationDocument(db.Model):
     uploaded_at = db.Column(db.DateTime, default=datetime.utcnow)
 
     loan_application = relationship("LoanApplication", back_populates="documents")
+
+
+class DisbursementChargeType(db.Model):
+    __tablename__ = "disbursement_charge_types"
+    __table_args__ = (
+        db.CheckConstraint("calculation_method in ('FIXED_AMOUNT','PERCENTAGE_OF_PRINCIPAL','MANUAL_AMOUNT')", name="ck_disb_charge_calc_method"),
+        db.CheckConstraint("accounting_treatment in ('INCOME','PAYABLE','EXPENSE_RECOVERY','TAX','OTHER')", name="ck_disb_charge_acct_treatment"),
+        db.CheckConstraint("tax_method in ('NO_TAX','TAX_EXCLUSIVE','TAX_INCLUSIVE')", name="ck_disb_charge_tax_method"),
+    )
+
+    id = db.Column(db.Integer, primary_key=True)
+    code = db.Column(db.String(50), unique=True, index=True, nullable=False)
+    name = db.Column(db.String(150), nullable=False)
+    description = db.Column(db.Text)
+    active = db.Column(db.Boolean, nullable=False, default=True)
+    default_amount = db.Column(Numeric(18, 2))
+    default_rate = db.Column(Numeric(9, 4))
+    calculation_method = db.Column(db.String(40), nullable=False)
+    accounting_treatment = db.Column(db.String(40), nullable=False)
+    income_account_id = db.Column(db.Integer, db.ForeignKey("accounting_accounts.id"))
+    payable_account_id = db.Column(db.Integer, db.ForeignKey("accounting_accounts.id"))
+    expense_account_id = db.Column(db.Integer, db.ForeignKey("accounting_accounts.id"))
+    tax_payable_account_id = db.Column(db.Integer, db.ForeignKey("accounting_accounts.id"))
+    tax_rate = db.Column(Numeric(9, 4))
+    tax_method = db.Column(db.String(30), nullable=False, default="NO_TAX")
+    included_in_principal = db.Column(db.Boolean, nullable=False, default=False)
+    deducted_from_disbursement = db.Column(db.Boolean, nullable=False, default=True)
+    refundable = db.Column(db.Boolean, nullable=False, default=False)
+    display_order = db.Column(db.Integer, nullable=False, default=0)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    income_account = relationship("AccountingAccount", foreign_keys=[income_account_id])
+    payable_account = relationship("AccountingAccount", foreign_keys=[payable_account_id])
+    expense_account = relationship("AccountingAccount", foreign_keys=[expense_account_id])
+    tax_payable_account = relationship("AccountingAccount", foreign_keys=[tax_payable_account_id])
+
+
+class LoanDisbursementDeduction(db.Model):
+    __tablename__ = "loan_disbursement_deductions"
+    __table_args__ = (
+        Index("ix_loan_disb_deduction_loan_id", "loan_id"),
+        Index("ix_loan_disb_deduction_charge_type_id", "charge_type_id"),
+        Index("ix_loan_disb_deduction_status", "status"),
+        db.CheckConstraint("status in ('DRAFT','POSTED','REVERSED','WAIVED')", name="ck_loan_disb_deduction_status"),
+    )
+
+    id = db.Column(db.Integer, primary_key=True)
+    loan_id = db.Column(db.Integer, db.ForeignKey("loans.id"), nullable=False)
+    loan_application_id = db.Column(db.Integer, db.ForeignKey("loan_applications.id"))
+    charge_type_id = db.Column(db.Integer, db.ForeignKey("disbursement_charge_types.id"), nullable=False)
+    description = db.Column(db.Text, nullable=False)
+    gross_amount = db.Column(Numeric(18, 2), nullable=False)
+    tax_amount = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    net_charge_amount = db.Column(Numeric(18, 2), nullable=False)
+    calculation_method = db.Column(db.String(40), nullable=False)
+    rate = db.Column(Numeric(9, 4))
+    accounting_treatment = db.Column(db.String(40), nullable=False)
+    destination_account_id = db.Column(db.Integer, db.ForeignKey("accounting_accounts.id"), nullable=False)
+    tax_account_id = db.Column(db.Integer, db.ForeignKey("accounting_accounts.id"))
+    status = db.Column(db.String(20), nullable=False, default="DRAFT")
+    journal_entry_id = db.Column(db.Integer, db.ForeignKey("accounting_journal_entries.id"))
+    reversed_at = db.Column(db.DateTime)
+    reversal_journal_id = db.Column(db.Integer, db.ForeignKey("accounting_journal_entries.id"))
+    created_by = db.Column(db.Integer, db.ForeignKey("users.id"))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    loan = relationship("Loan", backref="disbursement_deductions")
+    charge_type = relationship("DisbursementChargeType")
+    destination_account = relationship("AccountingAccount", foreign_keys=[destination_account_id])
+    tax_account = relationship("AccountingAccount", foreign_keys=[tax_account_id])
 
 
 class Payment(db.Model):
