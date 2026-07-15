@@ -21,8 +21,9 @@ from ..models import (
     AccountingAccount,
     AccountingJournalLine,
     CollectionDepositBatch,
+    LoanDisbursementDeduction,
 )
-from ..accounting import post_loan_disbursement, AccountingError, accrue_due_loan_interest, reverse_payment, reverse_loan_disbursement, money as acct_money, preview_collection_deposit, create_collection_deposit, reverse_collection_deposit, collector_cash_position, account_subtype, allocate_payment, post_loan_payment, validate_collection_account, repair_unposted_payment, require_open_accounting_period, ValidationError
+from ..accounting import post_loan_disbursement, AccountingError, accrue_due_loan_interest, reverse_payment, reverse_loan_disbursement, money as acct_money, preview_collection_deposit, create_collection_deposit, reverse_collection_deposit, collector_cash_position, account_subtype, allocate_payment, post_loan_payment, validate_collection_account, repair_unposted_payment, require_open_accounting_period, ValidationError, preview_loan_disbursement
 from ..loan_ledger import (
     daily_interest_rate,
     generate_loan_ledger,
@@ -269,6 +270,34 @@ def get_loan(loan_id):
     return jsonify(_loan_to_dict(loan))
 
 
+
+@admin_bp.route("/loans/<int:loan_id>/disbursement-preview", methods=["POST"])
+@role_required(["admin"])
+def loan_disbursement_preview(loan_id):
+    loan = Loan.query.get_or_404(loan_id)
+    data = request.get_json(silent=True) or {}
+    try:
+        funding_account = None
+        if data.get("funding_account_id") is not None:
+            funding_account = AccountingAccount.query.get(int(data["funding_account_id"]))
+        disbursement_date = date.fromisoformat(data.get("disbursement_date")) if data.get("disbursement_date") else (loan.start_date or date.today())
+        require_open_accounting_period(disbursement_date)
+        preview = preview_loan_disbursement(loan, data.get("charges") or [], funding_account, disbursement_date)
+        def dec(v): return float(v) if isinstance(v, Decimal) else v
+        preview.pop("charge_lines", None)
+        preview["gross_principal_amount"] = dec(preview["gross_principal_amount"])
+        preview["total_disbursement_deductions"] = dec(preview["total_disbursement_deductions"])
+        preview["net_disbursed_amount"] = dec(preview["net_disbursed_amount"])
+        for side in ("debits", "credits"):
+            for line in preview["journal_preview"][side]: line["amount"] = dec(line["amount"])
+        preview["journal_preview"]["total_debit"] = dec(preview["journal_preview"]["total_debit"])
+        preview["journal_preview"]["total_credit"] = dec(preview["journal_preview"]["total_credit"])
+        return jsonify(preview)
+    except AccountingError as exc:
+        return jsonify({"error": str(exc), "message": str(exc)}), 422
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid disbursement preview payload"}), 400
+
 def _loan_to_dict(loan: Loan) -> dict:
     config = loan_config_summary(loan)
     return {
@@ -279,6 +308,12 @@ def _loan_to_dict(loan: Loan) -> dict:
         "currency": CURRENCY_CODE,
         "principal_amount": float(loan.principal_amount),
         "principal_amount_formatted": format_currency(loan.principal_amount),
+        "gross_principal_amount": float(loan.gross_principal_amount or loan.principal_amount),
+        "total_disbursement_deductions": float(loan.total_disbursement_deductions or 0),
+        "net_disbursed_amount": float(loan.net_disbursed_amount or loan.principal_amount),
+        "disbursement_charge_count": loan.disbursement_charge_count or 0,
+        "disbursement_deductions_posted": bool(loan.disbursement_deductions_posted),
+        "disbursement_deductions": [{"code": d.charge_type.code if d.charge_type else None, "name": d.charge_type.name if d.charge_type else d.description, "amount": float(d.gross_amount), "tax_amount": float(d.tax_amount or 0), "net_charge_amount": float(d.net_charge_amount), "accounting_treatment": d.accounting_treatment, "account_code": d.destination_account.account_code if d.destination_account else None, "account_name": d.destination_account.account_name if d.destination_account else None, "status": d.status} for d in getattr(loan, "disbursement_deductions", [])],
         "interest_rate": float(loan.interest_rate),
         "total_days": loan.total_days,
         "payment_interval_days": loan.payment_interval_days,

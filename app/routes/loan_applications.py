@@ -553,6 +553,9 @@ def build_application_response(application: LoanApplication) -> dict:
         "existing_loan_details": application.existing_loan_details,
         "loan_purpose": (application.extra_data or {}).get("loan_purpose"),
         "extra_data": application.extra_data or {},
+        "proposed_disbursement_deductions": application.proposed_disbursement_deductions or [],
+        "estimated_total_deductions": _decimal_to_float(application.estimated_total_deductions),
+        "estimated_net_disbursement": _decimal_to_float(application.estimated_net_disbursement),
         "documents": [
             {
                 "id": d.id,
@@ -1216,14 +1219,14 @@ def disburse_application(application_id):
         "final_installment_due_date": maturity_date,
     }
 
-    loan = Loan(loan_number=generate_loan_number(), customer_id=application.customer_id, principal_amount=principal, interest_rate=interest_rate, total_days=total_days, payment_interval_days=payment_interval_days, daily_installment=daily_installment, total_payable=total_payable, start_date=start_date, end_date=end_date, status="ACTIVE", created_by_id=int(get_jwt_identity()), **loan_kwargs)
+    loan = Loan(loan_number=generate_loan_number(), customer_id=application.customer_id, principal_amount=principal, gross_principal_amount=principal, net_disbursed_amount=principal, interest_rate=interest_rate, total_days=total_days, payment_interval_days=payment_interval_days, daily_installment=daily_installment, total_payable=total_payable, start_date=start_date, end_date=end_date, status="ACTIVE", created_by_id=int(get_jwt_identity()), **loan_kwargs)
 
     try:
         db.session.add(loan); db.session.flush(); generate_loan_ledger(loan)
         application.status = STATUS_DISBURSED
-        post_loan_disbursement(loan, int(get_jwt_identity()), funding_account=funding_account, disbursement_date=disbursement_date)
+        post_loan_disbursement(loan, int(get_jwt_identity()), funding_account=funding_account, disbursement_date=disbursement_date, charges=data.get("charges") or [], loan_application_id=application.id, transaction_method=data.get("transaction_method"), reference=data.get("reference"), remarks=data.get("remarks"))
         db.session.commit()
-        return jsonify({"message": "Loan disbursed", "loan_id": loan.id, "loan_number": loan.loan_number, "loan": {"principal_amount": float(loan.principal_amount), "term_type": loan.term_type, "term_value": loan.term_value, "loan_days": loan.loan_days, "tenure_months": loan.tenure_months, "repayment_frequency": loan.repayment_frequency, "number_of_installments": loan.number_of_installments, "installment_count": loan.installment_count, "installment_amount": _decimal_to_float(loan.installment_amount), "total_repayment": _decimal_to_float(loan.total_repayment), "total_interest": _decimal_to_float(loan.total_interest), "interest_rate": float(loan.interest_rate), "interest_type": loan.interest_type, "interest_rate_basis": loan.interest_rate_basis, "start_date": loan.start_date.isoformat(), "maturity_date": loan.maturity_date.isoformat() if loan.maturity_date else None, "final_installment_due_date": loan.final_installment_due_date.isoformat() if loan.final_installment_due_date else None}, "application": build_application_response(application)}), 201
+        return jsonify({"message": "Loan disbursed", "loan_id": loan.id, "loan_number": loan.loan_number, "loan": {"principal_amount": float(loan.principal_amount), "gross_principal_amount": float(loan.gross_principal_amount or loan.principal_amount), "total_disbursement_deductions": float(loan.total_disbursement_deductions or 0), "net_disbursed_amount": float(loan.net_disbursed_amount or loan.principal_amount), "term_type": loan.term_type, "term_value": loan.term_value, "loan_days": loan.loan_days, "tenure_months": loan.tenure_months, "repayment_frequency": loan.repayment_frequency, "number_of_installments": loan.number_of_installments, "installment_count": loan.installment_count, "installment_amount": _decimal_to_float(loan.installment_amount), "total_repayment": _decimal_to_float(loan.total_repayment), "total_interest": _decimal_to_float(loan.total_interest), "interest_rate": float(loan.interest_rate), "interest_type": loan.interest_type, "interest_rate_basis": loan.interest_rate_basis, "start_date": loan.start_date.isoformat(), "maturity_date": loan.maturity_date.isoformat() if loan.maturity_date else None, "final_installment_due_date": loan.final_installment_due_date.isoformat() if loan.final_installment_due_date else None}, "application": build_application_response(application)}), 201
     except AccountingError as exc:
         db.session.rollback(); return jsonify({"message": "Accounting posting failed", "error": str(exc)}), 400
     except Exception as exc:
