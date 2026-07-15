@@ -21,7 +21,7 @@ from ..accounting import (
     accounting_settings_payload,
     update_accounting_settings,
     account_subtype,
-    validate_funding_account,
+    validate_funding_account, is_funding_account,
     resolve_system_account,
     trial_balance_report,
     income_statement_report,
@@ -141,8 +141,8 @@ def funding_accounts():
     for key in ["DEFAULT_DISBURSEMENT_ACCOUNT", "DEFAULT_CASH_COLLECTION_ACCOUNT", "DEFAULT_BANK_COLLECTION_ACCOUNT"]:
         try: default_ids.add(resolve_system_account(key).id)
         except Exception: pass
-    accounts=AccountingAccount.query.filter_by(is_active=True, account_type="ASSET", allow_manual_posting=True).order_by(AccountingAccount.account_code).all()
-    return jsonify({"accounts":[{"id":a.id,"account_code":a.account_code,"account_name":a.account_name,"account_subtype":account_subtype(a),"is_default":a.id in default_ids} for a in accounts if account_subtype(a) in subtypes]})
+    accounts=AccountingAccount.query.order_by(AccountingAccount.account_code).all()
+    return jsonify({"accounts":[{"id":a.id,"account_code":a.account_code,"account_name":a.account_name,"account_subtype":account_subtype(a),"is_default":a.id in default_ids} for a in accounts if is_funding_account(a) and account_subtype(a) in subtypes]})
 
 @accounting_bp.route("/journals", methods=["GET"])
 @role_required(["admin"])
