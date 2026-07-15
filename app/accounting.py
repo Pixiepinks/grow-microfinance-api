@@ -163,6 +163,7 @@ def seed_default_accounts():
                 "allow_manual_posting": False if code == "1050" else True,
                 "is_collection_account": False,
                 "is_active": True,
+                "account_role": "MAIN_BANK_ACCOUNT" if code == "1010" else "DOCUMENTATION_FEE_INCOME" if code == "4030" else None,
             }
             with db.session.no_autoflush:
                 acct = AccountingAccount.query.filter_by(account_code=code).first()
@@ -191,6 +192,14 @@ def seed_default_accounts():
                 acct.collector_id = None
             elif getattr(acct, "cash_flow_category", None) in (None, "NONE") and category != "NONE":
                 acct.cash_flow_category = "RECEIVABLE" if "RECEIVABLE" in category else category
+            if code == "1010":
+                acct.account_role = acct.account_role or "MAIN_BANK_ACCOUNT"
+                acct.allow_manual_posting = True
+                acct.is_active = True
+            elif code == "4030":
+                acct.account_role = "DOCUMENTATION_FEE_INCOME"
+                acct.allow_manual_posting = True
+                acct.is_active = True
         db.session.flush()
         for key, code in SYSTEM_MAPPINGS.items():
             with db.session.no_autoflush:
@@ -257,13 +266,18 @@ def ensure_documentation_charge_type():
     return charge
 
 def seed_disbursement_settings():
-    seed_default_accounts()
-    ensure_documentation_fee_income_account()
-    for key, value in DISBURSEMENT_SETTING_DEFAULTS.items():
-        if not AccountingSetting.query.filter_by(setting_key=key).first():
-            db.session.add(AccountingSetting(setting_key=key, setting_value=value))
-    ensure_documentation_charge_type()
-    db.session.flush()
+    try:
+        seed_default_accounts()
+        ensure_documentation_fee_income_account()
+        ensure_documentation_charge_type()
+        for key, value in DISBURSEMENT_SETTING_DEFAULTS.items():
+            setting = AccountingSetting.query.filter_by(setting_key=key).first()
+            if not setting:
+                db.session.add(AccountingSetting(setting_key=key, setting_value=value))
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        raise
 
 def resolve_system_account(key):
     setting = AccountingSetting.query.filter_by(setting_key=key).first()
@@ -571,8 +585,23 @@ def reconciliation_summary():
     return {"issues": issues, "total": len(issues), "counts_by_severity": counts_by_severity, "counts_by_type": counts_by_type}
 
 # Accounting improvement package helpers (phase 1.5)
+def normalize_account_value(value):
+    return str(value or "").strip().upper()
+
+def is_active_account(account):
+    return bool(account and getattr(account, "is_active", getattr(account, "active", False)))
+
+def is_posting_account(account):
+    return bool(account and getattr(account, "allow_manual_posting", getattr(account, "posting_allowed", False)))
+
+def account_type(account):
+    return normalize_account_value(getattr(account, "account_type", None))
+
 def account_subtype(account):
-    return getattr(account, "account_subtype", None) or ({"CASH": "CASH", "BANK": "BANK", "RECEIVABLE": "LOAN_RECEIVABLE"}.get(getattr(account, "cash_flow_category", None), "OTHER"))
+    subtype = getattr(account, "account_subtype", None)
+    if subtype:
+        return normalize_account_value(subtype)
+    return {"CASH": "CASH", "BANK": "BANK", "RECEIVABLE": "LOAN_RECEIVABLE"}.get(normalize_account_value(getattr(account, "cash_flow_category", None)), "OTHER")
 
 def serialize_account(account):
     return None if not account else {"account_id": account.id, "account_code": account.account_code, "account_name": account.account_name, "account_type": account.account_type, "account_subtype": account_subtype(account), "is_active": account.is_active}
@@ -1433,18 +1462,27 @@ def validate_collection_account(account, method, collector_id=None):
     return account
 
 
+def is_funding_account(account):
+    return (
+        is_active_account(account)
+        and is_posting_account(account)
+        and not getattr(account, "is_collection_account", False)
+        and account_type(account) == "ASSET"
+        and account_subtype(account) in {"CASH", "BANK"}
+    )
+
 def validate_funding_account(account, *_args):
     if not account:
         raise AccountingError("Funding account not found")
-    if getattr(account, "is_collection_account", False) or account_subtype(account) == "COLLECTION_CLEARING":
+    if getattr(account, "is_collection_account", False) or account_subtype(account) in {"COLLECTION_CLEARING", "COLLECTION_CLEARING_CONTROL"}:
         raise AccountingError("Collection clearing accounts cannot fund loans")
-    if not account.is_active:
+    if not is_active_account(account):
         raise AccountingError("Funding account is inactive")
-    if account.account_type != "ASSET":
+    if account_type(account) != "ASSET":
         raise AccountingError("Funding account must be an ASSET account")
-    if account_subtype(account) not in ("CASH", "BANK"):
+    if account_subtype(account) not in {"CASH", "BANK"}:
         raise AccountingError("Funding account must be configured as CASH or BANK")
-    if not account.allow_manual_posting:
+    if not is_posting_account(account):
         raise AccountingError("Funding account does not allow posting")
     return account
 
