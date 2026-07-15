@@ -25,7 +25,7 @@ from ..models import (
     DisbursementChargeType,
     AccountingSetting,
 )
-from ..accounting import post_loan_disbursement, AccountingError, accrue_due_loan_interest, reverse_payment, reverse_loan_disbursement, money as acct_money, preview_collection_deposit, create_collection_deposit, reverse_collection_deposit, collector_cash_position, account_subtype, allocate_payment, post_loan_payment, validate_collection_account, repair_unposted_payment, require_open_accounting_period, ValidationError, preview_loan_disbursement
+from ..accounting import post_loan_disbursement, AccountingError, accrue_due_loan_interest, reverse_payment, reverse_loan_disbursement, money as acct_money, preview_collection_deposit, create_collection_deposit, reverse_collection_deposit, collector_cash_position, account_subtype, allocate_payment, post_loan_payment, validate_collection_account, repair_unposted_payment, require_open_accounting_period, ValidationError, preview_loan_disbursement, CALCULATION_METHODS
 from ..loan_ledger import (
     daily_interest_rate,
     generate_loan_ledger,
@@ -45,7 +45,22 @@ def _compact_account(account):
 
 
 def _charge_destination_account(charge_type):
-    return charge_type.income_account or charge_type.payable_account or charge_type.expense_account or charge_type.tax_payable_account
+    if charge_type.accounting_treatment == "INCOME":
+        return charge_type.income_account
+    if charge_type.accounting_treatment in {"PAYABLE", "TAX"}:
+        return charge_type.payable_account or charge_type.tax_payable_account
+    return charge_type.expense_account or charge_type.income_account or charge_type.payable_account
+
+def _charge_type_is_disbursement_ready(charge_type):
+    destination = _charge_destination_account(charge_type)
+    return (
+        bool(charge_type.active)
+        and bool(charge_type.deducted_from_disbursement)
+        and charge_type.calculation_method in CALCULATION_METHODS
+        and destination is not None
+        and bool(destination.is_active)
+        and bool(destination.allow_manual_posting)
+    )
 
 
 def _charge_type_payload(charge_type):
@@ -65,6 +80,8 @@ def _charge_type_payload(charge_type):
         "deducted_from_disbursement": bool(charge_type.deducted_from_disbursement),
         "refundable": bool(charge_type.refundable),
         "display_order": charge_type.display_order,
+        "active": bool(charge_type.active),
+        "selected_by_default": bool(charge_type.active and charge_type.deducted_from_disbursement and (charge_type.default_amount or 0) > 0),
         "destination_account": _compact_account(destination),
     }
 
@@ -342,6 +359,8 @@ def loan_disbursement_preview(loan_id):
         preview["journal_preview"]["total_credit"] = dec(preview["journal_preview"]["total_credit"])
         return jsonify(preview)
     except AccountingError as exc:
+        if str(exc) == "Documentation Charge is required for this loan.":
+            return jsonify({"error": "Required disbursement charge missing", "message": str(exc)}), 422
         return jsonify({"error": str(exc), "message": str(exc)}), 422
     except (TypeError, ValueError):
         return jsonify({"error": "Invalid disbursement preview payload"}), 400
@@ -714,13 +733,58 @@ def list_disbursement_charge_types():
             joinedload(DisbursementChargeType.expense_account),
             joinedload(DisbursementChargeType.tax_payable_account),
         )
-        .filter(DisbursementChargeType.active.is_(True))
         .order_by(DisbursementChargeType.display_order, DisbursementChargeType.code)
         .limit(100)
         .all()
     )
     current_app.logger.info("Disbursement charge types milestone=completed count=%s", len(charges))
     return jsonify({"charge_types": [_charge_type_payload(charge) for charge in charges]})
+
+
+def _apply_charge_type_payload(charge, data):
+    for field in ["code", "name", "description", "calculation_method", "accounting_treatment", "tax_method"]:
+        if field in data:
+            setattr(charge, field, data[field])
+    for field in ["default_amount", "default_rate", "tax_rate"]:
+        if field in data:
+            setattr(charge, field, None if data[field] is None else Decimal(str(data[field])))
+    for field in ["active", "included_in_principal", "deducted_from_disbursement", "refundable"]:
+        if field in data:
+            setattr(charge, field, bool(data[field]))
+    for field in ["income_account_id", "payable_account_id", "expense_account_id", "tax_payable_account_id", "display_order"]:
+        if field in data:
+            setattr(charge, field, data[field])
+
+@admin_bp.route("/disbursement-charge-types", methods=["POST"])
+@role_required(["admin"])
+def create_disbursement_charge_type():
+    data = request.get_json() or {}
+    charge = DisbursementChargeType()
+    _apply_charge_type_payload(charge, data)
+    db.session.add(charge); db.session.commit()
+    return jsonify({"charge_type": _charge_type_payload(charge)}), 201
+
+@admin_bp.route("/disbursement-charge-types/<int:charge_id>", methods=["PATCH"])
+@role_required(["admin"])
+def update_disbursement_charge_type(charge_id):
+    charge = DisbursementChargeType.query.get_or_404(charge_id)
+    _apply_charge_type_payload(charge, request.get_json() or {})
+    db.session.commit()
+    return jsonify({"charge_type": _charge_type_payload(charge)})
+
+@admin_bp.route("/disbursement-charge-types/<int:charge_id>/activate", methods=["POST"])
+@role_required(["admin"])
+def activate_disbursement_charge_type(charge_id):
+    charge = DisbursementChargeType.query.get_or_404(charge_id)
+    charge.active = True; db.session.commit()
+    return jsonify({"charge_type": _charge_type_payload(charge)})
+
+@admin_bp.route("/disbursement-charge-types/<int:charge_id>/deactivate", methods=["POST"])
+@role_required(["admin"])
+def deactivate_disbursement_charge_type(charge_id):
+    charge = DisbursementChargeType.query.get_or_404(charge_id)
+    charge.active = False; db.session.commit()
+    return jsonify({"charge_type": _charge_type_payload(charge)})
 
 
 @admin_bp.route("/loan-applications/<int:application_id>/disbursement-options", methods=["GET"])
@@ -739,16 +803,15 @@ def loan_application_disbursement_options(application_id):
         )
         funding_accounts = [a for a in funding_accounts if account_subtype(a) in {"CASH", "BANK"}]
         current_app.logger.info("Disbursement options milestone=loading charge types")
-        charges = (
+        charges = [c for c in (
             DisbursementChargeType.query
             .options(joinedload(DisbursementChargeType.income_account), joinedload(DisbursementChargeType.payable_account), joinedload(DisbursementChargeType.expense_account), joinedload(DisbursementChargeType.tax_payable_account))
-            .filter(DisbursementChargeType.active.is_(True))
             .order_by(DisbursementChargeType.display_order, DisbursementChargeType.code)
             .limit(100)
             .all()
-        )
+        ) if _charge_type_is_disbursement_ready(c)]
         current_app.logger.info("Disbursement options milestone=resolving account mappings")
-        settings = {s.setting_key: s for s in AccountingSetting.query.filter(AccountingSetting.setting_key.in_(["allow_manual_disbursement_charges", "require_disbursement_charge_approval", "allow_zero_net_disbursement"])).all()}
+        settings = {s.setting_key: s for s in AccountingSetting.query.filter(AccountingSetting.setting_key.in_(["allow_manual_disbursement_charges", "require_disbursement_charge_approval", "require_documentation_charge", "allow_zero_net_disbursement"])).all()}
         current_app.logger.info("Disbursement options milestone=serializing response")
         payload = {
             "application": {
@@ -764,8 +827,10 @@ def loan_application_disbursement_options(application_id):
             "settings": {
                 "allow_manual_disbursement_charges": _setting_bool(settings, "allow_manual_disbursement_charges", True),
                 "require_disbursement_charge_approval": _setting_bool(settings, "require_disbursement_charge_approval", False),
+                "require_documentation_charge": _setting_bool(settings, "require_documentation_charge", True),
                 "allow_zero_net_disbursement": _setting_bool(settings, "allow_zero_net_disbursement", False),
             },
+            "default_charges": [{"charge_type_id": c.id, "amount": float(c.default_amount)} for c in charges if c.default_amount is not None and c.default_amount > 0],
         }
         current_app.logger.info("Disbursement options milestone=completed")
         return jsonify(payload)

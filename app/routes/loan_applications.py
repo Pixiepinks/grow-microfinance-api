@@ -19,7 +19,7 @@ from ..extensions import db
 from ..models import Customer, Loan, LoanApplication, LoanApplicationDocument
 from ..loan_ledger import generate_loan_ledger, money
 from ..loan_terms import calculate_flat_term_amounts, resolve_loan_term
-from ..accounting import AccountingError, post_loan_disbursement, validate_funding_account
+from ..accounting import seed_disbursement_settings, AccountingError, post_loan_disbursement, validate_funding_account
 from ..models import AccountingAccount
 from .utils import role_required
 
@@ -1224,11 +1224,16 @@ def disburse_application(application_id):
     try:
         db.session.add(loan); db.session.flush(); generate_loan_ledger(loan)
         application.status = STATUS_DISBURSED
-        post_loan_disbursement(loan, int(get_jwt_identity()), funding_account=funding_account, disbursement_date=disbursement_date, charges=data.get("charges") or [], loan_application_id=application.id, transaction_method=data.get("transaction_method"), reference=data.get("reference"), remarks=data.get("remarks"))
+        if "charges" not in data:
+            seed_disbursement_settings()
+        post_loan_disbursement(loan, int(get_jwt_identity()), funding_account=funding_account, disbursement_date=disbursement_date, charges=data["charges"] if "charges" in data else None, loan_application_id=application.id, transaction_method=data.get("transaction_method"), reference=data.get("reference"), remarks=data.get("remarks"))
         db.session.commit()
         return jsonify({"message": "Loan disbursed", "loan_id": loan.id, "loan_number": loan.loan_number, "loan": {"principal_amount": float(loan.principal_amount), "gross_principal_amount": float(loan.gross_principal_amount or loan.principal_amount), "total_disbursement_deductions": float(loan.total_disbursement_deductions or 0), "net_disbursed_amount": float(loan.net_disbursed_amount or loan.principal_amount), "term_type": loan.term_type, "term_value": loan.term_value, "loan_days": loan.loan_days, "tenure_months": loan.tenure_months, "repayment_frequency": loan.repayment_frequency, "number_of_installments": loan.number_of_installments, "installment_count": loan.installment_count, "installment_amount": _decimal_to_float(loan.installment_amount), "total_repayment": _decimal_to_float(loan.total_repayment), "total_interest": _decimal_to_float(loan.total_interest), "interest_rate": float(loan.interest_rate), "interest_type": loan.interest_type, "interest_rate_basis": loan.interest_rate_basis, "start_date": loan.start_date.isoformat(), "maturity_date": loan.maturity_date.isoformat() if loan.maturity_date else None, "final_installment_due_date": loan.final_installment_due_date.isoformat() if loan.final_installment_due_date else None}, "application": build_application_response(application)}), 201
     except AccountingError as exc:
-        db.session.rollback(); return jsonify({"message": "Accounting posting failed", "error": str(exc)}), 400
+        db.session.rollback()
+        if str(exc) == "Documentation Charge is required for this loan.":
+            return jsonify({"error": "Required disbursement charge missing", "message": str(exc)}), 422
+        return jsonify({"message": "Accounting posting failed", "error": str(exc)}), 422
     except Exception as exc:
         db.session.rollback(); current_app.logger.exception("Failed to disburse application %s: %s", application.id, exc); return jsonify({"message": "Failed to disburse loan"}), 500
 
