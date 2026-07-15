@@ -79,13 +79,15 @@ scripts/seed_data.py # Optional demo data
 3. Set environment variables in Railway → Variables:
    - `FLASK_ENV=production`
    - `DATABASE_URL` (from the Postgres addon)
-   - `JWT_SECRET_KEY` (at least 32 random bytes; do not reuse the example above)
+   - `JWT_SECRET_KEY` (at least 32 random bytes; use 48-64 random characters and never use an admin password)
+   - `JWT_ACCESS_TOKEN_MINUTES=60`
+   - `JWT_REFRESH_TOKEN_DAYS=7`
    - `SEED_DEMO_DATA=false` (default; only set `true` for non-production demo environments)
 4. Set start command: `./entrypoint.sh` (runs migrations once, stops if they fail, seeds only after successful migrations, then starts gunicorn)
 5. Deploy. Use the public Railway URL as the API base for the Flutter app.
 
 ### API highlights
-- JWT auth (`/auth/login`) returns `access_token`, `user_id`, `role`, `name`.
+- JWT auth (`/auth/login`) returns one-hour `access_token`, seven-day `refresh_token`, expiry metadata, and user details. Use `POST /auth/refresh` with the refresh token to resume idle sessions.
 - Role-protected blueprints:
   - **Admin**: manage users/customers/loans + dashboard summary.
   - **Staff**: record payments, see today’s collections and arrears.
@@ -144,10 +146,10 @@ const String apiBaseUrl = "https://YOUR-RAILWAY-API-URL";
 - Auto-redirect on app start if a token/role is already saved.
 
 ### Sample data for testing
-After running `python scripts/seed_data.py`:
-- Admin: `admin@grow.com` / `admin123`
-- Staff: `staff@grow.com` / `staff123`
-- Customer: `customer@grow.com` / `cust123`
+After running `python scripts/seed_data.py` in a non-production environment, seed users are created only if missing; existing password hashes are not overwritten on later runs. Do not store admin passwords in Railway variables.
+- Admin seed email: `admin@grow.com`
+- Staff seed email: `staff@grow.com`
+- Customer seed email: `customer@grow.com`
 - Loan: `LN001` with one payment (LKR 1,750)
 
 ## Notes

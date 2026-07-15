@@ -15,6 +15,8 @@ def role_required(roles):
 
             verify_jwt_in_request()
             claims = get_jwt()
+            if claims.get("must_change_password") or claims.get("password_change_only"):
+                return jsonify({"message": "Password change required"}), 403
             if claims.get("role") not in roles:
                 return jsonify({"message": "Access forbidden"}), 403
             return fn(*args, **kwargs)

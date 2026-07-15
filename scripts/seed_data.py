@@ -18,16 +18,16 @@ def demo_data_enabled() -> bool:
 
 
 def ensure_user(email: str, password: str, name: str, role: str) -> User:
-    """Create or update a user with the provided credentials."""
+    """Create seed users without overwriting existing password hashes."""
 
     user = User.query.filter_by(email=email).first()
     if user is None:
         user = User(email=email)
+        user.set_password(password)
         db.session.add(user)
 
     user.name = name
     user.role = role
-    user.set_password(password)
     return user
 
 
@@ -128,7 +128,7 @@ with app.app_context():
             db.session.add(payment)
 
         db.session.commit()
-        print("Seed data ensured. Admin login: admin@grow.com / admin123")
+        print("Seed data ensured. Existing password hashes were not overwritten.")
     except SystemExit:
         raise
     except Exception:

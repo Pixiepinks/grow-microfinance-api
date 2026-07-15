@@ -1,8 +1,9 @@
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from flask import Blueprint, request, jsonify, current_app
 from sqlalchemy.exc import IntegrityError
 import logging
+import secrets
 from flask_jwt_extended import get_jwt_identity
 from sqlalchemy.orm import joinedload
 
@@ -25,7 +26,7 @@ from ..models import (
     DisbursementChargeType,
     AccountingSetting,
 )
-from ..accounting import post_loan_disbursement, AccountingError, accrue_due_loan_interest, reverse_payment, reverse_loan_disbursement, money as acct_money, preview_collection_deposit, create_collection_deposit, reverse_collection_deposit, collector_cash_position, account_subtype, allocate_payment, post_loan_payment, validate_collection_account, repair_unposted_payment, require_open_accounting_period, ValidationError, preview_loan_disbursement, preview_loan_application_disbursement, CALCULATION_METHODS, is_funding_account, is_active_account, is_posting_account
+from ..accounting import log_audit, post_loan_disbursement, AccountingError, accrue_due_loan_interest, reverse_payment, reverse_loan_disbursement, money as acct_money, preview_collection_deposit, create_collection_deposit, reverse_collection_deposit, collector_cash_position, account_subtype, allocate_payment, post_loan_payment, validate_collection_account, repair_unposted_payment, require_open_accounting_period, ValidationError, preview_loan_disbursement, preview_loan_application_disbursement, CALCULATION_METHODS, is_funding_account, is_active_account, is_posting_account
 from ..loan_ledger import (
     daily_interest_rate,
     generate_loan_ledger,
@@ -165,6 +166,27 @@ def create_user():
 
     return jsonify({"message": "User created", "user_id": user.id})
 
+
+@admin_bp.route("/users/<int:user_id>/reset-password", methods=["POST"])
+@role_required(["admin"])
+def reset_user_password(user_id):
+    user = User.query.get_or_404(user_id)
+    temporary_password = f"Tmp-{secrets.token_urlsafe(18)}!9aA"
+    user.set_password(temporary_password)
+    user.must_change_password = True
+    user.password_changed_at = datetime.utcnow()
+    user.token_version = (user.token_version or 0) + 1
+    user.failed_login_attempts = 0
+    user.locked_until = None
+    log_audit("PASSWORD_RESET_REQUESTED", "User", user.id, int(get_jwt_identity()))
+    log_audit("PASSWORD_RESET_COMPLETED", "User", user.id, int(get_jwt_identity()))
+    log_audit("SESSION_REVOKED", "User", user.id, int(get_jwt_identity()), {"reason": "password_reset"})
+    db.session.commit()
+    return jsonify({
+        "message": "Temporary password generated. User must change it at next login.",
+        "temporary_password": temporary_password,
+        "must_change_password": True,
+    })
 
 @admin_bp.route("/users", methods=["GET"])
 @role_required(["admin"])

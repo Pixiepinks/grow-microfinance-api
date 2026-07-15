@@ -33,6 +33,24 @@ def init_jwt_handlers(app):
         app.logger.info("JWT revoked for identity=%s", jwt_payload.get("sub"))
         return {"message": "Token has been revoked"}, 401
 
+    @jwt.token_in_blocklist_loader
+    def is_token_revoked(jwt_header, jwt_payload):
+        from .models import RevokedToken, User
+
+        jti = jwt_payload.get("jti")
+        if jti and RevokedToken.query.filter_by(jti=jti).first():
+            return True
+        identity = jwt_payload.get("sub")
+        if not identity:
+            return True
+        user = User.query.get(int(identity))
+        if not user or not user.is_active:
+            return True
+        token_version = jwt_payload.get("token_version", 0)
+        if token_version != (user.token_version or 0):
+            return True
+        return False
+
     @jwt.needs_fresh_token_loader
     def handle_stale_token(jwt_header, jwt_payload):
         app.logger.info("Fresh token required for identity=%s", jwt_payload.get("sub"))
