@@ -10,6 +10,7 @@ if str(BASE_DIR) not in sys.path:
 from app import create_app
 from app.extensions import db
 from app.models import Customer, Loan, Payment, User
+from app.accounting import seed_disbursement_settings
 
 
 def demo_data_enabled() -> bool:
@@ -54,6 +55,8 @@ with app.app_context():
             name="Sunil Perera",
             role="customer",
         )
+
+        seed_disbursement_settings()
 
         if not demo_data_enabled():
             db.session.commit()
