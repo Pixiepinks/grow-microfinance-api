@@ -16,6 +16,7 @@ from .routes.customers import admin_api_customers_bp, api_customers_bp, customer
 from .routes.loan_applications import admin_api_bp, loan_app_bp
 from .routes.leads import leads_bp
 from .routes.accounting import accounting_bp
+from .routes.investors import investors_bp
 from .schema_fix import ensure_customers_lead_status_column
 
 def create_app():
@@ -104,6 +105,7 @@ def create_app():
     app.register_blueprint(loan_app_bp)
     app.register_blueprint(leads_bp)
     app.register_blueprint(accounting_bp)
+    app.register_blueprint(investors_bp)
 
     with app.app_context():
         ensure_customers_lead_status_column()
@@ -120,6 +122,44 @@ def create_app():
         except Exception:
             db.session.rollback()
 
+
+
+    @app.cli.command("accrue-investor-interest")
+    @click.option("--as-of-date", default=None, help="YYYY-MM-DD cutoff date.")
+    @click.option("--agreement-id", type=int, default=None)
+    @click.option("--month", default=None, help="YYYY-MM month to process.")
+    @click.option("--preview/--no-preview", default=False)
+    @click.option("--post/--no-post", default=False)
+    def accrue_investor_interest(as_of_date, agreement_id, month, preview, post):
+        from datetime import date as date_cls
+        from .models import InvestorFundingAgreement, InvestorInterestAccrual
+        from .investor_funding import month_bounds, completed_periods_for, calculate_investor_interest, post_investor_interest_accrual
+        as_of = date_cls.fromisoformat(as_of_date) if as_of_date else date_cls.today()
+        q = InvestorFundingAgreement.query.filter_by(auto_accrual_enabled=True)
+        if agreement_id:
+            q = q.filter_by(id=agreement_id)
+        else:
+            q = q.filter(InvestorFundingAgreement.status.in_(["ACTIVE", "MATURED"]))
+        rows = []
+        for agr in q.all():
+            periods = [month_bounds(month)] if month else completed_periods_for(agr, as_of)
+            for ps, pe in periods:
+                ps = max(ps, agr.start_date)
+                exists = InvestorInterestAccrual.query.filter_by(agreement_id=agr.id, accrual_period_start=ps, accrual_period_end=pe).first()
+                if exists and exists.status != "CALCULATED":
+                    rows.append({"agreement_id": agr.id, "period_end": pe.isoformat(), "status": "SKIPPED_EXISTING"})
+                    continue
+                if post and not preview:
+                    accrual = post_investor_interest_accrual(agr.id, ps, pe)
+                    rows.append({"agreement_id": agr.id, "period_end": pe.isoformat(), "status": accrual.status, "gross_interest": str(accrual.gross_interest_amount)})
+                else:
+                    calc = calculate_investor_interest(agr.id, ps, pe)
+                    rows.append({"agreement_id": agr.id, "period_start": ps.isoformat(), "period_end": pe.isoformat(), "status": "PREVIEW", "gross_interest": str(calc["gross_interest_amount"])})
+        if post and not preview:
+            db.session.commit()
+        else:
+            db.session.rollback()
+        print({"results": rows})
 
     @app.cli.group("accounting")
     def accounting_cli():
