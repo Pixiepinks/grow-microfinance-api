@@ -109,3 +109,42 @@ def test_list_masks_bank_account_number(app, client):
 
     assert resp.status_code == 200
     assert resp.get_json()["items"][0]["bank_account_number"] == "***8235"
+
+
+def test_generate_investor_number_continues_after_existing_highest(app):
+    from app.investor_funding import generate_investor_number
+
+    existing = Investor(
+        investor_number="GROW-INV-000004",
+        investor_type="INDIVIDUAL",
+        full_name="Existing Investor",
+        status="ACTIVE",
+    )
+    db.session.add(existing)
+    db.session.flush()
+
+    assert generate_investor_number() == "GROW-INV-000005"
+
+
+def test_generate_investor_number_ignores_malformed_legacy_number(app):
+    from app.investor_funding import generate_investor_number
+
+    db.session.add(
+        Investor(
+            investor_number="MANUAL-LEGACY",
+            investor_type="INDIVIDUAL",
+            full_name="Legacy Investor",
+            status="ACTIVE",
+        )
+    )
+    db.session.add(
+        Investor(
+            investor_number="GROW-INV-000004",
+            investor_type="INDIVIDUAL",
+            full_name="Valid Investor",
+            status="ACTIVE",
+        )
+    )
+    db.session.flush()
+
+    assert generate_investor_number() == "GROW-INV-000005"

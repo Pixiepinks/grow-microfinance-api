@@ -784,8 +784,9 @@ class CollectionDepositAllocation(db.Model):
 
 class Investor(db.Model):
     __tablename__ = "investors"
+    __table_args__ = (db.UniqueConstraint("investor_number", name="uq_investors_investor_number"),)
     id = db.Column(db.Integer, primary_key=True)
-    investor_number = db.Column(db.String(32), unique=True, index=True, nullable=False)
+    investor_number = db.Column(db.String(32), index=True, nullable=False)
     investor_type = db.Column(db.String(20), nullable=False, default="INDIVIDUAL")
     full_name = db.Column(db.String(150), nullable=False)
     company_name = db.Column(db.String(150))
