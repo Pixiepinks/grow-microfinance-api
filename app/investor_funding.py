@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import calendar
+import re
 from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 
 from .extensions import db
 from .models import AccountingAccount, AccountingJournalEntry, Investor, InvestorFundingAgreement, InvestorFundingTransaction, InvestorInterestAccrual
@@ -81,9 +83,92 @@ def seed_investor_accounts():
     db.session.flush()
 
 
+SUPPORTED_INVESTOR_TYPES = {"INDIVIDUAL", "COMPANY"}
+SUPPORTED_INVESTOR_STATUSES = {"ACTIVE", "INACTIVE"}
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_MOBILE_RE = re.compile(r"^[0-9+()\-\s]{7,30}$")
+
+
+def _clean_str(value):
+    if value is None:
+        return None
+    value = str(value).strip()
+    return value or None
+
+
+def _investor_validation_error(fields):
+    raise ValidationError(
+        "Investor validation failed",
+        fields=fields,
+        message="Investor validation failed",
+    )
+
+
+def _validate_investor_payload(data):
+    fields = {}
+    investor_type = _clean_str(data.get("investor_type") or "INDIVIDUAL")
+    status = _clean_str(data.get("status") or "ACTIVE")
+    full_name = _clean_str(data.get("full_name"))
+    company_name = _clean_str(data.get("company_name"))
+    email = _clean_str(data.get("email"))
+    mobile = _clean_str(data.get("mobile"))
+    nic = _clean_str(data.get("nic"))
+
+    if investor_type not in SUPPORTED_INVESTOR_TYPES:
+        fields["investor_type"] = "Unsupported investor type."
+    if status not in SUPPORTED_INVESTOR_STATUSES:
+        fields["status"] = "Unsupported investor status."
+    if investor_type == "INDIVIDUAL" and not full_name:
+        fields["full_name"] = "Full name is required for individual investors."
+    if investor_type == "COMPANY" and not company_name:
+        fields["company_name"] = "Company name is required for company investors."
+    if email and not _EMAIL_RE.match(email):
+        fields["email"] = "Enter a valid email address."
+    if mobile and not _MOBILE_RE.match(mobile):
+        fields["mobile"] = "Enter a valid mobile number."
+    if nic and Investor.query.filter_by(nic=nic).first():
+        fields["nic"] = "An investor with this NIC already exists."
+
+    if fields:
+        _investor_validation_error(fields)
+
+    return {
+        "investor_type": investor_type,
+        "full_name": full_name or company_name,
+        "company_name": company_name,
+        "nic": nic,
+        "company_registration_number": _clean_str(data.get("company_registration_number")),
+        "tax_identification_number": _clean_str(data.get("tax_identification_number")),
+        "mobile": mobile,
+        "email": email,
+        "address": _clean_str(data.get("address")),
+        "bank_name": _clean_str(data.get("bank_name")),
+        "bank_branch": _clean_str(data.get("bank_branch")),
+        "bank_account_name": _clean_str(data.get("bank_account_name")),
+        "bank_account_number": _clean_str(data.get("bank_account_number")),
+        "status": status,
+        "notes": _clean_str(data.get("notes")),
+    }
+
+
 def create_investor(data, user_id=None):
-    inv = Investor(investor_number=generate_investor_number(), investor_type=data.get("investor_type", "INDIVIDUAL"), full_name=data["full_name"], company_name=data.get("company_name"), nic=data.get("nic"), company_registration_number=data.get("company_registration_number"), tax_identification_number=data.get("tax_identification_number"), mobile=data.get("mobile"), email=data.get("email"), address=data.get("address"), bank_name=data.get("bank_name"), bank_branch=data.get("bank_branch"), bank_account_name=data.get("bank_account_name"), bank_account_number=data.get("bank_account_number"), status=data.get("status", "ACTIVE"), notes=data.get("notes"), created_by=user_id)
-    db.session.add(inv); db.session.flush(); log_audit("INVESTOR_CREATED", "Investor", inv.id, user_id); return inv
+    values = _validate_investor_payload(data or {})
+    for attempt in range(3):
+        inv = Investor(investor_number=generate_investor_number(), created_by=user_id, **values)
+        db.session.add(inv)
+        try:
+            db.session.flush()
+        except IntegrityError as exc:
+            db.session.rollback()
+            message = str(getattr(exc, "orig", exc)).lower()
+            if "investor_number" in message and attempt < 2:
+                continue
+            if "nic" in message:
+                _investor_validation_error({"nic": "An investor with this NIC already exists."})
+            raise
+        log_audit("INVESTOR_CREATED", "Investor", inv.id, user_id)
+        return inv
+    _investor_validation_error({"investor_number": "Could not generate a unique investor number."})
 
 
 def create_agreement(data, user_id=None):
@@ -226,8 +311,10 @@ def completed_periods_for(agr, as_of):
 
 
 def reverse_investor_transaction(tx_id, reversal_date, reason, user_id=None):
-    tx = InvestorFundingTransaction.query.get(tx_id); require_open_accounting_period(reversal_date)
-    if not tx or tx.status != "POSTED": raise ValidationError("Transaction cannot be reversed")
+    tx = db.session.get(InvestorFundingTransaction, tx_id)
+    if not tx: raise ValidationError("investor_funding_not_found", message="The investor funding record was not found.")
+    require_open_accounting_period(reversal_date)
+    if tx.status != "POSTED": raise ValidationError("Transaction cannot be reversed")
     rev = reverse_journal(tx.journal_entry, reversal_date, reason, user_id)
     tx.status = "REVERSED"; tx.reversed_at = datetime.utcnow(); tx.reversal_reason = reason
     agr = tx.agreement
