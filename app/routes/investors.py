@@ -36,7 +36,11 @@ def agr_dict(a):
 def tx_dict(t): return {"id":t.id,"transaction_number":t.transaction_number,"transaction_date":t.transaction_date.isoformat(),"accounting_date":t.accounting_date.isoformat(),"transaction_type":t.transaction_type,"amount":dec(t.amount),"reference":t.reference,"status":t.status,"journal_entry_id":t.journal_entry_id}
 def ac_dict(a): return {"id":a.id,"agreement_id":a.agreement_id,"period_start":a.accrual_period_start.isoformat(),"period_end":a.accrual_period_end.isoformat(),"average_daily_balance":dec(a.average_daily_balance),"gross_interest_amount":dec(a.gross_interest_amount),"withholding_tax_amount":dec(a.withholding_tax_amount),"net_interest_payable":dec(a.net_interest_payable),"payment_amount":dec(a.payment_amount),"capitalization_amount":dec(a.capitalization_amount),"status":a.status,"journal_entry_id":a.journal_entry_id}
 def error(exc):
-    db.session.rollback(); code=422 if isinstance(exc,(ValidationError,AccountingError)) else 400; return jsonify(getattr(exc,"payload",{"message":str(exc)})), code
+    db.session.rollback()
+    if isinstance(exc, (ValidationError, AccountingError)):
+        return jsonify(getattr(exc, "payload", {"message": str(exc)})), 422
+    current_app.logger.exception("Unexpected investor API error", exc_info=exc)
+    return jsonify({"error": "investor_creation_failed", "message": "The investor could not be created."}), 500
 
 
 def investor_not_found():

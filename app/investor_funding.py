@@ -5,7 +5,7 @@ import re
 from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 
-from sqlalchemy import func
+from sqlalchemy import func, text
 from sqlalchemy.exc import IntegrityError
 
 from .extensions import db
@@ -23,12 +23,15 @@ def money(value):
 
 
 def _seq(model, field, prefix, width=6):
-    last = db.session.query(func.max(getattr(model, field))).filter(getattr(model, field).like(prefix + "%")).with_for_update().scalar()
+    last = db.session.query(func.max(getattr(model, field))).filter(getattr(model, field).like(prefix + "%")).scalar()
     next_no = int(str(last).rsplit("-", 1)[1]) + 1 if last else 1
     return f"{prefix}{next_no:0{width}d}"
 
 
 def generate_investor_number():
+    if db.session.bind and db.session.bind.dialect.name == "postgresql":
+        next_value = db.session.execute(text("SELECT nextval('investor_number_seq')")).scalar_one()
+        return f"GROW-INV-{next_value:06d}"
     return _seq(Investor, "investor_number", "GROW-INV-", 6)
 
 
