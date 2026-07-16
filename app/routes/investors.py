@@ -56,7 +56,7 @@ def agr_dict(a):
     unpaid = sum((x.net_interest_payable - x.payment_amount - x.capitalization_amount for x in posted), 0)
     paid = sum((x.payment_amount for x in posted), 0); cap = sum((x.capitalization_amount for x in posted), 0)
     last = max([x.accrual_period_end for x in posted], default=None)
-    return {"id":a.id,"investor":inv_dict(a.investor),"agreement_number":a.agreement_number,"agreement_name":a.agreement_name,"original_principal":dec(a.original_principal_amount),"current_principal":dec(a.current_principal_balance),"interest_rate":dec(a.interest_rate),"interest_rate_period":a.interest_rate_period,"interest_rate_label":f"{a.interest_rate:.2f}% per {a.interest_rate_period.lower()}","calculation_method":a.calculation_method,"accrued_unpaid_interest":dec(unpaid),"interest_paid":dec(paid),"capitalized_interest":dec(cap),"maturity_date":a.maturity_date.isoformat() if a.maturity_date else None,"next_accrual_date":None,"last_accrued_through":last.isoformat() if last else None,"status":a.status,"account_mappings":{"funding_account_id":a.funding_account_id,"investor_liability_account_id":a.investor_liability_account_id,"interest_expense_account_id":a.interest_expense_account_id,"accrued_interest_payable_account_id":a.accrued_interest_payable_account_id,"withholding_tax_account_id":a.withholding_tax_account_id},"warnings":[],"reconciliation_status":"OK"}
+    return {"id":a.id,"agreement_id":a.id,"agreement_number":a.agreement_number,"investor_id":a.investor_id,"investor":inv_dict(a.investor),"agreement_name":a.agreement_name,"agreement_date":a.agreement_date.isoformat() if a.agreement_date else None,"start_date":a.start_date.isoformat() if a.start_date else None,"original_principal":dec(a.original_principal_amount),"original_principal_amount":dec(a.original_principal_amount),"current_principal":dec(a.current_principal_balance),"current_principal_balance":dec(a.current_principal_balance),"interest_rate":dec(a.interest_rate),"interest_rate_period":a.interest_rate_period,"interest_rate_label":f"{a.interest_rate:.2f}% per {a.interest_rate_period.lower()}","calculation_method":a.calculation_method,"accrued_unpaid_interest":dec(unpaid),"interest_paid":dec(paid),"capitalized_interest":dec(cap),"maturity_date":a.maturity_date.isoformat() if a.maturity_date else None,"next_accrual_date":None,"last_accrued_through":last.isoformat() if last else None,"status":a.status,"created_at":a.created_at.isoformat() if a.created_at else None,"account_mappings":{"funding_account_id":a.funding_account_id,"investor_liability_account_id":a.investor_liability_account_id,"interest_expense_account_id":a.interest_expense_account_id,"accrued_interest_payable_account_id":a.accrued_interest_payable_account_id,"withholding_tax_account_id":a.withholding_tax_account_id},"warnings":[],"reconciliation_status":"OK"}
 
 def tx_dict(t): return {"id":t.id,"transaction_number":t.transaction_number,"transaction_date":t.transaction_date.isoformat(),"accounting_date":t.accounting_date.isoformat(),"transaction_type":t.transaction_type,"amount":dec(t.amount),"reference":t.reference,"status":t.status,"journal_entry_id":t.journal_entry_id}
 def ac_dict(a): return {"id":a.id,"agreement_id":a.agreement_id,"period_start":a.accrual_period_start.isoformat(),"period_end":a.accrual_period_end.isoformat(),"average_daily_balance":dec(a.average_daily_balance),"gross_interest_amount":dec(a.gross_interest_amount),"withholding_tax_amount":dec(a.withholding_tax_amount),"net_interest_payable":dec(a.net_interest_payable),"payment_amount":dec(a.payment_amount),"capitalization_amount":dec(a.capitalization_amount),"status":a.status,"journal_entry_id":a.journal_entry_id}
@@ -76,6 +76,10 @@ def investor_not_found():
 
 def investor_funding_not_found():
     return jsonify({"error":"investor_funding_not_found","message":"The investor funding record was not found."}), 404
+
+
+def investor_agreement_not_found():
+    return jsonify({"error":"investor_agreement_not_found","message":"The investor funding agreement was not found."}), 404
 
 @investors_bp.route("/investors", methods=["GET"], strict_slashes=False)
 @role_required(["admin"])
@@ -132,16 +136,24 @@ def deactivate_investor(iid):
     if not i: return investor_not_found()
     i.status="INACTIVE"; db.session.commit(); return jsonify(inv_dict(i))
 
-@investors_bp.route("/investor-agreements", methods=["GET","POST"])
+@investors_bp.route("/investor-agreements", methods=["GET","POST"], strict_slashes=False)
 @role_required(["admin"])
 def agreements():
     if request.method=="GET": return jsonify({"items":[agr_dict(a) for a in InvestorFundingAgreement.query.order_by(InvestorFundingAgreement.id.desc()).all()]})
-    try: a=create_agreement(request.get_json() or {}, uid()); db.session.commit(); return jsonify(agr_dict(a)),201
+    payload = request.get_json(silent=True) or {}
+    current_app.logger.info(
+        "Investor agreement request method=%s path=%s payload_keys=%s",
+        request.method,
+        request.path,
+        sorted(payload.keys()),
+    )
+    try: a=create_agreement(payload, uid()); db.session.commit(); return jsonify(agr_dict(a)),201
     except Exception as e: return error(e)
-@investors_bp.route("/investor-agreements/<int:aid>", methods=["GET","PATCH"])
+@investors_bp.route("/investor-agreements/<int:aid>", methods=["GET","PATCH"], strict_slashes=False)
 @role_required(["admin"])
 def agreement(aid):
-    a=InvestorFundingAgreement.query.get_or_404(aid)
+    a=db.session.get(InvestorFundingAgreement, aid)
+    if not a: return investor_agreement_not_found()
     if request.method=="PATCH":
         data=request.get_json() or {}
         for f in ["agreement_name","maturity_date","interest_rate","interest_rate_period","calculation_method","status"]:

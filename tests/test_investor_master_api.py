@@ -265,3 +265,74 @@ def test_agreement_create_returns_contract_for_missing_or_inactive_investor(app,
     inactive_agreement = client.post("/admin/investor-agreements", headers=headers, json={"investor_id": inactive["id"]})
     assert inactive_agreement.status_code == 422
     assert inactive_agreement.get_json() == {"error": "investor_inactive", "message": "The selected investor is not active."}
+
+
+def test_create_agreement_does_not_require_funding_transaction_or_post_journal(app, client, caplog):
+    from app.accounting import seed_default_accounts
+    from app.investor_funding import seed_investor_accounts
+    from app.models import AccountingJournalEntry
+
+    admin = _admin()
+    headers = _headers(app, admin)
+    seed_default_accounts()
+    seed_investor_accounts()
+    db.session.commit()
+    investor = client.post("/admin/investors", headers=headers, json=_payload(nic="198900701482", email="agreement@example.com")).get_json()
+
+    resp = client.post(
+        "/admin/investor-agreements",
+        headers=headers,
+        json={
+            "investor_id": investor["id"],
+            "agreement_name": "Monthly Investor Funding Agreement",
+            "agreement_date": "2026-02-20",
+            "start_date": "2026-02-20",
+            "original_expected_principal": 50000,
+            "interest_rate": 2,
+            "interest_rate_period": "MONTHLY",
+            "calculation_method": "MONTHLY_AVERAGE_DAILY_BALANCE",
+            "compounding_method": "CAPITALIZE_MONTHLY",
+            "allow_partial_repayment": True,
+            "status": "ACTIVE",
+        },
+    )
+
+    assert resp.status_code == 201
+    body = resp.get_json()
+    assert body["id"] == body["agreement_id"]
+    assert body["investor_id"] == investor["id"]
+    assert body["original_principal_amount"] == 50000.0
+    assert body["current_principal_balance"] == 0.0
+    assert body["interest_rate"] == 2.0
+    assert body["interest_rate_period"] == "MONTHLY"
+    assert body["agreement_number"].startswith("GROW-IFA-20260220-")
+    assert InvestorFundingAgreement.query.count() == 1
+    assert InvestorFundingTransaction.query.count() == 0
+    assert AccountingJournalEntry.query.count() == 0
+    assert "Investor agreement request method=POST path=/admin/investor-agreements" in caplog.text
+
+
+def test_create_agreement_invalid_liability_account_is_account_specific(app, client):
+    from app.accounting import seed_default_accounts
+    from app.investor_funding import seed_investor_accounts
+    from app.models import AccountingAccount
+
+    admin = _admin()
+    headers = _headers(app, admin)
+    seed_default_accounts()
+    seed_investor_accounts()
+    db.session.commit()
+    investor = client.post("/admin/investors", headers=headers, json=_payload(nic="198900701483", email="badaccount@example.com")).get_json()
+    asset = AccountingAccount.query.filter_by(account_type="ASSET").first()
+
+    resp = client.post(
+        "/admin/investor-agreements",
+        headers=headers,
+        json={"investor_id": investor["id"], "investor_liability_account_id": asset.id},
+    )
+
+    assert resp.status_code == 422
+    assert resp.get_json() == {
+        "error": "account_mapping_invalid",
+        "message": "investor_liability_account_id must be a liability account.",
+    }

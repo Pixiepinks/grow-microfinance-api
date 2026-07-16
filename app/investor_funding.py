@@ -37,6 +37,9 @@ def generate_investor_number():
 
 def generate_agreement_number(agreement_date):
     prefix = f"GROW-IFA-{agreement_date:%Y%m%d}-"
+    if db.session.bind and db.session.bind.dialect.name == "postgresql":
+        next_value = db.session.execute(text("SELECT nextval('investor_agreement_number_seq')")).scalar_one()
+        return f"{prefix}{next_value:04d}"
     return _seq(InvestorFundingAgreement, "agreement_number", prefix, 4)
 
 
@@ -194,18 +197,100 @@ def _validate_agreement_investor(investor_id):
     return investor
 
 
+def _coalesce(data, *keys, default=None):
+    for key in keys:
+        if key in data and data.get(key) is not None:
+            return data.get(key)
+    return default
+
+
+def _as_bool(value):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _normalize_agreement_payload(data):
+    data = data or {}
+    normalized = dict(data)
+    normalized["original_principal_amount"] = _coalesce(data, "original_principal_amount", "original_expected_principal", default="0")
+    normalized["allow_partial_withdrawal"] = _coalesce(data, "allow_partial_withdrawal", "allow_partial_repayment", default=True)
+    normalized["interest_expense_account_id"] = _coalesce(data, "interest_expense_account_id", "investor_interest_expense_account_id")
+    normalized["accrued_interest_payable_account_id"] = _coalesce(data, "accrued_interest_payable_account_id", "investor_interest_payable_account_id")
+    normalized["allow_additional_funding"] = _coalesce(data, "allow_additional_funding", default=True)
+    normalized["auto_accrual_enabled"] = _coalesce(data, "auto_accrual_enabled", default=True)
+    normalized["auto_capitalize_interest"] = _coalesce(data, "auto_capitalize_interest", default=False)
+    return normalized
+
+
+def _get_account(account_id, field_name):
+    if account_id in (None, ""):
+        raise ValidationError("account_mapping_invalid", message=f"{field_name} is required.")
+    acct = db.session.get(AccountingAccount, int(account_id))
+    if not acct:
+        raise ValidationError("account_mapping_invalid", message=f"{field_name} was not found.")
+    if not acct.is_active:
+        raise ValidationError("account_mapping_invalid", message=f"{field_name} must be active.")
+    if not acct.allow_manual_posting:
+        raise ValidationError("account_mapping_invalid", message=f"{field_name} must allow posting.")
+    return acct
+
+
+def _validate_account(account_id, field_name, expected_type, allowed_subtypes=None, allowed_roles=None):
+    acct = _get_account(account_id, field_name)
+    account_type = str(acct.account_type or "").upper()
+    subtype = str(acct.account_subtype or "").upper()
+    role = str(acct.account_role or "").upper()
+    if account_type != expected_type:
+        raise ValidationError("account_mapping_invalid", message=f"{field_name} must be a {expected_type.lower()} account.")
+    if allowed_subtypes and subtype in allowed_subtypes:
+        return acct
+    if allowed_roles and role in allowed_roles:
+        return acct
+    if allowed_subtypes or allowed_roles:
+        raise ValidationError("account_mapping_invalid", message=f"{field_name} has an invalid account role or subtype.")
+    return acct
+
+
+def _validate_agreement_terms(data):
+    original_principal = money(data.get("original_principal_amount"))
+    interest_rate = Decimal(str(data.get("interest_rate", "0")))
+    if original_principal < 0:
+        raise ValidationError("agreement_terms_invalid", message="Original principal amount cannot be negative.")
+    if interest_rate < 0:
+        raise ValidationError("agreement_terms_invalid", message="Interest rate cannot be negative.")
+    if _as_bool(data.get("auto_capitalize_interest")) and data.get("compounding_method", "SIMPLE") in {"SIMPLE", "NONE", "DISABLED"}:
+        raise ValidationError("agreement_terms_invalid", message="Auto capitalization requires a compatible compounding method.")
+
+
 def create_agreement(data, user_id=None):
+    data = _normalize_agreement_payload(data)
     investor_id = int(data["investor_id"])
     _validate_agreement_investor(investor_id)
+    _validate_agreement_terms(data)
     agreement_date = date.fromisoformat(data.get("agreement_date") or date.today().isoformat())
     start = date.fromisoformat(data.get("start_date") or agreement_date.isoformat())
-    liability = resolve_account("investor_borrowings_control_account", "2300")
-    expense = resolve_account("investor_interest_expense_account", "5100")
-    payable = resolve_account("investor_interest_payable_account", "2310")
-    bank = resolve_account("default_investor_funding_bank_account", "1010")
-    agr = InvestorFundingAgreement(agreement_number=generate_agreement_number(agreement_date), investor_id=investor_id, agreement_name=data.get("agreement_name"), agreement_date=agreement_date, start_date=start, maturity_date=date.fromisoformat(data["maturity_date"]) if data.get("maturity_date") else None, original_principal_amount=money(data.get("original_principal_amount")), current_principal_balance=money(data.get("current_principal_balance")), interest_rate=Decimal(str(data.get("interest_rate", "0"))), interest_rate_period=data.get("interest_rate_period", "MONTHLY"), calculation_method=data.get("calculation_method") or get_setting("default_investor_interest_calculation_method", "MONTHLY_AVERAGE_DAILY_BALANCE"), interest_payment_frequency=data.get("interest_payment_frequency", "MONTHLY"), compounding_method=data.get("compounding_method", "SIMPLE"), day_count_basis=data.get("day_count_basis", "ACTUAL"), interest_payment_method=data.get("interest_payment_method", "BANK_TRANSFER"), funding_account_id=data.get("funding_account_id") or bank.id, investor_liability_account_id=data.get("investor_liability_account_id") or liability.id, interest_expense_account_id=data.get("interest_expense_account_id") or expense.id, accrued_interest_payable_account_id=data.get("accrued_interest_payable_account_id") or payable.id, withholding_tax_account_id=data.get("withholding_tax_account_id"), withholding_tax_rate=Decimal(str(data["withholding_tax_rate"])) if data.get("withholding_tax_rate") is not None else None, status=data.get("status", "DRAFT"), created_by=user_id)
+    liability_default = resolve_account("investor_borrowings_control_account", "2300")
+    expense_default = resolve_account("investor_interest_expense_account", "5100")
+    payable_default = resolve_account("investor_interest_payable_account", "2310")
+    bank_default = resolve_account("default_investor_funding_bank_account", "1010")
+    funding_account_id = data.get("funding_account_id") or bank_default.id
+    investor_liability_account_id = data.get("investor_liability_account_id") or liability_default.id
+    interest_expense_account_id = data.get("interest_expense_account_id") or expense_default.id
+    accrued_interest_payable_account_id = data.get("accrued_interest_payable_account_id") or payable_default.id
+    withholding_tax_account_id = data.get("withholding_tax_account_id")
+    _validate_account(funding_account_id, "funding_account_id", "ASSET", allowed_subtypes={"BANK", "CASH"})
+    _validate_account(investor_liability_account_id, "investor_liability_account_id", "LIABILITY", allowed_subtypes={"BORROWING"}, allowed_roles={"INVESTOR_BORROWINGS_CONTROL", "INVESTOR_BORROWINGS"})
+    _validate_account(interest_expense_account_id, "interest_expense_account_id", "EXPENSE", allowed_subtypes={"OPERATING_EXPENSE"}, allowed_roles={"INVESTOR_INTEREST_EXPENSE"})
+    _validate_account(accrued_interest_payable_account_id, "accrued_interest_payable_account_id", "LIABILITY", allowed_subtypes={"ACCOUNTS_PAYABLE", "BORROWING"}, allowed_roles={"INVESTOR_INTEREST_PAYABLE"})
+    if withholding_tax_account_id not in (None, ""):
+        _validate_account(withholding_tax_account_id, "withholding_tax_account_id", "LIABILITY")
+    agr = InvestorFundingAgreement(agreement_number=generate_agreement_number(agreement_date), investor_id=investor_id, agreement_name=data.get("agreement_name"), agreement_date=agreement_date, start_date=start, maturity_date=date.fromisoformat(data["maturity_date"]) if data.get("maturity_date") else None, original_principal_amount=money(data.get("original_principal_amount")), current_principal_balance=Decimal("0.00"), interest_rate=Decimal(str(data.get("interest_rate", "0"))), interest_rate_period=data.get("interest_rate_period", "MONTHLY"), calculation_method=data.get("calculation_method") or get_setting("default_investor_interest_calculation_method", "MONTHLY_AVERAGE_DAILY_BALANCE"), interest_payment_frequency=data.get("interest_payment_frequency", "MONTHLY"), compounding_method=data.get("compounding_method", "SIMPLE"), day_count_basis=data.get("day_count_basis", "ACTUAL_365"), interest_payment_method=data.get("interest_payment_method", "BANK_TRANSFER"), funding_account_id=funding_account_id, investor_liability_account_id=investor_liability_account_id, interest_expense_account_id=interest_expense_account_id, accrued_interest_payable_account_id=accrued_interest_payable_account_id, withholding_tax_account_id=withholding_tax_account_id or None, withholding_tax_rate=Decimal(str(data["withholding_tax_rate"])) if data.get("withholding_tax_rate") is not None else None, allow_additional_funding=_as_bool(data.get("allow_additional_funding")), allow_partial_withdrawal=_as_bool(data.get("allow_partial_withdrawal")), auto_accrual_enabled=_as_bool(data.get("auto_accrual_enabled")), auto_capitalize_interest=_as_bool(data.get("auto_capitalize_interest")), status=data.get("status", "DRAFT"), created_by=user_id)
     db.session.add(agr); db.session.flush(); log_audit("INVESTOR_AGREEMENT_CREATED", "InvestorFundingAgreement", agr.id, user_id); return agr
-
 
 def _post_two_line(date_, desc, debit_account_id, credit_account_id, amount, ref_type, ref_id, user_id, idem):
     entry = create_draft_journal(date_, desc, [{"account_id": debit_account_id, "debit": amount, "credit": 0, "description": desc}, {"account_id": credit_account_id, "debit": 0, "credit": amount, "description": desc}], ref_type, ref_id, "INVESTOR_FUNDING", user_id, idem)
