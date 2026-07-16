@@ -207,6 +207,8 @@ def seed_default_accounts():
             if not setting:
                 db.session.add(AccountingSetting(setting_key=key, setting_value=code))
         db.session.flush()
+        from .investor_funding import seed_investor_accounts
+        seed_investor_accounts()
     except Exception:
         db.session.rollback()
         raise
