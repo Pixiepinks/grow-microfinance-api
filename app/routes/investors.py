@@ -21,10 +21,35 @@ def mask_bank_account(value):
     return "*" * max(len(value) - 4, 0) + value[-4:]
 
 
+def normalize_investor_status(investor):
+    return str(investor.status or "").strip().upper()
+
+
+def investor_display_name(investor):
+    investor_type = str(investor.investor_type or "").strip().upper()
+    full_name = (investor.full_name or "").strip()
+    company_name = (investor.company_name or "").strip()
+    investor_number = (investor.investor_number or "").strip()
+    if investor_type == "INDIVIDUAL" and full_name:
+        return full_name
+    if investor_type == "COMPANY" and company_name:
+        return company_name
+    return full_name or company_name or investor_number
+
+
+def investor_is_active(investor):
+    return normalize_investor_status(investor) == "ACTIVE"
+
+
 def inv_dict(i, include_sensitive=False):
-    display_name = i.full_name if i.investor_type == "INDIVIDUAL" else (i.company_name or i.full_name)
-    data = {"id":i.id,"investor_id":i.id,"investor_number":i.investor_number,"investor_type":i.investor_type,"full_name":i.full_name,"company_name":i.company_name,"display_name":display_name,"nic":i.nic,"company_registration_number":i.company_registration_number,"tax_identification_number":i.tax_identification_number,"mobile":i.mobile,"email":i.email,"address":i.address,"bank_name":i.bank_name,"bank_branch":i.bank_branch,"bank_account_name":i.bank_account_name,"bank_account_number":i.bank_account_number if include_sensitive else mask_bank_account(i.bank_account_number),"notes":i.notes,"status":i.status,"created_at":i.created_at.isoformat() if i.created_at else None}
+    display_name = investor_display_name(i)
+    data = {"id":i.id,"investor_id":i.id,"investor_number":i.investor_number,"investor_type":i.investor_type,"full_name":i.full_name,"company_name":i.company_name,"display_name":display_name,"nic":i.nic,"company_registration_number":i.company_registration_number,"tax_identification_number":i.tax_identification_number,"mobile":i.mobile,"email":i.email,"address":i.address,"bank_name":i.bank_name,"bank_branch":i.bank_branch,"bank_account_name":i.bank_account_name,"bank_account_number":i.bank_account_number if include_sensitive else mask_bank_account(i.bank_account_number),"notes":i.notes,"status":normalize_investor_status(i),"created_at":i.created_at.isoformat() if i.created_at else None}
     return data
+
+
+def investor_option_dict(i):
+    display_name = investor_display_name(i)
+    return {"id":i.id,"investor_id":i.id,"investor_number":i.investor_number,"investor_type":i.investor_type,"display_name":display_name,"full_name":i.full_name,"company_name":i.company_name,"nic":i.nic,"status":normalize_investor_status(i),"label":f"{i.investor_number} — {display_name}"}
 
 def agr_dict(a):
     posted = [x for x in a.interest_accruals if x.status in {"POSTED","PARTIALLY_PAID","PAID","CAPITALIZED"}]
@@ -38,7 +63,9 @@ def ac_dict(a): return {"id":a.id,"agreement_id":a.agreement_id,"period_start":a
 def error(exc):
     db.session.rollback()
     if isinstance(exc, (ValidationError, AccountingError)):
-        return jsonify(getattr(exc, "payload", {"message": str(exc)})), 422
+        payload = dict(getattr(exc, "payload", {"message": str(exc)}))
+        status_code = payload.pop("status_code", 422)
+        return jsonify(payload), status_code
     current_app.logger.exception("Unexpected investor API error", exc_info=exc)
     return jsonify({"error": "investor_creation_failed", "message": "The investor could not be created."}), 500
 
@@ -52,7 +79,18 @@ def investor_funding_not_found():
 
 @investors_bp.route("/investors", methods=["GET"], strict_slashes=False)
 @role_required(["admin"])
-def list_investors(): return jsonify({"items":[inv_dict(i) for i in Investor.query.order_by(Investor.id.desc()).all()]})
+def list_investors():
+    items = [inv_dict(i) for i in Investor.query.order_by(Investor.id.desc()).all()]
+    return jsonify({"items":items,"total":len(items)})
+
+
+@investors_bp.route("/investors/options", methods=["GET"], strict_slashes=False)
+@role_required(["admin"])
+def investor_options():
+    investors = Investor.query.order_by(Investor.investor_number.asc(), Investor.id.asc()).all()
+    return jsonify({"items":[investor_option_dict(i) for i in investors if investor_is_active(i)]})
+
+
 @investors_bp.route("/investors", methods=["POST"], strict_slashes=False)
 @role_required(["admin"])
 def post_investor():

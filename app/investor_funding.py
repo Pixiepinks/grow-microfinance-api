@@ -174,14 +174,36 @@ def create_investor(data, user_id=None):
     _investor_validation_error({"investor_number": "Could not generate a unique investor number."})
 
 
+def _normalize_investor_status(investor):
+    return str(investor.status or "").strip().upper()
+
+
+def _validate_agreement_investor(investor_id):
+    investor = db.session.get(Investor, investor_id)
+    if not investor:
+        raise ValidationError(
+            "investor_not_found",
+            message="The selected investor was not found.",
+            status_code=404,
+        )
+    if _normalize_investor_status(investor) != "ACTIVE":
+        raise ValidationError(
+            "investor_inactive",
+            message="The selected investor is not active.",
+        )
+    return investor
+
+
 def create_agreement(data, user_id=None):
+    investor_id = int(data["investor_id"])
+    _validate_agreement_investor(investor_id)
     agreement_date = date.fromisoformat(data.get("agreement_date") or date.today().isoformat())
     start = date.fromisoformat(data.get("start_date") or agreement_date.isoformat())
     liability = resolve_account("investor_borrowings_control_account", "2300")
     expense = resolve_account("investor_interest_expense_account", "5100")
     payable = resolve_account("investor_interest_payable_account", "2310")
     bank = resolve_account("default_investor_funding_bank_account", "1010")
-    agr = InvestorFundingAgreement(agreement_number=generate_agreement_number(agreement_date), investor_id=int(data["investor_id"]), agreement_name=data.get("agreement_name"), agreement_date=agreement_date, start_date=start, maturity_date=date.fromisoformat(data["maturity_date"]) if data.get("maturity_date") else None, original_principal_amount=money(data.get("original_principal_amount")), current_principal_balance=money(data.get("current_principal_balance")), interest_rate=Decimal(str(data.get("interest_rate", "0"))), interest_rate_period=data.get("interest_rate_period", "MONTHLY"), calculation_method=data.get("calculation_method") or get_setting("default_investor_interest_calculation_method", "MONTHLY_AVERAGE_DAILY_BALANCE"), interest_payment_frequency=data.get("interest_payment_frequency", "MONTHLY"), compounding_method=data.get("compounding_method", "SIMPLE"), day_count_basis=data.get("day_count_basis", "ACTUAL"), interest_payment_method=data.get("interest_payment_method", "BANK_TRANSFER"), funding_account_id=data.get("funding_account_id") or bank.id, investor_liability_account_id=data.get("investor_liability_account_id") or liability.id, interest_expense_account_id=data.get("interest_expense_account_id") or expense.id, accrued_interest_payable_account_id=data.get("accrued_interest_payable_account_id") or payable.id, withholding_tax_account_id=data.get("withholding_tax_account_id"), withholding_tax_rate=Decimal(str(data["withholding_tax_rate"])) if data.get("withholding_tax_rate") is not None else None, status=data.get("status", "DRAFT"), created_by=user_id)
+    agr = InvestorFundingAgreement(agreement_number=generate_agreement_number(agreement_date), investor_id=investor_id, agreement_name=data.get("agreement_name"), agreement_date=agreement_date, start_date=start, maturity_date=date.fromisoformat(data["maturity_date"]) if data.get("maturity_date") else None, original_principal_amount=money(data.get("original_principal_amount")), current_principal_balance=money(data.get("current_principal_balance")), interest_rate=Decimal(str(data.get("interest_rate", "0"))), interest_rate_period=data.get("interest_rate_period", "MONTHLY"), calculation_method=data.get("calculation_method") or get_setting("default_investor_interest_calculation_method", "MONTHLY_AVERAGE_DAILY_BALANCE"), interest_payment_frequency=data.get("interest_payment_frequency", "MONTHLY"), compounding_method=data.get("compounding_method", "SIMPLE"), day_count_basis=data.get("day_count_basis", "ACTUAL"), interest_payment_method=data.get("interest_payment_method", "BANK_TRANSFER"), funding_account_id=data.get("funding_account_id") or bank.id, investor_liability_account_id=data.get("investor_liability_account_id") or liability.id, interest_expense_account_id=data.get("interest_expense_account_id") or expense.id, accrued_interest_payable_account_id=data.get("accrued_interest_payable_account_id") or payable.id, withholding_tax_account_id=data.get("withholding_tax_account_id"), withholding_tax_rate=Decimal(str(data["withholding_tax_rate"])) if data.get("withholding_tax_rate") is not None else None, status=data.get("status", "DRAFT"), created_by=user_id)
     db.session.add(agr); db.session.flush(); log_audit("INVESTOR_AGREEMENT_CREATED", "InvestorFundingAgreement", agr.id, user_id); return agr
 
 
