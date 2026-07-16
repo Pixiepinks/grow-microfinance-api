@@ -148,3 +148,120 @@ def test_generate_investor_number_ignores_malformed_legacy_number(app):
     db.session.flush()
 
     assert generate_investor_number() == "GROW-INV-000005"
+
+
+def test_investor_options_returns_active_individual_without_agreement_or_balance(app, client):
+    admin = _admin()
+    headers = _headers(app, admin)
+    created = client.post("/admin/investors", headers=headers, json=_payload()).get_json()
+
+    resp = client.get("/admin/investors/options", headers=headers)
+
+    assert resp.status_code == 200
+    assert resp.get_json() == {
+        "items": [
+            {
+                "id": created["id"],
+                "investor_id": created["id"],
+                "investor_number": "GROW-INV-000001",
+                "investor_type": "INDIVIDUAL",
+                "display_name": "Prakash Vijayanga Withana",
+                "full_name": "Prakash Vijayanga Withana",
+                "company_name": None,
+                "nic": "198900701481",
+                "status": "ACTIVE",
+                "label": "GROW-INV-000001 — Prakash Vijayanga Withana",
+            }
+        ]
+    }
+    assert InvestorFundingAgreement.query.count() == 0
+
+
+def test_investor_options_excludes_inactive_investors(app, client):
+    admin = _admin()
+    headers = _headers(app, admin)
+    client.post("/admin/investors", headers=headers, json=_payload(status="INACTIVE"))
+
+    resp = client.get("/admin/investors/options", headers=headers)
+
+    assert resp.status_code == 200
+    assert resp.get_json() == {"items": []}
+
+
+def test_investor_options_company_label_uses_company_name(app, client):
+    admin = _admin()
+    headers = _headers(app, admin)
+    resp = client.post(
+        "/admin/investors",
+        headers=headers,
+        json=_payload(
+            investor_type="COMPANY",
+            full_name=None,
+            company_name="Grow Capital Pvt Ltd",
+            nic=None,
+            company_registration_number="PV-123",
+        ),
+    )
+    assert resp.status_code == 201
+
+    options = client.get("/admin/investors/options", headers=headers).get_json()["items"]
+
+    assert options[0]["display_name"] == "Grow Capital Pvt Ltd"
+    assert options[0]["label"] == "GROW-INV-000001 — Grow Capital Pvt Ltd"
+
+
+def test_list_investors_includes_total_and_normalized_contract(app, client):
+    admin = _admin()
+    headers = _headers(app, admin)
+    created = client.post("/admin/investors", headers=headers, json=_payload()).get_json()
+
+    resp = client.get("/admin/investors", headers=headers)
+
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["total"] == 1
+    item = body["items"][0]
+    for field in ["id", "investor_id", "investor_number", "investor_type", "display_name", "full_name", "company_name", "nic", "mobile", "status"]:
+        assert field in item
+    assert item["id"] == created["id"]
+
+
+def test_agreement_create_resolves_active_investor_by_investor_id(app, client):
+    from app.accounting import seed_default_accounts
+    from app.investor_funding import seed_investor_accounts
+
+    admin = _admin()
+    headers = _headers(app, admin)
+    seed_default_accounts()
+    seed_investor_accounts()
+    db.session.commit()
+    investor = client.post("/admin/investors", headers=headers, json=_payload()).get_json()
+
+    resp = client.post(
+        "/admin/investor-agreements",
+        headers=headers,
+        json={"investor_id": investor["id"], "agreement_name": "Test Agreement", "interest_rate": "12.5"},
+    )
+
+    assert resp.status_code == 201
+    assert resp.get_json()["investor"]["id"] == investor["id"]
+
+
+def test_agreement_create_returns_contract_for_missing_or_inactive_investor(app, client):
+    from app.accounting import seed_default_accounts
+    from app.investor_funding import seed_investor_accounts
+
+    admin = _admin()
+    headers = _headers(app, admin)
+    seed_default_accounts()
+    seed_investor_accounts()
+    db.session.commit()
+
+    missing = client.post("/admin/investor-agreements", headers=headers, json={"investor_id": 999})
+    assert missing.status_code == 404
+    assert missing.get_json() == {"error": "investor_not_found", "message": "The selected investor was not found."}
+
+    inactive = client.post("/admin/investors", headers=headers, json=_payload(status="INACTIVE")).get_json()
+    inactive_agreement = client.post("/admin/investor-agreements", headers=headers, json={"investor_id": inactive["id"]})
+    assert inactive_agreement.status_code == 422
+    assert inactive_agreement.get_json() == {"error": "investor_inactive", "message": "The selected investor is not active."}
