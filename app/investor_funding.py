@@ -9,7 +9,7 @@ from sqlalchemy import func, text
 from sqlalchemy.exc import IntegrityError
 
 from .extensions import db
-from .models import AccountingAccount, AccountingJournalEntry, Investor, InvestorFundingAgreement, InvestorFundingTransaction, InvestorInterestAccrual
+from .models import AccountingAccount, AccountingJournalEntry, AccountingSetting, Investor, InvestorFundingAgreement, InvestorFundingTransaction, InvestorInterestAccrual
 from .accounting import AccountingError, ValidationError, create_draft_journal, post_journal, reverse_journal, require_open_accounting_period, get_setting, log_audit
 
 CENT = Decimal("0.01")
@@ -71,6 +71,16 @@ def seed_investor_accounts():
         acct = AccountingAccount.query.filter_by(account_code=code).first()
         if not acct:
             db.session.add(AccountingAccount(account_code=code, account_name=name, account_type=typ, normal_balance=normal, account_subtype="BORROWING" if typ == "LIABILITY" else "OPERATING_EXPENSE", cash_flow_category="FINANCING" if typ == "LIABILITY" else "OPERATING", is_system_account=True, is_active=True, allow_manual_posting=True, account_role=role))
+        else:
+            acct.account_name = name
+            acct.account_type = typ
+            acct.normal_balance = normal
+            acct.account_subtype = "BORROWING" if typ == "LIABILITY" else "OPERATING_EXPENSE"
+            acct.cash_flow_category = "FINANCING" if typ == "LIABILITY" else "OPERATING"
+            acct.is_system_account = True
+            acct.is_active = True
+            acct.allow_manual_posting = True
+            acct.account_role = role
     db.session.flush()
     defaults = {
         "investor_borrowings_control_account": "2300", "INVESTOR_BORROWINGS_CONTROL": "2300", "INVESTOR_BORROWINGS": "2300",
@@ -78,7 +88,9 @@ def seed_investor_accounts():
         "investor_interest_payable_account": "2310", "INVESTOR_INTEREST_PAYABLE": "2310",
         "investor_withholding_tax_payable_account": "2320", "WITHHOLDING_TAX_PAYABLE": "2320",
         "default_investor_funding_bank_account": "1010", "default_investor_interest_calculation_method": "MONTHLY_AVERAGE_DAILY_BALANCE",
-        "default_investor_interest_rate_period": "MONTHLY", "auto_post_investor_interest": "true", "investor_interest_accrual_day": "MONTH_END",
+        "default_investor_interest_rate_period": "MONTHLY", "default_investor_interest_payment_frequency": "MONTHLY",
+        "default_investor_compounding_method": "NONE", "default_investor_day_count_basis": "ACTUAL_365",
+        "default_investor_interest_payment_method": "BANK_TRANSFER", "auto_post_investor_interest": "true", "investor_interest_accrual_day": "MONTH_END",
         "allow_historical_investor_transactions": "true", "allow_interest_capitalization": "false", "require_investor_agreement_document": "false",
         "require_withholding_tax_configuration": "false", "investor_balance_reconciliation_tolerance": "0.01",
     }
@@ -87,6 +99,115 @@ def seed_investor_accounts():
         if not AccountingSetting.query.filter_by(setting_key=k).first():
             db.session.add(AccountingSetting(setting_key=k, setting_value=v))
     db.session.flush()
+
+
+INVESTOR_SETTINGS = {
+    "investor_borrowings_control_account_id": ("investor_borrowings_control_account", "INVESTOR_BORROWINGS_CONTROL", "2300", "investor_borrowings_control", {"LIABILITY"}, None),
+    "investor_interest_expense_account_id": ("investor_interest_expense_account", "INVESTOR_INTEREST_EXPENSE", "5100", "investor_interest_expense", {"EXPENSE"}, None),
+    "investor_interest_payable_account_id": ("investor_interest_payable_account", "INVESTOR_INTEREST_PAYABLE", "2310", "investor_interest_payable", {"LIABILITY"}, None),
+    "investor_withholding_tax_payable_account_id": ("investor_withholding_tax_payable_account", "WITHHOLDING_TAX_PAYABLE", "2320", "withholding_tax_payable", {"LIABILITY"}, None),
+    "default_investor_funding_bank_account_id": ("default_investor_funding_bank_account", "MAIN_BANK_ACCOUNT", "1010", "default_funding_bank", {"ASSET"}, {"BANK", "CASH"}),
+}
+
+INVESTOR_POLICY_DEFAULTS = {
+    "default_interest_calculation_method": ("default_investor_interest_calculation_method", "MONTHLY_AVERAGE_DAILY_BALANCE"),
+    "default_interest_rate_period": ("default_investor_interest_rate_period", "MONTHLY"),
+    "default_interest_payment_frequency": ("default_investor_interest_payment_frequency", "MONTHLY"),
+    "default_compounding_method": ("default_investor_compounding_method", "NONE"),
+    "default_day_count_basis": ("default_investor_day_count_basis", "ACTUAL_365"),
+    "default_interest_payment_method": ("default_investor_interest_payment_method", "BANK_TRANSFER"),
+    "auto_post_investor_interest": ("auto_post_investor_interest", True),
+    "allow_historical_investor_transactions": ("allow_historical_investor_transactions", True),
+    "allow_interest_capitalization": ("allow_interest_capitalization", False),
+    "require_investor_agreement_document": ("require_investor_agreement_document", False),
+    "reconciliation_tolerance": ("investor_balance_reconciliation_tolerance", "0.01"),
+}
+
+
+def _setting_value(key):
+    setting = AccountingSetting.query.filter_by(setting_key=key).first()
+    return setting.setting_value if setting else None
+
+
+def _bool_setting(key, default):
+    value = _setting_value(key)
+    if value is None:
+        return bool(default)
+    return str(value).lower() in {"1", "true", "yes", "on"}
+
+
+def _account_ref(account):
+    if not account:
+        return None
+    return {"id": account.id, "account_code": account.account_code, "account_name": account.account_name}
+
+
+def _resolve_investor_setting_account(setting_key, role, default_code):
+    value = _setting_value(setting_key) or _setting_value(role)
+    account = None
+    if value:
+        account = db.session.get(AccountingAccount, int(value)) if str(value).isdigit() else AccountingAccount.query.filter_by(account_code=str(value)).first()
+    return account or AccountingAccount.query.filter_by(account_role=role).first() or AccountingAccount.query.filter_by(account_code=default_code).first()
+
+
+def _validate_investor_account(account, field, allowed_types, allowed_subtypes=None):
+    if not account:
+        raise ValidationError("invalid_account_mapping", field=field, message=f"{field} account was not found.")
+    if account.account_type not in allowed_types or not account.is_active or not account.allow_manual_posting:
+        raise ValidationError("invalid_account_mapping", field=field, message=f"{field} has an invalid account classification.")
+    if allowed_subtypes and account.account_subtype not in allowed_subtypes:
+        raise ValidationError("invalid_account_mapping", field=field, message=f"{field} must be a bank or cash account.")
+
+
+def load_investor_funding_settings():
+    return {
+        field: _resolve_investor_setting_account(setting_key, role, default_code)
+        for field, (setting_key, role, default_code, _account_key, _types, _subtypes) in INVESTOR_SETTINGS.items()
+    }
+
+
+def serialize_investor_funding_settings(settings):
+    payload = {"configured": True, "missing_settings": [], "accounts": {}}
+    for field, (_setting_key, _role, _default_code, account_key, _types, _subtypes) in INVESTOR_SETTINGS.items():
+        account = settings.get(field)
+        payload[field] = account.id if account else None
+        payload["accounts"][account_key] = _account_ref(account)
+        if account is None:
+            payload["configured"] = False
+            payload["missing_settings"].append(field.replace("_id", ""))
+    for field, (setting_key, default) in INVESTOR_POLICY_DEFAULTS.items():
+        if isinstance(default, bool):
+            payload[field] = _bool_setting(setting_key, default)
+        else:
+            payload[field] = _setting_value(setting_key) or default
+    if not payload["configured"]:
+        payload["message"] = "Investor funding accounting configuration is incomplete."
+    return payload
+
+
+def update_investor_funding_settings(data, user_id=None):
+    for field, (setting_key, role, _default_code, _account_key, types, subtypes) in INVESTOR_SETTINGS.items():
+        if field in data:
+            account = db.session.get(AccountingAccount, int(data[field]))
+            _validate_investor_account(account, field, types, subtypes)
+            account.account_role = role if role != "MAIN_BANK_ACCOUNT" else account.account_role or role
+            setting = AccountingSetting.query.filter_by(setting_key=setting_key).first()
+            if not setting:
+                setting = AccountingSetting(setting_key=setting_key, setting_value=str(account.id))
+                db.session.add(setting)
+            else:
+                setting.setting_value = str(account.id)
+    for field, (setting_key, _default) in INVESTOR_POLICY_DEFAULTS.items():
+        if field in data:
+            value = str(data[field]).lower() if isinstance(data[field], bool) else str(data[field])
+            setting = AccountingSetting.query.filter_by(setting_key=setting_key).first()
+            if not setting:
+                setting = AccountingSetting(setting_key=setting_key, setting_value=value)
+                db.session.add(setting)
+            else:
+                setting.setting_value = value
+    log_audit("INVESTOR_FUNDING_SETTINGS_CHANGED", "AccountingSetting", "investor-funding", user_id)
+    return serialize_investor_funding_settings(load_investor_funding_settings())
 
 
 SUPPORTED_INVESTOR_TYPES = {"INDIVIDUAL", "COMPANY"}
