@@ -322,16 +322,88 @@ def create_account(data, user_id=None):
     acct = AccountingAccount(account_code=data["account_code"], account_name=data["account_name"], account_type=typ, normal_balance=normal, parent_id=parent_id, parent_account_id=data.get("parent_account_id"), collector_id=collector_id, is_collection_account=is_collection, account_role=data.get("account_role"), account_subtype=subtype, description=data.get("description"), is_active=data.get("is_active", True), allow_manual_posting=data.get("allow_manual_posting", True), cash_flow_category=data.get("cash_flow_category", "NONE"))
     db.session.add(acct); db.session.flush(); log_audit("ACCOUNT_CREATE", "AccountingAccount", acct.id, user_id); return acct
 
+def _bool_value(value):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _unprocessable(error, message=None):
+    raise ValidationError(error, message=message or error)
+
+
+def _validate_account_state(acct):
+    subtype = account_subtype(acct)
+    if acct.account_type not in ACCOUNT_TYPES or acct.normal_balance not in NORMAL_BALANCES or subtype not in ACCOUNT_SUBTYPES:
+        _unprocessable("Invalid account structure", "Invalid account type, normal balance, or subtype.")
+    if subtype == "COLLECTION_CLEARING":
+        if not acct.collector_id:
+            _unprocessable("Collection account validation failed", "Collector clearing accounts require a collector_id.")
+        if not acct.parent_account_id:
+            _unprocessable("Collection account validation failed", "Collector clearing accounts require a collection parent account.")
+        if acct.account_type != "ASSET" or acct.normal_balance != "DEBIT" or not acct.allow_manual_posting or not acct.is_collection_account:
+            _unprocessable("Collection account validation failed", "Collector clearing accounts must be debit ASSET posting collection accounts.")
+    elif subtype == "COLLECTION_CLEARING_CONTROL":
+        if acct.collector_id is not None:
+            _unprocessable("Collection account validation failed", "Collection clearing control accounts must not have a collector_id.")
+        if acct.account_type != "ASSET" or acct.normal_balance != "DEBIT" or acct.allow_manual_posting:
+            _unprocessable("Collection account validation failed", "Collection clearing control accounts must be non-posting debit ASSET accounts.")
+    else:
+        if acct.collector_id is not None or acct.is_collection_account:
+            _unprocessable("Ordinary account validation failed", "Ordinary accounts must not have collector fields or collection classification.")
+
+
 def update_account(acct, data, user_id=None):
-    for field in ["account_name", "description", "is_active", "allow_manual_posting", "cash_flow_category", "account_role", "parent_account_id"]:
+    data = dict(data or {})
+    if acct.is_system_account and data.get("_delete"):
+        log_audit("PROTECTED_ACCOUNT_UPDATE_ATTEMPTED", "AccountingAccount", acct.id, user_id, data); raise AccountingError("System accounts cannot be deleted")
+    if "posting_allowed" in data and "allow_manual_posting" not in data:
+        data["allow_manual_posting"] = data["posting_allowed"]
+    if "parent_account_id" in data and data["parent_account_id"] in ("", 0):
+        data["parent_account_id"] = None
+    if "collector_id" in data and data["collector_id"] in ("", 0):
+        data["collector_id"] = None
+    for f in ("is_active", "allow_manual_posting", "is_collection_account"):
+        if f in data:
+            data[f] = _bool_value(data[f])
+    if "account_code" in data:
+        data["account_code"] = str(data["account_code"] or "").strip()
+        if not data["account_code"]:
+            _unprocessable("Invalid account code", "Account code is required.")
+        duplicate = AccountingAccount.query.filter(AccountingAccount.account_code == data["account_code"], AccountingAccount.id != acct.id).first()
+        if duplicate:
+            _unprocessable("Duplicate account code", "Account code already exists.")
+    has_posted = account_has_posted_transactions(acct)
+    dangerous = {
+        "account_type": "Account type cannot be changed because this account has posted transactions.",
+        "normal_balance": "Normal balance cannot be changed because this account has posted transactions.",
+        "account_code": "Account code cannot be changed because this account has posted transactions.",
+        "is_collection_account": "Collection classification cannot be changed because this account has posted transactions.",
+        "collector_id": "Collector classification cannot be changed because this account has posted transactions.",
+    }
+    if has_posted:
+        for f, msg in dangerous.items():
+            if f in data and data[f] != getattr(acct, f):
+                log_audit("PROTECTED_ACCOUNT_UPDATE_ATTEMPTED", "AccountingAccount", acct.id, user_id, {"field": f})
+                _unprocessable("Account structure change blocked", msg)
+        if "account_subtype" in data:
+            old_collection = account_subtype(acct) in {"COLLECTION_CLEARING", "COLLECTION_CLEARING_CONTROL"}
+            new_collection = normalize_account_value(data["account_subtype"]) in {"COLLECTION_CLEARING", "COLLECTION_CLEARING_CONTROL"}
+            if old_collection != new_collection:
+                _unprocessable("Account structure change blocked", "Collector/control classification cannot be changed because this account has posted transactions.")
+    if "is_active" in data and data["is_active"] is False and account_is_mapped(acct):
+        log_audit("PROTECTED_ACCOUNT_UPDATE_ATTEMPTED", "AccountingAccount", acct.id, user_id, {"field": "is_active"}); raise AccountingError("Mapped accounts cannot be deactivated")
+    allowed = ["account_name", "account_code", "description", "account_type", "normal_balance", "is_active", "allow_manual_posting", "cash_flow_category", "account_subtype", "account_role", "parent_account_id", "collector_id", "is_collection_account", "financial_statement_group", "financial_statement_order", "cash_flow_group"]
+    old_values = {f: getattr(acct, f) for f in allowed if f in data}
+    for field in allowed:
         if field in data: setattr(acct, field, data[field])
-    if "collector_id" in data: acct.collector_id = data["collector_id"]
-    if "is_collection_account" in data or data.get("account_subtype") == "COLLECTION_CLEARING":
-        acct.is_collection_account = bool(data.get("is_collection_account", acct.is_collection_account)) or data.get("account_subtype") == "COLLECTION_CLEARING"
-        if acct.is_collection_account:
-            if acct.account_type != "ASSET" or acct.normal_balance != "DEBIT": raise AccountingError("Collector collection accounts must be debit ASSET accounts")
-            acct.account_subtype = "COLLECTION_CLEARING"
-    log_audit("ACCOUNT_UPDATE", "AccountingAccount", acct.id, user_id); return acct
+    _validate_account_state(acct)
+    changed = [f for f in old_values if old_values[f] != getattr(acct, f)]
+    if changed:
+        log_audit("ACCOUNT_UPDATE", "AccountingAccount", acct.id, user_id, {"account_id": acct.id, "account_code": acct.account_code, "changed_fields": changed, "old_values": old_values, "new_values": {f: getattr(acct, f) for f in changed}})
+    return acct
 
 def _line_from_payload(raw, line_no):
     return AccountingJournalLine(line_no=line_no, account_id=raw["account_id"], debit=money(raw.get("debit")), credit=money(raw.get("credit")), customer_id=raw.get("customer_id"), loan_id=raw.get("loan_id"), payment_id=raw.get("payment_id"), collection_id=raw.get("collection_id"), description=raw.get("description"))
@@ -348,27 +420,40 @@ def create_draft_journal(journal_date, description, lines, reference_type="MANUA
 
 def validate_journal(entry):
     if len(entry.lines) < 2: raise AccountingError("Posted journals must have at least two lines")
-    debit = Decimal("0.00"); credit = Decimal("0.00")
+    total_debit = sum((money(line.debit) for line in entry.lines), Decimal("0.00"))
+    total_credit = sum((money(line.credit) for line in entry.lines), Decimal("0.00"))
+    if total_debit != total_credit: raise AccountingError("Journal is not balanced")
+    entry.total_debit = money(total_debit); entry.total_credit = money(total_credit)
     for line in entry.lines:
-        line.debit = money(line.debit); line.credit = money(line.credit)
-        if (line.debit > 0 and line.credit > 0) or (line.debit == 0 and line.credit == 0): raise AccountingError("Each line must have either debit or credit")
-        acct = db.session.get(AccountingAccount, line.account_id)
-        if not acct or not acct.is_active: raise AccountingError("Inactive or missing account cannot receive postings")
-        if acct.children and not acct.allow_manual_posting: raise AccountingError("Parent account is not postable")
-        debit += line.debit; credit += line.credit
-    entry.total_debit = money(debit); entry.total_credit = money(credit)
-    if entry.total_debit != entry.total_credit: raise AccountingError("Journal is not balanced")
-    return True
+        account = line.account or AccountingAccount.query.get(line.account_id)
+        if not is_active_account(account) or not is_posting_account(account):
+            raise AccountingError("Journal line references inactive or non-posting account")
+    return entry
 
 def post_journal(entry, user_id=None):
-    if entry.status == "POSTED": return entry
-    if entry.status != "DRAFT": raise AccountingError("Only DRAFT journals can be posted")
-    validate_journal(entry); entry.status="POSTED"; entry.posted_at=datetime.utcnow(); entry.posted_by_id=user_id; log_audit("JOURNAL_POST", "AccountingJournalEntry", entry.id, user_id); return entry
+    validate_journal(entry)
+    entry.status = "POSTED"
+    entry.posted_at = datetime.utcnow()
+    entry.posted_by_id = user_id
+    log_audit("JOURNAL_POST", "AccountingJournalEntry", entry.id, user_id)
+    return entry
 
-def reverse_journal(entry, journal_date, reason, user_id=None):
-    if entry.status != "POSTED": raise AccountingError("Only POSTED journals can be reversed")
-    reversal = create_draft_journal(journal_date, f"Reversal: {reason}", [{"account_id": l.account_id, "debit": l.credit, "credit": l.debit, "customer_id": l.customer_id, "loan_id": l.loan_id, "payment_id": l.payment_id, "collection_id": l.collection_id, "description": l.description} for l in entry.lines], "REVERSAL", entry.id, "ACCOUNTING", user_id, f"REVERSAL:{entry.id}")
-    reversal.reversal_of_id = entry.id; reversal.reversal_of_journal_id = entry.id; reversal.is_reversal = True; post_journal(reversal, user_id); entry.status = "REVERSED"; log_audit("JOURNAL_REVERSE", "AccountingJournalEntry", entry.id, user_id, reason); return reversal
+def reverse_journal(entry, journal_date=None, reason=None, user_id=None):
+    if entry.status not in {"POSTED", "REVERSED"}:
+        raise AccountingError("Only posted journals can be reversed")
+    if entry.status == "REVERSED" and entry.reversal_journals:
+        return entry.reversal_journals[0]
+    reversal = create_draft_journal(journal_date or date.today(), reason or f"Reversal of {entry.journal_no}", [
+        {"account_id": line.account_id, "debit": money(line.credit), "credit": money(line.debit), "customer_id": line.customer_id, "loan_id": line.loan_id, "payment_id": line.payment_id, "collection_id": line.collection_id, "description": line.description}
+        for line in entry.lines
+    ], "REVERSAL", entry.id, entry.source_module, user_id, f"REVERSAL:{entry.id}")
+    reversal.is_reversal = True
+    reversal.reversal_of_id = entry.id
+    reversal.reversal_of_journal_id = entry.id
+    post_journal(reversal, user_id)
+    entry.status = "REVERSED"
+    log_audit("JOURNAL_REVERSE", "AccountingJournalEntry", entry.id, user_id, {"reversal_id": reversal.id})
+    return reversal
 
 def validate_funding_account(account, *_args):
     if not account:
@@ -603,8 +688,35 @@ def account_subtype(account):
         return normalize_account_value(subtype)
     return {"CASH": "CASH", "BANK": "BANK", "RECEIVABLE": "LOAN_RECEIVABLE"}.get(normalize_account_value(getattr(account, "cash_flow_category", None)), "OTHER")
 
+def account_has_posted_transactions(acct):
+    return db.session.query(AccountingJournalLine.id).join(AccountingJournalEntry).filter(
+        AccountingJournalLine.account_id == acct.id,
+        AccountingJournalEntry.status == "POSTED",
+    ).first() is not None
+
+
 def serialize_account(account):
-    return None if not account else {"account_id": account.id, "account_code": account.account_code, "account_name": account.account_name, "account_type": account.account_type, "account_subtype": account_subtype(account), "is_active": account.is_active}
+    if not account:
+        return None
+    return {
+        "id": account.id,
+        "account_id": account.id,
+        "account_code": account.account_code,
+        "account_name": account.account_name,
+        "account_type": account.account_type,
+        "account_subtype": account_subtype(account),
+        "normal_balance": account.normal_balance,
+        "account_role": account.account_role,
+        "posting_allowed": bool(account.allow_manual_posting),
+        "allow_manual_posting": bool(account.allow_manual_posting),
+        "is_active": bool(account.is_active),
+        "is_system_account": bool(account.is_system_account),
+        "is_collection_account": bool(account.is_collection_account),
+        "collector_id": account.collector_id,
+        "parent_account_id": account.parent_account_id,
+        "parent_id": account.parent_id,
+        "has_posted_transactions": account_has_posted_transactions(account),
+    }
 
 def validate_setting_account(key, account):
     if key not in SETTING_VALIDATION:
@@ -715,19 +827,104 @@ def create_account(data, user_id=None):
     db.session.add(acct); db.session.flush(); log_audit("ACCOUNT_CREATE", "AccountingAccount", acct.id, user_id); return acct
 
 def update_account(acct, data, user_id=None):
+    data = dict(data or {})
     if acct.is_system_account and data.get("_delete"):
         log_audit("PROTECTED_ACCOUNT_UPDATE_ATTEMPTED", "AccountingAccount", acct.id, user_id, data); raise AccountingError("System accounts cannot be deleted")
-    if account_has_activity(acct):
-        for f in ("account_code", "account_type", "normal_balance"):
+    if "posting_allowed" in data and "allow_manual_posting" not in data:
+        data["allow_manual_posting"] = data["posting_allowed"]
+    if "parent_account_id" in data and data["parent_account_id"] in ("", 0):
+        data["parent_account_id"] = None
+    if "collector_id" in data and data["collector_id"] in ("", 0):
+        data["collector_id"] = None
+    for f in ("is_active", "allow_manual_posting", "is_collection_account"):
+        if f in data:
+            data[f] = _bool_value(data[f])
+    if "account_code" in data:
+        data["account_code"] = str(data["account_code"] or "").strip()
+        if not data["account_code"]:
+            _unprocessable("Invalid account code", "Account code is required.")
+        duplicate = AccountingAccount.query.filter(AccountingAccount.account_code == data["account_code"], AccountingAccount.id != acct.id).first()
+        if duplicate:
+            _unprocessable("Duplicate account code", "Account code already exists.")
+    has_posted = account_has_posted_transactions(acct)
+    dangerous = {
+        "account_type": "Account type cannot be changed because this account has posted transactions.",
+        "normal_balance": "Normal balance cannot be changed because this account has posted transactions.",
+        "account_code": "Account code cannot be changed because this account has posted transactions.",
+        "is_collection_account": "Collection classification cannot be changed because this account has posted transactions.",
+        "collector_id": "Collector classification cannot be changed because this account has posted transactions.",
+    }
+    if has_posted:
+        for f, msg in dangerous.items():
             if f in data and data[f] != getattr(acct, f):
-                log_audit("PROTECTED_ACCOUNT_UPDATE_ATTEMPTED", "AccountingAccount", acct.id, user_id, {"field": f}); raise AccountingError(f"{f} cannot be changed after journal activity exists")
+                log_audit("PROTECTED_ACCOUNT_UPDATE_ATTEMPTED", "AccountingAccount", acct.id, user_id, {"field": f})
+                _unprocessable("Account structure change blocked", msg)
+        if "account_subtype" in data:
+            old_collection = account_subtype(acct) in {"COLLECTION_CLEARING", "COLLECTION_CLEARING_CONTROL"}
+            new_collection = normalize_account_value(data["account_subtype"]) in {"COLLECTION_CLEARING", "COLLECTION_CLEARING_CONTROL"}
+            if old_collection != new_collection:
+                _unprocessable("Account structure change blocked", "Collector/control classification cannot be changed because this account has posted transactions.")
     if "is_active" in data and data["is_active"] is False and account_is_mapped(acct):
         log_audit("PROTECTED_ACCOUNT_UPDATE_ATTEMPTED", "AccountingAccount", acct.id, user_id, {"field": "is_active"}); raise AccountingError("Mapped accounts cannot be deactivated")
-    if "account_subtype" in data and data["account_subtype"] != account_subtype(acct) and account_is_mapped(acct):
-        log_audit("PROTECTED_ACCOUNT_UPDATE_ATTEMPTED", "AccountingAccount", acct.id, user_id, {"field": "account_subtype"}); raise AccountingError("Mapped account subtype cannot be changed incompatibly")
-    for field in ["account_name", "description", "is_active", "allow_manual_posting", "cash_flow_category", "account_subtype", "financial_statement_group", "financial_statement_order", "cash_flow_group"]:
+    allowed = ["account_name", "account_code", "description", "account_type", "normal_balance", "is_active", "allow_manual_posting", "cash_flow_category", "account_subtype", "account_role", "parent_account_id", "collector_id", "is_collection_account", "financial_statement_group", "financial_statement_order", "cash_flow_group"]
+    old_values = {f: getattr(acct, f) for f in allowed if f in data}
+    for field in allowed:
         if field in data: setattr(acct, field, data[field])
-    log_audit("ACCOUNT_ACTIVATION_CHANGED" if "is_active" in data else "ACCOUNT_UPDATE", "AccountingAccount", acct.id, user_id, data); return acct
+    _validate_account_state(acct)
+    changed = [f for f in old_values if old_values[f] != getattr(acct, f)]
+    if changed:
+        log_audit("ACCOUNT_UPDATE", "AccountingAccount", acct.id, user_id, {"account_id": acct.id, "account_code": acct.account_code, "changed_fields": changed, "old_values": old_values, "new_values": {f: getattr(acct, f) for f in changed}})
+    return acct
+
+def _line_from_payload(raw, line_no):
+    return AccountingJournalLine(line_no=line_no, account_id=raw["account_id"], debit=money(raw.get("debit")), credit=money(raw.get("credit")), customer_id=raw.get("customer_id"), loan_id=raw.get("loan_id"), payment_id=raw.get("payment_id"), collection_id=raw.get("collection_id"), description=raw.get("description"))
+
+def create_draft_journal(journal_date, description, lines, reference_type="MANUAL_JOURNAL", reference_id=None, source_module="ACCOUNTING", created_by_id=None, idempotency_key=None):
+    if idempotency_key:
+        existing = AccountingJournalEntry.query.filter_by(idempotency_key=idempotency_key).first()
+        if existing: return existing
+    entry = AccountingJournalEntry(journal_no=generate_journal_number(journal_date), journal_date=journal_date, accounting_date=journal_date, description=description, reference_type=reference_type, reference_id=str(reference_id) if reference_id is not None else None, source_type=reference_type, source_id=int(reference_id) if str(reference_id).isdigit() else None, source_module=source_module, created_by_id=created_by_id, idempotency_key=idempotency_key, status="DRAFT")
+    db.session.add(entry); db.session.flush()
+    for i, raw in enumerate(lines, 1): entry.lines.append(_line_from_payload(raw, i))
+    validate_journal(entry)
+    return entry
+
+def validate_journal(entry):
+    if len(entry.lines) < 2: raise AccountingError("Posted journals must have at least two lines")
+    total_debit = sum((money(line.debit) for line in entry.lines), Decimal("0.00"))
+    total_credit = sum((money(line.credit) for line in entry.lines), Decimal("0.00"))
+    if total_debit != total_credit: raise AccountingError("Journal is not balanced")
+    entry.total_debit = money(total_debit); entry.total_credit = money(total_credit)
+    for line in entry.lines:
+        account = line.account or AccountingAccount.query.get(line.account_id)
+        if not is_active_account(account) or not is_posting_account(account):
+            raise AccountingError("Journal line references inactive or non-posting account")
+    return entry
+
+def post_journal(entry, user_id=None):
+    validate_journal(entry)
+    entry.status = "POSTED"
+    entry.posted_at = datetime.utcnow()
+    entry.posted_by_id = user_id
+    log_audit("JOURNAL_POST", "AccountingJournalEntry", entry.id, user_id)
+    return entry
+
+def reverse_journal(entry, journal_date=None, reason=None, user_id=None):
+    if entry.status not in {"POSTED", "REVERSED"}:
+        raise AccountingError("Only posted journals can be reversed")
+    if entry.status == "REVERSED" and entry.reversal_journals:
+        return entry.reversal_journals[0]
+    reversal = create_draft_journal(journal_date or date.today(), reason or f"Reversal of {entry.journal_no}", [
+        {"account_id": line.account_id, "debit": money(line.credit), "credit": money(line.debit), "customer_id": line.customer_id, "loan_id": line.loan_id, "payment_id": line.payment_id, "collection_id": line.collection_id, "description": line.description}
+        for line in entry.lines
+    ], "REVERSAL", entry.id, entry.source_module, user_id, f"REVERSAL:{entry.id}")
+    reversal.is_reversal = True
+    reversal.reversal_of_id = entry.id
+    reversal.reversal_of_journal_id = entry.id
+    post_journal(reversal, user_id)
+    entry.status = "REVERSED"
+    log_audit("JOURNAL_REVERSE", "AccountingJournalEntry", entry.id, user_id, {"reversal_id": reversal.id})
+    return reversal
 
 def validate_funding_account(account, method=None):
     if not account: raise AccountingError("Funding account not found")

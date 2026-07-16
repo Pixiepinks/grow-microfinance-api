@@ -29,6 +29,8 @@ from ..accounting import (
     reports_summary,
     report_csv,
     seed_default_report_classifications,
+    serialize_account,
+    ValidationError,
 )
 from .utils import role_required
 
@@ -41,6 +43,8 @@ def _uid():
 def _error(exc):
     db.session.rollback()
     current_app.logger.exception("Accounting API error")
+    if isinstance(exc, ValidationError):
+        return jsonify(exc.payload), 422
     return jsonify({"success": False, "message": str(exc), "error_code": "ACCOUNTING_ERROR"}), 400
 
 @accounting_bp.before_request
@@ -57,16 +61,7 @@ def _log_accounting_request_end(response):
     return response
 
 def _account_option(account):
-    return {
-        "id": account.id,
-        "account_code": account.account_code,
-        "account_name": account.account_name,
-        "account_type": account.account_type,
-        "account_subtype": account_subtype(account),
-        "posting_allowed": bool(account.allow_manual_posting),
-        "is_active": bool(account.is_active),
-        "account_role": account.account_role,
-    }
+    return serialize_account(account)
 
 
 @accounting_bp.route("/accounts", methods=["GET"])
@@ -93,13 +88,18 @@ def add_account():
         return jsonify({"id":acct.id,"account_code":acct.account_code}), 201
     except Exception as exc: return _error(exc)
 
-@accounting_bp.route("/accounts/<int:account_id>", methods=["PUT"])
+@accounting_bp.route("/accounts/<int:account_id>", methods=["GET"])
+@role_required(["admin"])
+def get_account(account_id):
+    return jsonify(serialize_account(AccountingAccount.query.get_or_404(account_id)))
+
+@accounting_bp.route("/accounts/<int:account_id>", methods=["PUT", "PATCH"])
 @role_required(["admin"])
 def edit_account(account_id):
     acct=AccountingAccount.query.get_or_404(account_id)
     try:
         update_account(acct, request.get_json() or {}, _uid()); db.session.commit()
-        return jsonify({"id":acct.id,"account_code":acct.account_code})
+        return jsonify(serialize_account(acct))
     except Exception as exc: return _error(exc)
 
 @accounting_bp.route("/accounts/<int:account_id>", methods=["DELETE"])
