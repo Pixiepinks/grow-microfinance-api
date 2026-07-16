@@ -32,6 +32,11 @@ from ..accounting import (
     serialize_account,
     ValidationError,
 )
+from ..investor_funding import (
+    load_investor_funding_settings,
+    serialize_investor_funding_settings,
+    update_investor_funding_settings,
+)
 from .utils import role_required
 
 accounting_bp = Blueprint("accounting", __name__, url_prefix="/admin/accounting")
@@ -119,6 +124,22 @@ def get_settings():
     settings = accounting_settings_payload()
     current_app.logger.info("Accounting settings milestone=completed configured=%s", settings.get("configured"))
     return jsonify({"settings": settings})
+
+@accounting_bp.route("/settings/investor-funding", methods=["GET"], strict_slashes=False)
+@role_required(["admin"])
+def get_investor_funding_settings():
+    settings = load_investor_funding_settings()
+    return jsonify(serialize_investor_funding_settings(settings)), 200
+
+@accounting_bp.route("/settings/investor-funding", methods=["PATCH"], strict_slashes=False)
+@role_required(["admin"])
+def patch_investor_funding_settings():
+    try:
+        settings = update_investor_funding_settings(request.get_json() or {}, _uid())
+        db.session.commit()
+        return jsonify(settings), 200
+    except Exception as exc:
+        return _error(exc)
 
 @accounting_bp.route("/settings", methods=["PUT"])
 @role_required(["admin"])
