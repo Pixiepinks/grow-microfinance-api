@@ -1,5 +1,5 @@
 from datetime import date
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, current_app, jsonify, request
 from flask_jwt_extended import get_jwt_identity
 from ..extensions import db
 from ..models import Investor, InvestorFundingAgreement, InvestorFundingTransaction, InvestorInterestAccrual
@@ -14,8 +14,17 @@ def uid():
 
 def dec(v): return float(v) if v is not None else None
 
-def inv_dict(i):
-    return {"id":i.id,"investor_number":i.investor_number,"investor_type":i.investor_type,"full_name":i.full_name,"company_name":i.company_name,"nic":i.nic,"mobile":i.mobile,"email":i.email,"address":i.address,"status":i.status,"created_at":i.created_at.isoformat() if i.created_at else None}
+def mask_bank_account(value):
+    if not value:
+        return None
+    value = str(value)
+    return "*" * max(len(value) - 4, 0) + value[-4:]
+
+
+def inv_dict(i, include_sensitive=False):
+    display_name = i.full_name if i.investor_type == "INDIVIDUAL" else (i.company_name or i.full_name)
+    data = {"id":i.id,"investor_id":i.id,"investor_number":i.investor_number,"investor_type":i.investor_type,"full_name":i.full_name,"company_name":i.company_name,"display_name":display_name,"nic":i.nic,"company_registration_number":i.company_registration_number,"tax_identification_number":i.tax_identification_number,"mobile":i.mobile,"email":i.email,"address":i.address,"bank_name":i.bank_name,"bank_branch":i.bank_branch,"bank_account_name":i.bank_account_name,"bank_account_number":i.bank_account_number if include_sensitive else mask_bank_account(i.bank_account_number),"notes":i.notes,"status":i.status,"created_at":i.created_at.isoformat() if i.created_at else None}
+    return data
 
 def agr_dict(a):
     posted = [x for x in a.interest_accruals if x.status in {"POSTED","PARTIALLY_PAID","PAID","CAPITALIZED"}]
@@ -29,30 +38,57 @@ def ac_dict(a): return {"id":a.id,"agreement_id":a.agreement_id,"period_start":a
 def error(exc):
     db.session.rollback(); code=422 if isinstance(exc,(ValidationError,AccountingError)) else 400; return jsonify(getattr(exc,"payload",{"message":str(exc)})), code
 
-@investors_bp.route("/investors", methods=["GET"])
+
+def investor_not_found():
+    return jsonify({"error":"investor_not_found","message":"The investor was not found."}), 404
+
+
+def investor_funding_not_found():
+    return jsonify({"error":"investor_funding_not_found","message":"The investor funding record was not found."}), 404
+
+@investors_bp.route("/investors", methods=["GET"], strict_slashes=False)
 @role_required(["admin"])
 def list_investors(): return jsonify({"items":[inv_dict(i) for i in Investor.query.order_by(Investor.id.desc()).all()]})
-@investors_bp.route("/investors", methods=["POST"])
+@investors_bp.route("/investors", methods=["POST"], strict_slashes=False)
 @role_required(["admin"])
 def post_investor():
-    try: i=create_investor(request.get_json() or {}, uid()); db.session.commit(); return jsonify(inv_dict(i)),201
+    payload = request.get_json(silent=True) or {}
+    current_app.logger.info(
+        "Investor request method=%s path=%s payload_keys=%s",
+        request.method,
+        request.path,
+        sorted(payload.keys()),
+    )
+    try:
+        i=create_investor(payload, uid()); db.session.commit(); return jsonify(inv_dict(i, include_sensitive=True)),201
     except Exception as e: return error(e)
-@investors_bp.route("/investors/<int:iid>", methods=["GET"])
+@investors_bp.route("/investors/<int:iid>", methods=["GET"], strict_slashes=False)
 @role_required(["admin"])
-def get_investor(iid): return jsonify(inv_dict(Investor.query.get_or_404(iid)))
+def get_investor(iid):
+    i = db.session.get(Investor, iid)
+    if not i: return investor_not_found()
+    return jsonify(inv_dict(i, include_sensitive=True))
 @investors_bp.route("/investors/<int:iid>", methods=["PATCH"])
 @role_required(["admin"])
 def patch_investor(iid):
-    i=Investor.query.get_or_404(iid); data=request.get_json() or {}
+    i=db.session.get(Investor, iid)
+    if not i: return investor_not_found()
+    data=request.get_json() or {}
     for f in ["full_name","company_name","mobile","email","address","notes","status"]:
         if f in data: setattr(i,f,data[f])
     db.session.commit(); return jsonify(inv_dict(i))
 @investors_bp.route("/investors/<int:iid>/activate", methods=["POST"])
 @role_required(["admin"])
-def activate_investor(iid): i=Investor.query.get_or_404(iid); i.status="ACTIVE"; db.session.commit(); return jsonify(inv_dict(i))
+def activate_investor(iid):
+    i=db.session.get(Investor, iid)
+    if not i: return investor_not_found()
+    i.status="ACTIVE"; db.session.commit(); return jsonify(inv_dict(i))
 @investors_bp.route("/investors/<int:iid>/deactivate", methods=["POST"])
 @role_required(["admin"])
-def deactivate_investor(iid): i=Investor.query.get_or_404(iid); i.status="INACTIVE"; db.session.commit(); return jsonify(inv_dict(i))
+def deactivate_investor(iid):
+    i=db.session.get(Investor, iid)
+    if not i: return investor_not_found()
+    i.status="INACTIVE"; db.session.commit(); return jsonify(inv_dict(i))
 
 @investors_bp.route("/investor-agreements", methods=["GET","POST"])
 @role_required(["admin"])
@@ -93,6 +129,20 @@ def repay(aid):
 @investors_bp.route("/investor-agreements/<int:aid>/transactions")
 @role_required(["admin"])
 def txs(aid): return jsonify({"items":[tx_dict(t) for t in InvestorFundingTransaction.query.filter_by(agreement_id=aid).order_by(InvestorFundingTransaction.transaction_date).all()]})
+
+@investors_bp.route("/investor-transactions/<int:tid>", methods=["GET"], strict_slashes=False)
+@role_required(["admin"])
+def get_transaction(tid):
+    tx = db.session.get(InvestorFundingTransaction, tid)
+    if not tx: return investor_funding_not_found()
+    return jsonify(tx_dict(tx))
+
+@investors_bp.route("/investor-funding/<int:tid>", methods=["GET"], strict_slashes=False)
+@role_required(["admin"])
+def get_investor_funding(tid):
+    tx = db.session.get(InvestorFundingTransaction, tid)
+    if not tx: return investor_funding_not_found()
+    return jsonify(tx_dict(tx))
 @investors_bp.route("/investor-transactions/<int:tid>/reverse", methods=["POST"])
 @role_required(["admin"])
 def reverse_tx(tid):
