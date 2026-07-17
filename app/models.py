@@ -615,6 +615,10 @@ class AccountingAccount(db.Model):
     is_system_account = db.Column(db.Boolean, nullable=False, default=False)
     is_active = db.Column(db.Boolean, nullable=False, default=True)
     allow_manual_posting = db.Column(db.Boolean, nullable=False, default=True)
+    requires_customer = db.Column(db.Boolean, nullable=False, default=False)
+    requires_loan = db.Column(db.Boolean, nullable=False, default=False)
+    allows_customer = db.Column(db.Boolean, nullable=False, default=True)
+    allows_loan = db.Column(db.Boolean, nullable=False, default=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
@@ -631,6 +635,7 @@ class AccountingJournalEntry(db.Model):
 
     id = db.Column(db.Integer, primary_key=True)
     journal_no = db.Column(db.String(40), unique=True, index=True, nullable=False)
+    reference = db.Column(db.String(120))
     journal_date = db.Column(db.Date, index=True, nullable=False)
     description = db.Column(db.Text, nullable=False)
     reference_type = db.Column(db.String(50))
@@ -645,6 +650,8 @@ class AccountingJournalEntry(db.Model):
     is_reversal = db.Column(db.Boolean, nullable=False, default=False)
     status = db.Column(db.String(20), nullable=False, default="DRAFT")
     posted_at = db.Column(db.DateTime)
+    reversed_at = db.Column(db.DateTime)
+    reversal_journal_id = db.Column(db.Integer, db.ForeignKey("accounting_journal_entries.id"))
     posted_by_id = db.Column(db.Integer, db.ForeignKey("users.id"))
     created_by_id = db.Column(db.Integer, db.ForeignKey("users.id"))
     reversal_of_id = db.Column(db.Integer, db.ForeignKey("accounting_journal_entries.id"))
@@ -658,6 +665,14 @@ class AccountingJournalEntry(db.Model):
     reversal_of = relationship("AccountingJournalEntry", remote_side=[id], foreign_keys=[reversal_of_id], backref="reversal_journals")
     created_by = relationship("User", foreign_keys=[created_by_id])
     posted_by = relationship("User", foreign_keys=[posted_by_id])
+
+    @property
+    def journal_number(self):
+        return self.journal_no
+
+    @journal_number.setter
+    def journal_number(self, value):
+        self.journal_no = value
 
 
 class PaymentAllocation(db.Model):
@@ -704,6 +719,9 @@ class AccountingJournalLine(db.Model):
     account_id = db.Column(db.Integer, db.ForeignKey("accounting_accounts.id"), nullable=False, index=True)
     debit = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
     credit = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    investor_id = db.Column(db.Integer)
+    investor_agreement_id = db.Column(db.Integer)
+    collector_id = db.Column(db.Integer, db.ForeignKey("users.id"))
     customer_id = db.Column(db.Integer, db.ForeignKey("customers.id"))
     loan_id = db.Column(db.Integer, db.ForeignKey("loans.id"))
     payment_id = db.Column(db.Integer, db.ForeignKey("payments.id"))
@@ -717,6 +735,22 @@ class AccountingJournalLine(db.Model):
     customer = relationship("Customer")
     loan = relationship("Loan")
     payment = relationship("Payment")
+
+    @property
+    def debit_amount(self):
+        return self.debit
+
+    @debit_amount.setter
+    def debit_amount(self, value):
+        self.debit = value
+
+    @property
+    def credit_amount(self):
+        return self.credit
+
+    @credit_amount.setter
+    def credit_amount(self, value):
+        self.credit = value
 
 
 class AccountingSetting(db.Model):
@@ -781,6 +815,22 @@ class CollectionDepositAllocation(db.Model):
 
     deposit_batch = relationship("CollectionDepositBatch", back_populates="allocations")
     payment = relationship("Payment")
+
+    @property
+    def debit_amount(self):
+        return self.debit
+
+    @debit_amount.setter
+    def debit_amount(self, value):
+        self.debit = value
+
+    @property
+    def credit_amount(self):
+        return self.credit
+
+    @credit_amount.setter
+    def credit_amount(self, value):
+        self.credit = value
 
 class Investor(db.Model):
     __tablename__ = "investors"
@@ -896,6 +946,8 @@ class InvestorInterestAccrual(db.Model):
     payment_journal_entry_id = db.Column(db.Integer, db.ForeignKey("accounting_journal_entries.id"))
     capitalization_journal_entry_id = db.Column(db.Integer, db.ForeignKey("accounting_journal_entries.id"))
     posted_at = db.Column(db.DateTime)
+    reversed_at = db.Column(db.DateTime)
+    reversal_journal_id = db.Column(db.Integer, db.ForeignKey("accounting_journal_entries.id"))
     reversed_at = db.Column(db.DateTime)
     reversal_journal_id = db.Column(db.Integer, db.ForeignKey("accounting_journal_entries.id"))
     created_by = db.Column(db.Integer, db.ForeignKey("users.id"))

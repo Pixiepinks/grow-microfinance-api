@@ -189,21 +189,37 @@ def list_journals():
     return jsonify({"items":[serialize_journal(e) for e in items.items],"total":items.total,"page":page,"per_page":per})
 
 @accounting_bp.route("/journals/<int:journal_id>", methods=["GET"])
+@accounting_bp.route("/journal-entries/<int:journal_id>", methods=["GET"])
 @role_required(["admin"])
 def get_journal(journal_id):
     return jsonify(serialize_journal(AccountingJournalEntry.query.get_or_404(journal_id)))
 
+def _create_manual_journal_from_request(post_now=False):
+    data=request.get_json() or {}
+    journal_date = date.fromisoformat(data["journal_date"])
+    entry=create_draft_journal(journal_date, data.get("description"), data.get("lines") or [], "MANUAL_JOURNAL", None, "ACCOUNTING", _uid(), reference=data.get("reference"))
+    if post_now or str(data.get("status", "DRAFT")).upper() == "POSTED":
+        post_journal(entry, _uid())
+    db.session.commit()
+    return jsonify(serialize_journal(entry)), 201
+
 @accounting_bp.route("/journals", methods=["POST"])
+@accounting_bp.route("/journal-entries", methods=["POST"])
 @role_required(["admin"])
 def create_journal():
-    data=request.get_json() or {}
     try:
-        entry=create_draft_journal(date.fromisoformat(data["journal_date"]), data["description"], data.get("lines") or [], "MANUAL_JOURNAL", None, "ACCOUNTING", _uid())
-        if data.get("status","DRAFT") == "POSTED": post_journal(entry, _uid())
-        db.session.commit(); return jsonify(serialize_journal(entry)), 201
+        return _create_manual_journal_from_request(False)
+    except Exception as exc: return _error(exc)
+
+@accounting_bp.route("/journal-entries/post", methods=["POST"])
+@role_required(["admin"])
+def post_manual_journal_direct():
+    try:
+        return _create_manual_journal_from_request(True)
     except Exception as exc: return _error(exc)
 
 @accounting_bp.route("/journals/<int:journal_id>/post", methods=["POST"])
+@accounting_bp.route("/journal-entries/<int:journal_id>/post", methods=["POST"])
 @role_required(["admin"])
 def post_existing_journal(journal_id):
     try:
