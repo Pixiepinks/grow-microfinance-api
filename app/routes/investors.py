@@ -149,6 +149,33 @@ def agreement_option_dict(a):
         "label": f"{a.agreement_number} — {a.agreement_name or investor_name or ''}".rstrip(),
     }
 
+def agreement_list_dict(a, accrued_interest=0):
+    investor = a.investor
+    investor_name = investor_display_name(investor) if investor else None
+    return {
+        "id": a.id,
+        "agreement_id": a.id,
+        "agreement_number": a.agreement_number,
+        "agreement_name": a.agreement_name,
+        "investor_id": a.investor_id,
+        "investor": {
+            "id": investor.id,
+            "investor_number": investor.investor_number,
+            "display_name": investor_name,
+        } if investor else None,
+        "investor_name": investor_name,
+        "start_date": a.start_date.isoformat() if a.start_date else None,
+        "maturity_date": a.maturity_date.isoformat() if a.maturity_date else None,
+        "original_principal_amount": dec(a.original_principal_amount) or 0,
+        "current_principal_balance": dec(a.current_principal_balance) or 0,
+        "interest_rate": dec(a.interest_rate) or 0,
+        "interest_rate_period": a.interest_rate_period,
+        "calculation_method": a.calculation_method,
+        "accrued_interest": dec(accrued_interest) or 0,
+        "status": normalize_status(a.status),
+    }
+
+
 def agr_dict(a):
     posted = [x for x in a.interest_accruals if x.status in {"POSTED","PARTIALLY_PAID","PAID","CAPITALIZED"}]
     unpaid = sum((x.net_interest_payable - x.payment_amount - x.capitalization_amount for x in posted), 0)
@@ -292,10 +319,91 @@ def agreement_options():
     return jsonify({"items":[agreement_option_dict(a) for a in agreements if agreement_is_fundable(a)]})
 
 
+def agreement_list_query():
+    accrued_interest_totals = (
+        db.session.query(
+            InvestorInterestAccrual.agreement_id.label("agreement_id"),
+            db.func.coalesce(
+                db.func.sum(
+                    InvestorInterestAccrual.net_interest_payable
+                    - InvestorInterestAccrual.payment_amount
+                    - InvestorInterestAccrual.capitalization_amount
+                ),
+                0,
+            ).label("accrued_interest"),
+        )
+        .filter(InvestorInterestAccrual.status.in_(["POSTED", "PARTIALLY_PAID"]))
+        .group_by(InvestorInterestAccrual.agreement_id)
+        .subquery()
+    )
+    return (
+        db.session.query(
+            InvestorFundingAgreement,
+            db.func.coalesce(accrued_interest_totals.c.accrued_interest, 0).label("accrued_interest"),
+        )
+        .outerjoin(Investor, InvestorFundingAgreement.investor_id == Investor.id)
+        .outerjoin(accrued_interest_totals, accrued_interest_totals.c.agreement_id == InvestorFundingAgreement.id)
+    )
+
+
+def list_agreements():
+    status = normalize_status(request.args.get("status") or "ALL")
+    investor_id = request.args.get("investor_id")
+    search = (request.args.get("q") or "").strip()
+    date_from = request.args.get("date_from")
+    date_to = request.args.get("date_to")
+
+    query = agreement_list_query()
+
+    if status in {"ACTIVE", "DRAFT", "CLOSED"}:
+        query = query.filter(db.func.upper(InvestorFundingAgreement.status) == status)
+    elif status != "ALL":
+        return jsonify({"error": "invalid_status", "message": "status must be ACTIVE, DRAFT, CLOSED, or ALL."}), 422
+
+    if investor_id not in (None, ""):
+        try:
+            investor_id = int(investor_id)
+        except (TypeError, ValueError):
+            return jsonify({"error": "invalid_investor_id", "message": "investor_id must be an integer."}), 422
+        query = query.filter(InvestorFundingAgreement.investor_id == investor_id)
+
+    if date_from:
+        try:
+            query = query.filter(InvestorFundingAgreement.agreement_date >= date.fromisoformat(date_from))
+        except ValueError:
+            return jsonify({"error": "invalid_date_from", "message": "date_from must be YYYY-MM-DD."}), 422
+    if date_to:
+        try:
+            query = query.filter(InvestorFundingAgreement.agreement_date <= date.fromisoformat(date_to))
+        except ValueError:
+            return jsonify({"error": "invalid_date_to", "message": "date_to must be YYYY-MM-DD."}), 422
+
+    if search:
+        pattern = f"%{search.lower()}%"
+        query = query.filter(
+            or_(
+                db.func.lower(InvestorFundingAgreement.agreement_number).like(pattern),
+                db.func.lower(InvestorFundingAgreement.agreement_name).like(pattern),
+                db.func.lower(Investor.investor_number).like(pattern),
+                db.func.lower(Investor.full_name).like(pattern),
+                db.func.lower(Investor.company_name).like(pattern),
+            )
+        )
+
+    rows = query.order_by(InvestorFundingAgreement.id.desc()).all()
+    items = [agreement_list_dict(agreement, accrued_interest) for agreement, accrued_interest in rows]
+    return jsonify({"items": items, "total": len(items)})
+
+
 @investors_bp.route("/investor-agreements", methods=["GET","POST"], strict_slashes=False)
 @role_required(["admin"])
 def agreements():
-    if request.method=="GET": return jsonify({"items":[agr_dict(a) for a in InvestorFundingAgreement.query.order_by(InvestorFundingAgreement.id.desc()).all()]})
+    if request.method=="GET":
+        try:
+            return list_agreements()
+        except Exception as exc:
+            current_app.logger.exception("Unexpected investor agreement list error", exc_info=exc)
+            return jsonify({"error": "investor_agreement_list_failed", "message": "Funding agreements could not be listed."}), 500
     payload = request.get_json(silent=True) or {}
     current_app.logger.info(
         "Investor agreement request method=%s path=%s payload_keys=%s",
