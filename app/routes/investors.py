@@ -1,5 +1,6 @@
 from datetime import date
 from flask import Blueprint, current_app, jsonify, request
+from sqlalchemy import or_
 from flask_jwt_extended import get_jwt_identity
 from ..extensions import db
 from ..models import Investor, InvestorFundingAgreement, InvestorFundingTransaction, InvestorInterestAccrual
@@ -70,6 +71,57 @@ def inv_dict(i, include_sensitive=False):
     return data
 
 
+
+def investor_summary_dict(investor, aggregates=None):
+    aggregates = aggregates or {}
+    display_name = investor_display_name(investor)
+    return {
+        "id": investor.id,
+        "investor_id": investor.id,
+        "investor_number": investor.investor_number,
+        "investor_type": investor.investor_type,
+        "full_name": investor.full_name,
+        "company_name": investor.company_name,
+        "display_name": display_name,
+        "nic": investor.nic,
+        "company_registration_number": investor.company_registration_number,
+        "mobile": investor.mobile,
+        "active_agreements": int(aggregates.get("active_agreements") or 0),
+        "principal_balance": dec(aggregates.get("principal_balance") or 0),
+        "accrued_interest": dec(aggregates.get("accrued_interest") or 0),
+        "status": normalize_investor_status(investor),
+    }
+
+
+def investor_list_aggregates():
+    active_agreement_totals = (
+        db.session.query(
+            InvestorFundingAgreement.investor_id.label("investor_id"),
+            db.func.count(InvestorFundingAgreement.id).label("active_agreements"),
+            db.func.coalesce(db.func.sum(InvestorFundingAgreement.current_principal_balance), 0).label("principal_balance"),
+        )
+        .filter(InvestorFundingAgreement.status == "ACTIVE")
+        .group_by(InvestorFundingAgreement.investor_id)
+        .subquery()
+    )
+    accrual_totals = (
+        db.session.query(
+            InvestorInterestAccrual.investor_id.label("investor_id"),
+            db.func.coalesce(
+                db.func.sum(
+                    InvestorInterestAccrual.net_interest_payable
+                    - InvestorInterestAccrual.payment_amount
+                    - InvestorInterestAccrual.capitalization_amount
+                ),
+                0,
+            ).label("accrued_interest"),
+        )
+        .filter(InvestorInterestAccrual.status.in_(["POSTED", "PARTIALLY_PAID"]))
+        .group_by(InvestorInterestAccrual.investor_id)
+        .subquery()
+    )
+    return active_agreement_totals, accrual_totals
+
 def investor_option_dict(i):
     display_name = investor_display_name(i)
     return {"id":i.id,"investor_id":i.id,"investor_number":i.investor_number,"investor_type":i.investor_type,"display_name":display_name,"full_name":i.full_name,"company_name":i.company_name,"nic":i.nic,"status":normalize_investor_status(i),"label":f"{i.investor_number} — {display_name}"}
@@ -130,8 +182,51 @@ def investor_agreement_not_found():
 @investors_bp.route("/investors", methods=["GET"], strict_slashes=False)
 @role_required(["admin"])
 def list_investors():
-    items = [inv_dict(i) for i in Investor.query.order_by(Investor.id.desc()).all()]
-    return jsonify({"items":items,"total":len(items)})
+    status = normalize_status(request.args.get("status") or "ALL")
+    search = (request.args.get("q") or "").strip()
+
+    active_agreement_totals, accrual_totals = investor_list_aggregates()
+    query = (
+        db.session.query(
+            Investor,
+            db.func.coalesce(active_agreement_totals.c.active_agreements, 0).label("active_agreements"),
+            db.func.coalesce(active_agreement_totals.c.principal_balance, 0).label("principal_balance"),
+            db.func.coalesce(accrual_totals.c.accrued_interest, 0).label("accrued_interest"),
+        )
+        .outerjoin(active_agreement_totals, active_agreement_totals.c.investor_id == Investor.id)
+        .outerjoin(accrual_totals, accrual_totals.c.investor_id == Investor.id)
+    )
+
+    if status in {"ACTIVE", "INACTIVE"}:
+        query = query.filter(db.func.upper(Investor.status) == status)
+    elif status != "ALL":
+        return jsonify({"error": "invalid_status", "message": "status must be ACTIVE, INACTIVE, or ALL."}), 422
+
+    if search:
+        pattern = f"%{search.lower()}%"
+        query = query.filter(
+            or_(
+                db.func.lower(Investor.investor_number).like(pattern),
+                db.func.lower(Investor.full_name).like(pattern),
+                db.func.lower(Investor.company_name).like(pattern),
+                db.func.lower(Investor.nic).like(pattern),
+                db.func.lower(Investor.mobile).like(pattern),
+            )
+        )
+
+    rows = query.order_by(Investor.id.desc()).all()
+    items = [
+        investor_summary_dict(
+            investor,
+            {
+                "active_agreements": active_agreements,
+                "principal_balance": principal_balance,
+                "accrued_interest": accrued_interest,
+            },
+        )
+        for investor, active_agreements, principal_balance, accrued_interest in rows
+    ]
+    return jsonify({"items": items, "total": len(items)})
 
 
 @investors_bp.route("/investors/options", methods=["GET"], strict_slashes=False)

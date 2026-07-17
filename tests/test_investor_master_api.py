@@ -1,5 +1,7 @@
 from datetime import date
 
+from datetime import timedelta
+
 from flask_jwt_extended import create_access_token
 
 from app.extensions import db
@@ -102,7 +104,7 @@ def test_unknown_funding_transaction_uses_funding_message(app, client):
     }
 
 
-def test_list_masks_bank_account_number(app, client):
+def test_list_investors_returns_compact_summary_without_bank_details(app, client):
     admin = _admin()
     headers = _headers(app, admin)
     client.post("/admin/investors", headers=headers, json=_payload())
@@ -110,7 +112,12 @@ def test_list_masks_bank_account_number(app, client):
     resp = client.get("/admin/investors", headers=headers)
 
     assert resp.status_code == 200
-    assert resp.get_json()["items"][0]["bank_account_number"] == "***8235"
+    item = resp.get_json()["items"][0]
+    assert item["investor_number"] == "GROW-INV-000001"
+    assert item["active_agreements"] == 0
+    assert item["principal_balance"] == 0
+    assert item["accrued_interest"] == 0
+    assert "bank_account_number" not in item
 
 
 def test_generate_investor_number_continues_after_existing_highest(app):
@@ -226,6 +233,92 @@ def test_list_investors_includes_total_and_normalized_contract(app, client):
     for field in ["id", "investor_id", "investor_number", "investor_type", "display_name", "full_name", "company_name", "nic", "mobile", "status"]:
         assert field in item
     assert item["id"] == created["id"]
+
+
+def test_list_investors_includes_investor_without_agreement(app, client):
+    admin = _admin()
+    headers = _headers(app, admin)
+    created = client.post("/admin/investors", headers=headers, json=_payload()).get_json()
+
+    body = client.get("/admin/investors", headers=headers).get_json()
+
+    assert body["total"] == 1
+    assert body["items"][0]["id"] == created["id"]
+    assert body["items"][0]["active_agreements"] == 0
+
+
+def test_list_investors_includes_zero_principal_investor(app, client):
+    admin = _admin()
+    headers = _headers(app, admin)
+    _seed_investor_agreement_dependencies()
+    investor = client.post("/admin/investors", headers=headers, json=_payload()).get_json()
+    _create_active_agreement(client, headers, investor["id"], original_principal_amount=0)
+
+    items = client.get("/admin/investors", headers=headers).get_json()["items"]
+
+    assert items[0]["investor_id"] == investor["id"]
+    assert items[0]["principal_balance"] == 0
+
+
+def test_list_investors_includes_active_agreement_count(app, client):
+    admin = _admin()
+    headers = _headers(app, admin)
+    _seed_investor_agreement_dependencies()
+    investor = client.post("/admin/investors", headers=headers, json=_payload()).get_json()
+    _create_active_agreement(client, headers, investor["id"])
+
+    item = client.get("/admin/investors", headers=headers).get_json()["items"][0]
+
+    assert item["active_agreements"] == 1
+
+
+def test_list_investors_defaults_to_all_statuses(app, client):
+    admin = _admin()
+    headers = _headers(app, admin)
+    client.post("/admin/investors", headers=headers, json=_payload(nic="1", email="active@example.com"))
+    client.post("/admin/investors", headers=headers, json=_payload(nic="2", email="inactive@example.com", status="INACTIVE"))
+
+    items = client.get("/admin/investors", headers=headers).get_json()["items"]
+
+    assert {item["status"] for item in items} == {"ACTIVE", "INACTIVE"}
+
+
+def test_list_investors_filters_active_status(app, client):
+    admin = _admin()
+    headers = _headers(app, admin)
+    active = client.post("/admin/investors", headers=headers, json=_payload(nic="1", email="active@example.com")).get_json()
+    client.post("/admin/investors", headers=headers, json=_payload(nic="2", email="inactive@example.com", status="INACTIVE"))
+
+    items = client.get("/admin/investors?status=ACTIVE", headers=headers).get_json()["items"]
+
+    assert [item["id"] for item in items] == [active["id"]]
+    assert all(item["status"] == "ACTIVE" for item in items)
+
+
+def test_list_investors_searches_by_investor_number(app, client):
+    admin = _admin()
+    headers = _headers(app, admin)
+    created = client.post("/admin/investors", headers=headers, json=_payload()).get_json()
+
+    items = client.get("/admin/investors?q=grow-inv-000001", headers=headers).get_json()["items"]
+
+    assert [item["id"] for item in items] == [created["id"]]
+
+
+def test_list_investors_expired_token_returns_401_json(app, client):
+    admin = _admin()
+    with app.app_context():
+        token = create_access_token(
+            identity=str(admin.id),
+            additional_claims={"role": admin.role},
+            expires_delta=timedelta(seconds=-1),
+        )
+
+    resp = client.get("/admin/investors", headers={"Authorization": f"Bearer {token}"})
+
+    assert resp.status_code == 401
+    assert resp.is_json
+    assert "items" not in resp.get_json()
 
 
 def test_agreement_create_resolves_active_investor_by_investor_id(app, client):
