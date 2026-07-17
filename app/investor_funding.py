@@ -419,14 +419,29 @@ def _post_two_line(date_, desc, debit_account_id, credit_account_id, amount, ref
 
 
 def record_funding(agreement_id, data, user_id=None, transaction_type=None):
+    data = data or {}
     agr = InvestorFundingAgreement.query.get(agreement_id)
-    if not agr: raise ValidationError("Agreement not found")
-    amount = money(data.get("amount")); tx_date = date.fromisoformat(data["transaction_date"]); require_open_accounting_period(tx_date)
-    if amount <= 0 or tx_date < agr.start_date: raise ValidationError("Invalid funding transaction")
-    if agr.status not in {"DRAFT", "ACTIVE"}: raise ValidationError("Agreement is not fundable")
+    if not agr:
+        raise ValidationError("agreement_not_found", message="Agreement not found", status_code=404)
+    if str(agr.status or "").strip().upper() != "ACTIVE":
+        raise ValidationError("agreement_not_fundable", message="Agreement is not active.")
+    investor = _validate_agreement_investor(agr.investor_id)
+    supplied_investor_id = data.get("investor_id")
+    if supplied_investor_id not in (None, "") and int(supplied_investor_id) != agr.investor_id:
+        raise ValidationError("investor_mismatch", message="Selected investor does not match the agreement.")
+    amount = money(data.get("amount"))
+    if amount <= 0:
+        raise ValidationError("invalid_funding_amount", message="Funding amount must be greater than zero.")
+    tx_date = date.fromisoformat(data["transaction_date"])
+    require_open_accounting_period(tx_date)
+    if tx_date < agr.start_date:
+        raise ValidationError("invalid_funding_date", message="Funding date cannot be before the agreement start date.")
+    if money(agr.current_principal_balance) > 0 and not agr.allow_additional_funding:
+        raise ValidationError("additional_funding_not_allowed", message="Additional funding is not allowed for this agreement.")
     bank_id = int(data.get("bank_account_id") or agr.funding_account_id)
+    _validate_account(bank_id, "bank_account_id", "ASSET", allowed_subtypes={"BANK", "CASH"})
     ttype = transaction_type or ("INITIAL_FUNDING" if money(agr.current_principal_balance) == 0 else "ADDITIONAL_FUNDING")
-    tx = InvestorFundingTransaction(transaction_number=generate_transaction_number(tx_date), investor_id=agr.investor_id, agreement_id=agr.id, transaction_type=ttype, transaction_date=tx_date, accounting_date=tx_date, amount=amount, bank_account_id=bank_id, reference=data.get("reference"), remarks=data.get("remarks"), status="POSTED", created_by=user_id)
+    tx = InvestorFundingTransaction(transaction_number=generate_transaction_number(tx_date), investor_id=investor.id, agreement_id=agr.id, transaction_type=ttype, transaction_date=tx_date, accounting_date=tx_date, amount=amount, bank_account_id=bank_id, reference=data.get("reference"), remarks=data.get("remarks"), status="POSTED", created_by=user_id)
     db.session.add(tx); db.session.flush()
     journal = _post_two_line(tx_date, f"Investor funding – {agr.agreement_number}", bank_id, agr.investor_liability_account_id, amount, "INVESTOR_FUNDING", tx.id, user_id, f"INVESTOR_FUNDING:{tx.id}")
     tx.journal_entry_id = journal.id; agr.current_principal_balance = money(agr.current_principal_balance) + amount; agr.original_principal_amount = money(agr.original_principal_amount) + amount

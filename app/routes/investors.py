@@ -21,8 +21,12 @@ def mask_bank_account(value):
     return "*" * max(len(value) - 4, 0) + value[-4:]
 
 
+def normalize_status(value):
+    return str(value or "").strip().upper()
+
+
 def normalize_investor_status(investor):
-    return str(investor.status or "").strip().upper()
+    return normalize_status(investor.status)
 
 
 def investor_display_name(investor):
@@ -38,7 +42,26 @@ def investor_display_name(investor):
 
 
 def investor_is_active(investor):
-    return normalize_investor_status(investor) == "ACTIVE"
+    if normalize_investor_status(investor) != "ACTIVE":
+        return False
+    if getattr(investor, "deleted_at", None) is not None:
+        return False
+    if getattr(investor, "is_deleted", False):
+        return False
+    if getattr(investor, "suspended_at", None) is not None:
+        return False
+    return True
+
+
+def agreement_is_fundable(agreement):
+    if normalize_status(agreement.status) != "ACTIVE":
+        return False
+    if not agreement.investor or not investor_is_active(agreement.investor):
+        return False
+    principal = float(agreement.current_principal_balance or 0)
+    if principal > 0 and not agreement.allow_additional_funding:
+        return False
+    return True
 
 
 def inv_dict(i, include_sensitive=False):
@@ -50,6 +73,29 @@ def inv_dict(i, include_sensitive=False):
 def investor_option_dict(i):
     display_name = investor_display_name(i)
     return {"id":i.id,"investor_id":i.id,"investor_number":i.investor_number,"investor_type":i.investor_type,"display_name":display_name,"full_name":i.full_name,"company_name":i.company_name,"nic":i.nic,"status":normalize_investor_status(i),"label":f"{i.investor_number} — {display_name}"}
+
+
+def agreement_option_dict(a):
+    investor = a.investor
+    investor_name = investor_display_name(investor) if investor else None
+    return {
+        "id": a.id,
+        "agreement_id": a.id,
+        "agreement_number": a.agreement_number,
+        "agreement_name": a.agreement_name,
+        "investor_id": a.investor_id,
+        "investor_number": investor.investor_number if investor else None,
+        "investor_name": investor_name,
+        "status": normalize_status(a.status),
+        "start_date": a.start_date.isoformat() if a.start_date else None,
+        "maturity_date": a.maturity_date.isoformat() if a.maturity_date else None,
+        "original_principal_amount": dec(a.original_principal_amount),
+        "current_principal_balance": dec(a.current_principal_balance),
+        "allow_additional_funding": bool(a.allow_additional_funding),
+        "funding_account_id": a.funding_account_id,
+        "investor_liability_account_id": a.investor_liability_account_id,
+        "label": f"{a.agreement_number} — {a.agreement_name or investor_name or ''}".rstrip(),
+    }
 
 def agr_dict(a):
     posted = [x for x in a.interest_accruals if x.status in {"POSTED","PARTIALLY_PAID","PAID","CAPITALIZED"}]
@@ -135,6 +181,21 @@ def deactivate_investor(iid):
     i=db.session.get(Investor, iid)
     if not i: return investor_not_found()
     i.status="INACTIVE"; db.session.commit(); return jsonify(inv_dict(i))
+
+@investors_bp.route("/investor-agreements/options", methods=["GET"], strict_slashes=False)
+@role_required(["admin"])
+def agreement_options():
+    investor_id = request.args.get("investor_id")
+    query = InvestorFundingAgreement.query.join(Investor)
+    if investor_id not in (None, ""):
+        try:
+            investor_id = int(investor_id)
+        except (TypeError, ValueError):
+            return jsonify({"error":"invalid_investor_id","message":"investor_id must be an integer."}), 422
+        query = query.filter(InvestorFundingAgreement.investor_id == investor_id)
+    agreements = query.order_by(InvestorFundingAgreement.agreement_number.asc(), InvestorFundingAgreement.id.asc()).all()
+    return jsonify({"items":[agreement_option_dict(a) for a in agreements if agreement_is_fundable(a)]})
+
 
 @investors_bp.route("/investor-agreements", methods=["GET","POST"], strict_slashes=False)
 @role_required(["admin"])
