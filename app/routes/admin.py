@@ -1236,3 +1236,37 @@ def collector_options():
         if acct and acct.is_active and acct.allow_manual_posting and acct.is_collection_account and account_subtype(acct) == "COLLECTION_CLEARING" and acct.collector_id == user.id:
             items.append({"collector_id": user.id, "collector_name": user.name, "collection_account_id": acct.id, "collection_account_code": acct.account_code, "collection_account_name": acct.account_name})
     return jsonify({"items": items})
+
+@admin_bp.route("/customers/options", methods=["GET"])
+@role_required(["admin"])
+def customer_options():
+    include_inactive = str(request.args.get("include_inactive", "false")).lower() in ("1", "true", "yes", "on")
+    query = Customer.query
+    if not include_inactive:
+        query = query.filter(Customer.status.in_(["Active", "ACTIVE", "active"]))
+    if request.args.get("search"):
+        s = f"%{request.args['search']}%"
+        query = query.filter((Customer.customer_code.ilike(s)) | (Customer.full_name.ilike(s)) | (Customer.nic_number.ilike(s)) | (Customer.mobile.ilike(s)))
+    items = []
+    for c in query.order_by(Customer.customer_code.asc()).limit(100).all():
+        label = f"{c.customer_code} — {c.full_name}"
+        items.append({"id": c.id, "customer_number": c.customer_code, "display_name": c.full_name, "nic": c.nic_number, "mobile": c.mobile, "label": label})
+    return jsonify({"items": items})
+
+@admin_bp.route("/loans/options", methods=["GET"])
+@role_required(["admin"])
+def loan_options():
+    query = Loan.query.options(joinedload(Loan.customer))
+    if request.args.get("customer_id"):
+        query = query.filter(Loan.customer_id == int(request.args["customer_id"]))
+    if request.args.get("status"):
+        status = request.args["status"]
+        query = query.filter(Loan.status.in_([status, status.upper(), status.title()]))
+    if request.args.get("search"):
+        s = f"%{request.args['search']}%"
+        query = query.join(Customer).filter((Loan.loan_number.ilike(s)) | (Customer.full_name.ilike(s)) | (Customer.customer_code.ilike(s)))
+    items = []
+    for l in query.order_by(Loan.loan_number.asc()).limit(100).all():
+        customer_name = l.customer.full_name if l.customer else None
+        items.append({"id": l.id, "loan_number": l.loan_number, "customer_id": l.customer_id, "customer_name": customer_name, "status": l.status, "principal_amount": float(l.principal_amount or 0), "outstanding_amount": float(l.outstanding), "label": f"{l.loan_number} — {customer_name or ''}"})
+    return jsonify({"items": items})

@@ -294,13 +294,14 @@ def resolve_system_account(key):
 
 def generate_journal_number(journal_date):
     prefix = f"GROW-JV-{journal_date:%Y%m%d}-"
-    try:
-        db.session.execute(text("select pg_advisory_xact_lock(hashtext(:p))"), {"p": prefix})
-    except Exception:
-        pass
-    last = db.session.query(func.max(AccountingJournalEntry.journal_no)).filter(AccountingJournalEntry.journal_no.like(prefix + "%")).scalar()
-    next_no = int(last.rsplit("-", 1)[1]) + 1 if last else 1
-    return f"{prefix}{next_no:04d}"
+    if db.session.bind and db.session.bind.dialect.name == "postgresql":
+        seq_name = "accounting_journal_number_seq"
+        db.session.execute(text(f"create sequence if not exists {seq_name}"))
+        next_no = db.session.execute(text(f"select nextval('{seq_name}')")).scalar()
+    else:
+        # Test/development fallback for engines without sequences; production PostgreSQL uses the sequence above.
+        next_no = (AccountingJournalEntry.query.count() or 0) + 1
+    return f"{prefix}{int(next_no):04d}"
 
 def create_account(data, user_id=None):
     typ = data.get("account_type")
@@ -367,7 +368,7 @@ def update_account(acct, data, user_id=None):
         data["parent_account_id"] = None
     if "collector_id" in data and data["collector_id"] in ("", 0):
         data["collector_id"] = None
-    for f in ("is_active", "allow_manual_posting", "is_collection_account"):
+    for f in ("is_active", "allow_manual_posting", "is_collection_account", "requires_customer", "requires_loan", "allows_customer", "allows_loan"):
         if f in data:
             data[f] = _bool_value(data[f])
     if "account_code" in data:
@@ -397,7 +398,7 @@ def update_account(acct, data, user_id=None):
                 _unprocessable("Account structure change blocked", "Collector/control classification cannot be changed because this account has posted transactions.")
     if "is_active" in data and data["is_active"] is False and account_is_mapped(acct):
         log_audit("PROTECTED_ACCOUNT_UPDATE_ATTEMPTED", "AccountingAccount", acct.id, user_id, {"field": "is_active"}); raise AccountingError("Mapped accounts cannot be deactivated")
-    allowed = ["account_name", "account_code", "description", "account_type", "normal_balance", "is_active", "allow_manual_posting", "cash_flow_category", "account_subtype", "account_role", "parent_account_id", "collector_id", "is_collection_account", "financial_statement_group", "financial_statement_order", "cash_flow_group"]
+    allowed = ["account_name", "account_code", "description", "account_type", "normal_balance", "is_active", "allow_manual_posting", "requires_customer", "requires_loan", "allows_customer", "allows_loan", "cash_flow_category", "account_subtype", "account_role", "parent_account_id", "collector_id", "is_collection_account", "financial_statement_group", "financial_statement_order", "cash_flow_group"]
     old_values = {f: getattr(acct, f) for f in allowed if f in data}
     for field in allowed:
         if field in data: setattr(acct, field, data[field])
@@ -408,36 +409,62 @@ def update_account(acct, data, user_id=None):
     return acct
 
 def _line_from_payload(raw, line_no):
-    return AccountingJournalLine(line_no=line_no, account_id=raw["account_id"], debit=money(raw.get("debit")), credit=money(raw.get("credit")), customer_id=raw.get("customer_id"), loan_id=raw.get("loan_id"), payment_id=raw.get("payment_id"), collection_id=raw.get("collection_id"), description=raw.get("description"))
+    debit = money(raw.get("debit", raw.get("debit_amount")))
+    credit = money(raw.get("credit", raw.get("credit_amount")))
+    return AccountingJournalLine(line_no=line_no, account_id=raw.get("account_id"), debit=debit, credit=credit, customer_id=raw.get("customer_id"), loan_id=raw.get("loan_id"), payment_id=raw.get("payment_id"), collection_id=raw.get("collection_id"), description=raw.get("description"), investor_id=raw.get("investor_id"), investor_agreement_id=raw.get("investor_agreement_id"), collector_id=raw.get("collector_id"))
 
-def create_draft_journal(journal_date, description, lines, reference_type="MANUAL_JOURNAL", reference_id=None, source_module="ACCOUNTING", created_by_id=None, idempotency_key=None):
+def create_draft_journal(journal_date, description, lines, reference_type="MANUAL_JOURNAL", reference_id=None, source_module="ACCOUNTING", created_by_id=None, idempotency_key=None, reference=None):
     if idempotency_key:
         existing = AccountingJournalEntry.query.filter_by(idempotency_key=idempotency_key).first()
         if existing: return existing
-    entry = AccountingJournalEntry(journal_no=generate_journal_number(journal_date), journal_date=journal_date, accounting_date=journal_date, description=description, reference_type=reference_type, reference_id=str(reference_id) if reference_id is not None else None, source_type=reference_type, source_id=int(reference_id) if str(reference_id).isdigit() else None, source_module=source_module, created_by_id=created_by_id, idempotency_key=idempotency_key, status="DRAFT")
+    if not journal_date:
+        raise ValidationError("journal_date_required", field="journal_date", message="Journal date is required.")
+    if not (description or reference):
+        raise ValidationError("journal_reference_required", field="description", message="Reference or description is required.")
+    entry = AccountingJournalEntry(journal_no=generate_journal_number(journal_date), journal_date=journal_date, accounting_date=journal_date, description=description or reference or "Manual journal", reference=reference, reference_type=reference_type, reference_id=str(reference_id) if reference_id is not None else None, source_type=reference_type, source_id=int(reference_id) if reference_id is not None and str(reference_id).isdigit() else None, source_module=source_module, created_by_id=created_by_id, idempotency_key=idempotency_key, status="DRAFT")
     db.session.add(entry); db.session.flush()
-    for i, raw in enumerate(lines, 1): entry.lines.append(_line_from_payload(raw, i))
+    for i, raw in enumerate(lines or [], 1): entry.lines.append(_line_from_payload(raw, i))
     validate_journal(entry)
+    log_audit("JOURNAL_DRAFT_CREATED", "AccountingJournalEntry", entry.id, created_by_id, {"journal_no": entry.journal_no, "total_debit": str(entry.total_debit), "total_credit": str(entry.total_credit)})
     return entry
 
 def validate_journal(entry):
-    if len(entry.lines) < 2: raise AccountingError("Posted journals must have at least two lines")
+    if len(entry.lines) < 2: raise ValidationError("journal_lines_required", field="lines", message="At least two journal lines are required.")
     total_debit = sum((money(line.debit) for line in entry.lines), Decimal("0.00"))
     total_credit = sum((money(line.credit) for line in entry.lines), Decimal("0.00"))
-    if total_debit != total_credit: raise AccountingError("Journal is not balanced")
+    if total_debit <= 0 or total_credit <= 0 or abs(total_debit - total_credit) > CENT:
+        raise ValidationError("journal_not_balanced", message="Total debit must equal total credit.", total_debit=float(total_debit), total_credit=float(total_credit), difference=float(abs(total_debit-total_credit)))
+    require_open_accounting_period(entry.accounting_date or entry.journal_date)
     entry.total_debit = money(total_debit); entry.total_credit = money(total_credit)
+    has_debit = has_credit = False
     for line in entry.lines:
+        line.debit = money(line.debit); line.credit = money(line.credit)
+        if line.debit > 0 and line.credit > 0: raise ValidationError("invalid_journal_line", line_no=line.line_no, message="Debit and credit cannot both be positive on one line.")
+        if line.debit <= 0 and line.credit <= 0: raise ValidationError("blank_journal_line", line_no=line.line_no, message="Zero-value journal lines cannot be posted.")
+        has_debit = has_debit or line.debit > 0; has_credit = has_credit or line.credit > 0
         account = line.account or AccountingAccount.query.get(line.account_id)
-        if not is_active_account(account) or not is_posting_account(account):
-            raise AccountingError("Journal line references inactive or non-posting account")
+        if not is_active_account(account) or not is_posting_account(account): raise ValidationError("invalid_account", line_no=line.line_no, message="The selected account is not available for posting.")
+        if getattr(account, "requires_customer", False) and not line.customer_id: raise ValidationError("customer_required", line_no=line.line_no, field="customer_id", message="Customer is required for the selected account.")
+        if getattr(account, "requires_loan", False) and not line.loan_id: raise ValidationError("loan_required", line_no=line.line_no, field="loan_id", message="Loan is required for the selected account.")
+        if not getattr(account, "allows_customer", True) and line.customer_id: raise ValidationError("customer_not_allowed", line_no=line.line_no, field="customer_id", message="Customer is not allowed for the selected account.")
+        if not getattr(account, "allows_loan", True) and line.loan_id: raise ValidationError("loan_not_allowed", line_no=line.line_no, field="loan_id", message="Loan is not allowed for the selected account.")
+        if line.customer_id and not Customer.query.get(line.customer_id): raise ValidationError("invalid_customer", line_no=line.line_no, field="customer_id", message="The selected customer does not exist.")
+        if line.loan_id:
+            loan = Loan.query.get(line.loan_id)
+            if not loan: raise ValidationError("invalid_loan", line_no=line.line_no, field="loan_id", message="The selected loan does not exist.")
+            if line.customer_id is None: line.customer_id = loan.customer_id
+            elif int(line.customer_id) != int(loan.customer_id): raise ValidationError("loan_customer_mismatch", line_no=line.line_no, message="The selected loan does not belong to the selected customer.")
+    if not has_debit or not has_credit: raise ValidationError("journal_not_balanced", message="Journal must include at least one debit and one credit line.")
     return entry
 
 def post_journal(entry, user_id=None):
+    if entry.status == "POSTED": return entry
+    if entry.status not in {"DRAFT", "POSTED"}: raise ValidationError("journal_not_postable", message="Only draft journals can be posted.")
     validate_journal(entry)
     entry.status = "POSTED"
     entry.posted_at = datetime.utcnow()
     entry.posted_by_id = user_id
-    log_audit("JOURNAL_POST", "AccountingJournalEntry", entry.id, user_id)
+    log_audit("JOURNAL_POST", "AccountingJournalEntry", entry.id, user_id, {"journal_no": entry.journal_no, "total_debit": str(entry.total_debit), "total_credit": str(entry.total_credit)})
     return entry
 
 def reverse_journal(entry, journal_date=None, reason=None, user_id=None):
@@ -454,7 +481,9 @@ def reverse_journal(entry, journal_date=None, reason=None, user_id=None):
     reversal.reversal_of_journal_id = entry.id
     post_journal(reversal, user_id)
     entry.status = "REVERSED"
-    log_audit("JOURNAL_REVERSE", "AccountingJournalEntry", entry.id, user_id, {"reversal_id": reversal.id})
+    entry.reversed_at = datetime.utcnow()
+    entry.reversal_journal_id = reversal.id
+    log_audit("JOURNAL_REVERSE", "AccountingJournalEntry", entry.id, user_id, {"reversal_id": reversal.id, "journal_no": entry.journal_no, "reason": reason})
     return reversal
 
 def validate_funding_account(account, *_args):
@@ -509,7 +538,7 @@ def post_loan_payment(payment, user_id=None, receipt_account=None):
     return post_journal(create_draft_journal(payment.collection_date, "Loan payment", lines, "LOAN_PAYMENT", payment.id, "PAYMENTS", user_id, f"LOAN_PAYMENT:{payment.id}"), user_id)
 
 def serialize_journal(entry):
-    return {"id": entry.id, "journal_no": entry.journal_no, "journal_date": entry.journal_date.isoformat(), "description": entry.description, "reference_type": entry.reference_type, "reference_id": entry.reference_id, "status": entry.status, "total_debit": f"{money(entry.total_debit):.2f}", "total_credit": f"{money(entry.total_credit):.2f}", "lines": [{"id": l.id, "line_no": l.line_no, "account_id": l.account_id, "account_code": l.account.account_code, "account_name": l.account.account_name, "debit": f"{money(l.debit):.2f}", "credit": f"{money(l.credit):.2f}", "customer_id": l.customer_id, "loan_id": l.loan_id, "payment_id": l.payment_id, "description": l.description} for l in entry.lines]}
+    return {"id": entry.id, "journal_no": entry.journal_no, "journal_number": entry.journal_no, "journal_date": entry.journal_date.isoformat(), "accounting_date": entry.accounting_date.isoformat() if entry.accounting_date else None, "reference": getattr(entry, "reference", None), "description": entry.description, "reference_type": entry.reference_type, "reference_id": entry.reference_id, "status": entry.status, "total_debit": f"{money(entry.total_debit):.2f}", "total_credit": f"{money(entry.total_credit):.2f}", "lines": [{"id": l.id, "line_no": l.line_no, "account_id": l.account_id, "account_code": l.account.account_code, "account_name": l.account.account_name, "debit": f"{money(l.debit):.2f}", "credit": f"{money(l.credit):.2f}", "customer_id": l.customer_id, "loan_id": l.loan_id, "payment_id": l.payment_id, "description": l.description} for l in entry.lines]}
 
 def _blank_to_none(value):
     if value is None:
@@ -711,6 +740,10 @@ def serialize_account(account):
         "account_role": account.account_role,
         "posting_allowed": bool(account.allow_manual_posting),
         "allow_manual_posting": bool(account.allow_manual_posting),
+        "requires_customer": bool(getattr(account, "requires_customer", False)),
+        "requires_loan": bool(getattr(account, "requires_loan", False)),
+        "allows_customer": bool(getattr(account, "allows_customer", True)),
+        "allows_loan": bool(getattr(account, "allows_loan", True)),
         "is_active": bool(account.is_active),
         "is_system_account": bool(account.is_system_account),
         "is_collection_account": bool(account.is_collection_account),
@@ -825,7 +858,7 @@ def create_account(data, user_id=None):
     typ = data.get("account_type"); normal = data.get("normal_balance"); subtype = data.get("account_subtype", "OTHER")
     if typ not in ACCOUNT_TYPES or normal not in NORMAL_BALANCES or subtype not in ACCOUNT_SUBTYPES:
         raise AccountingError("Invalid account type, normal balance, or subtype")
-    acct = AccountingAccount(account_code=data["account_code"], account_name=data["account_name"], account_type=typ, normal_balance=normal, parent_id=data.get("parent_id"), description=data.get("description"), is_active=data.get("is_active", True), allow_manual_posting=data.get("allow_manual_posting", True), cash_flow_category=data.get("cash_flow_category", subtype if subtype in ("CASH", "BANK") else "NONE"), account_subtype=subtype, financial_statement_group=data.get("financial_statement_group"), financial_statement_order=data.get("financial_statement_order"), cash_flow_group=data.get("cash_flow_group"))
+    acct = AccountingAccount(account_code=data["account_code"], account_name=data["account_name"], account_type=typ, normal_balance=normal, parent_id=data.get("parent_id"), description=data.get("description"), is_active=data.get("is_active", True), allow_manual_posting=data.get("allow_manual_posting", True), requires_customer=data.get("requires_customer", False), requires_loan=data.get("requires_loan", False), allows_customer=data.get("allows_customer", True), allows_loan=data.get("allows_loan", True), cash_flow_category=data.get("cash_flow_category", subtype if subtype in ("CASH", "BANK") else "NONE"), account_subtype=subtype, financial_statement_group=data.get("financial_statement_group"), financial_statement_order=data.get("financial_statement_order"), cash_flow_group=data.get("cash_flow_group"))
     db.session.add(acct); db.session.flush(); log_audit("ACCOUNT_CREATE", "AccountingAccount", acct.id, user_id); return acct
 
 def update_account(acct, data, user_id=None):
@@ -838,7 +871,7 @@ def update_account(acct, data, user_id=None):
         data["parent_account_id"] = None
     if "collector_id" in data and data["collector_id"] in ("", 0):
         data["collector_id"] = None
-    for f in ("is_active", "allow_manual_posting", "is_collection_account"):
+    for f in ("is_active", "allow_manual_posting", "is_collection_account", "requires_customer", "requires_loan", "allows_customer", "allows_loan"):
         if f in data:
             data[f] = _bool_value(data[f])
     if "account_code" in data:
@@ -868,7 +901,7 @@ def update_account(acct, data, user_id=None):
                 _unprocessable("Account structure change blocked", "Collector/control classification cannot be changed because this account has posted transactions.")
     if "is_active" in data and data["is_active"] is False and account_is_mapped(acct):
         log_audit("PROTECTED_ACCOUNT_UPDATE_ATTEMPTED", "AccountingAccount", acct.id, user_id, {"field": "is_active"}); raise AccountingError("Mapped accounts cannot be deactivated")
-    allowed = ["account_name", "account_code", "description", "account_type", "normal_balance", "is_active", "allow_manual_posting", "cash_flow_category", "account_subtype", "account_role", "parent_account_id", "collector_id", "is_collection_account", "financial_statement_group", "financial_statement_order", "cash_flow_group"]
+    allowed = ["account_name", "account_code", "description", "account_type", "normal_balance", "is_active", "allow_manual_posting", "requires_customer", "requires_loan", "allows_customer", "allows_loan", "cash_flow_category", "account_subtype", "account_role", "parent_account_id", "collector_id", "is_collection_account", "financial_statement_group", "financial_statement_order", "cash_flow_group"]
     old_values = {f: getattr(acct, f) for f in allowed if f in data}
     for field in allowed:
         if field in data: setattr(acct, field, data[field])
@@ -879,36 +912,62 @@ def update_account(acct, data, user_id=None):
     return acct
 
 def _line_from_payload(raw, line_no):
-    return AccountingJournalLine(line_no=line_no, account_id=raw["account_id"], debit=money(raw.get("debit")), credit=money(raw.get("credit")), customer_id=raw.get("customer_id"), loan_id=raw.get("loan_id"), payment_id=raw.get("payment_id"), collection_id=raw.get("collection_id"), description=raw.get("description"))
+    debit = money(raw.get("debit", raw.get("debit_amount")))
+    credit = money(raw.get("credit", raw.get("credit_amount")))
+    return AccountingJournalLine(line_no=line_no, account_id=raw.get("account_id"), debit=debit, credit=credit, customer_id=raw.get("customer_id"), loan_id=raw.get("loan_id"), payment_id=raw.get("payment_id"), collection_id=raw.get("collection_id"), description=raw.get("description"), investor_id=raw.get("investor_id"), investor_agreement_id=raw.get("investor_agreement_id"), collector_id=raw.get("collector_id"))
 
-def create_draft_journal(journal_date, description, lines, reference_type="MANUAL_JOURNAL", reference_id=None, source_module="ACCOUNTING", created_by_id=None, idempotency_key=None):
+def create_draft_journal(journal_date, description, lines, reference_type="MANUAL_JOURNAL", reference_id=None, source_module="ACCOUNTING", created_by_id=None, idempotency_key=None, reference=None):
     if idempotency_key:
         existing = AccountingJournalEntry.query.filter_by(idempotency_key=idempotency_key).first()
         if existing: return existing
-    entry = AccountingJournalEntry(journal_no=generate_journal_number(journal_date), journal_date=journal_date, accounting_date=journal_date, description=description, reference_type=reference_type, reference_id=str(reference_id) if reference_id is not None else None, source_type=reference_type, source_id=int(reference_id) if str(reference_id).isdigit() else None, source_module=source_module, created_by_id=created_by_id, idempotency_key=idempotency_key, status="DRAFT")
+    if not journal_date:
+        raise ValidationError("journal_date_required", field="journal_date", message="Journal date is required.")
+    if not (description or reference):
+        raise ValidationError("journal_reference_required", field="description", message="Reference or description is required.")
+    entry = AccountingJournalEntry(journal_no=generate_journal_number(journal_date), journal_date=journal_date, accounting_date=journal_date, description=description or reference or "Manual journal", reference=reference, reference_type=reference_type, reference_id=str(reference_id) if reference_id is not None else None, source_type=reference_type, source_id=int(reference_id) if reference_id is not None and str(reference_id).isdigit() else None, source_module=source_module, created_by_id=created_by_id, idempotency_key=idempotency_key, status="DRAFT")
     db.session.add(entry); db.session.flush()
-    for i, raw in enumerate(lines, 1): entry.lines.append(_line_from_payload(raw, i))
+    for i, raw in enumerate(lines or [], 1): entry.lines.append(_line_from_payload(raw, i))
     validate_journal(entry)
+    log_audit("JOURNAL_DRAFT_CREATED", "AccountingJournalEntry", entry.id, created_by_id, {"journal_no": entry.journal_no, "total_debit": str(entry.total_debit), "total_credit": str(entry.total_credit)})
     return entry
 
 def validate_journal(entry):
-    if len(entry.lines) < 2: raise AccountingError("Posted journals must have at least two lines")
+    if len(entry.lines) < 2: raise ValidationError("journal_lines_required", field="lines", message="At least two journal lines are required.")
     total_debit = sum((money(line.debit) for line in entry.lines), Decimal("0.00"))
     total_credit = sum((money(line.credit) for line in entry.lines), Decimal("0.00"))
-    if total_debit != total_credit: raise AccountingError("Journal is not balanced")
+    if total_debit <= 0 or total_credit <= 0 or abs(total_debit - total_credit) > CENT:
+        raise ValidationError("journal_not_balanced", message="Total debit must equal total credit.", total_debit=float(total_debit), total_credit=float(total_credit), difference=float(abs(total_debit-total_credit)))
+    require_open_accounting_period(entry.accounting_date or entry.journal_date)
     entry.total_debit = money(total_debit); entry.total_credit = money(total_credit)
+    has_debit = has_credit = False
     for line in entry.lines:
+        line.debit = money(line.debit); line.credit = money(line.credit)
+        if line.debit > 0 and line.credit > 0: raise ValidationError("invalid_journal_line", line_no=line.line_no, message="Debit and credit cannot both be positive on one line.")
+        if line.debit <= 0 and line.credit <= 0: raise ValidationError("blank_journal_line", line_no=line.line_no, message="Zero-value journal lines cannot be posted.")
+        has_debit = has_debit or line.debit > 0; has_credit = has_credit or line.credit > 0
         account = line.account or AccountingAccount.query.get(line.account_id)
-        if not is_active_account(account) or not is_posting_account(account):
-            raise AccountingError("Journal line references inactive or non-posting account")
+        if not is_active_account(account) or not is_posting_account(account): raise ValidationError("invalid_account", line_no=line.line_no, message="The selected account is not available for posting.")
+        if getattr(account, "requires_customer", False) and not line.customer_id: raise ValidationError("customer_required", line_no=line.line_no, field="customer_id", message="Customer is required for the selected account.")
+        if getattr(account, "requires_loan", False) and not line.loan_id: raise ValidationError("loan_required", line_no=line.line_no, field="loan_id", message="Loan is required for the selected account.")
+        if not getattr(account, "allows_customer", True) and line.customer_id: raise ValidationError("customer_not_allowed", line_no=line.line_no, field="customer_id", message="Customer is not allowed for the selected account.")
+        if not getattr(account, "allows_loan", True) and line.loan_id: raise ValidationError("loan_not_allowed", line_no=line.line_no, field="loan_id", message="Loan is not allowed for the selected account.")
+        if line.customer_id and not Customer.query.get(line.customer_id): raise ValidationError("invalid_customer", line_no=line.line_no, field="customer_id", message="The selected customer does not exist.")
+        if line.loan_id:
+            loan = Loan.query.get(line.loan_id)
+            if not loan: raise ValidationError("invalid_loan", line_no=line.line_no, field="loan_id", message="The selected loan does not exist.")
+            if line.customer_id is None: line.customer_id = loan.customer_id
+            elif int(line.customer_id) != int(loan.customer_id): raise ValidationError("loan_customer_mismatch", line_no=line.line_no, message="The selected loan does not belong to the selected customer.")
+    if not has_debit or not has_credit: raise ValidationError("journal_not_balanced", message="Journal must include at least one debit and one credit line.")
     return entry
 
 def post_journal(entry, user_id=None):
+    if entry.status == "POSTED": return entry
+    if entry.status not in {"DRAFT", "POSTED"}: raise ValidationError("journal_not_postable", message="Only draft journals can be posted.")
     validate_journal(entry)
     entry.status = "POSTED"
     entry.posted_at = datetime.utcnow()
     entry.posted_by_id = user_id
-    log_audit("JOURNAL_POST", "AccountingJournalEntry", entry.id, user_id)
+    log_audit("JOURNAL_POST", "AccountingJournalEntry", entry.id, user_id, {"journal_no": entry.journal_no, "total_debit": str(entry.total_debit), "total_credit": str(entry.total_credit)})
     return entry
 
 def reverse_journal(entry, journal_date=None, reason=None, user_id=None):
@@ -925,7 +984,9 @@ def reverse_journal(entry, journal_date=None, reason=None, user_id=None):
     reversal.reversal_of_journal_id = entry.id
     post_journal(reversal, user_id)
     entry.status = "REVERSED"
-    log_audit("JOURNAL_REVERSE", "AccountingJournalEntry", entry.id, user_id, {"reversal_id": reversal.id})
+    entry.reversed_at = datetime.utcnow()
+    entry.reversal_journal_id = reversal.id
+    log_audit("JOURNAL_REVERSE", "AccountingJournalEntry", entry.id, user_id, {"reversal_id": reversal.id, "journal_no": entry.journal_no, "reason": reason})
     return reversal
 
 def validate_funding_account(account, method=None):
@@ -977,7 +1038,7 @@ def serialize_journal(entry):
     source_line = next((l for l in entry.lines if l.customer_id or l.loan_id or l.payment_id), None)
     ctx = _line_context(source_line) if source_line else {}
     reversal = entry.reversal_journals[0] if getattr(entry, "reversal_journals", None) else None
-    return {"id": entry.id, "journal_no": entry.journal_no, "journal_date": entry.journal_date.isoformat(), "description": entry.description, "reference_type": entry.reference_type, "reference_id": entry.reference_id, "source_module": entry.source_module, "status": entry.status, "total_debit": f"{money(entry.total_debit):.2f}", "total_credit": f"{money(entry.total_credit):.2f}", "posted_at": entry.posted_at.isoformat() if entry.posted_at else None, "created_by_name": entry.created_by.name if entry.created_by else None, "posted_by_name": entry.posted_by.name if entry.posted_by else None, "customer_id": ctx.get("customer_id"), "customer_number": ctx.get("customer_number"), "customer_name": ctx.get("customer_name"), "loan_id": ctx.get("loan_id"), "loan_number": ctx.get("loan_number"), "payment_id": ctx.get("payment_id"), "collection_id": ctx.get("collection_id"), "original_journal_no": entry.reversal_of.journal_no if entry.reversal_of else None, "reversal_journal_no": reversal.journal_no if reversal else None, "is_reversal": bool(entry.reversal_of_id), "lines": [{"id": l.id, "line_no": l.line_no, "account_id": l.account_id, "account_code": l.account.account_code, "account_name": l.account.account_name, "account_type": l.account.account_type, "account_subtype": account_subtype(l.account), "debit": f"{money(l.debit):.2f}", "credit": f"{money(l.credit):.2f}", **_line_context(l), "description": l.description} for l in entry.lines]}
+    return {"id": entry.id, "journal_no": entry.journal_no, "journal_number": entry.journal_no, "journal_date": entry.journal_date.isoformat(), "accounting_date": entry.accounting_date.isoformat() if entry.accounting_date else None, "reference": getattr(entry, "reference", None), "description": entry.description, "reference_type": entry.reference_type, "reference_id": entry.reference_id, "source_module": entry.source_module, "status": entry.status, "total_debit": f"{money(entry.total_debit):.2f}", "total_credit": f"{money(entry.total_credit):.2f}", "posted_at": entry.posted_at.isoformat() if entry.posted_at else None, "created_by_name": entry.created_by.name if entry.created_by else None, "posted_by_name": entry.posted_by.name if entry.posted_by else None, "customer_id": ctx.get("customer_id"), "customer_number": ctx.get("customer_number"), "customer_name": ctx.get("customer_name"), "loan_id": ctx.get("loan_id"), "loan_number": ctx.get("loan_number"), "payment_id": ctx.get("payment_id"), "collection_id": ctx.get("collection_id"), "original_journal_no": entry.reversal_of.journal_no if entry.reversal_of else None, "reversal_journal_no": reversal.journal_no if reversal else None, "is_reversal": bool(entry.reversal_of_id), "lines": [{"id": l.id, "line_no": l.line_no, "account_id": l.account_id, "account_code": l.account.account_code, "account_name": l.account.account_name, "account_type": l.account.account_type, "account_subtype": account_subtype(l.account), "debit": f"{money(l.debit):.2f}", "credit": f"{money(l.credit):.2f}", **_line_context(l), "description": l.description} for l in entry.lines]}
 
 def general_ledger(account_id=None, date_from=None, date_to=None, customer_id=None, loan_id=None, account_code=None, query_params=None):
     account = _resolve_ledger_account(account_id, account_code)
@@ -1319,7 +1380,7 @@ def require_open_accounting_period(accounting_date):
     allow = str(get_setting("allow_posting_to_locked_period", "false")).lower() == "true"
     open_, period = is_accounting_period_open(accounting_date)
     if not open_ and not allow:
-        raise AccountingError({"error":"Accounting period is locked", "accounting_date": accounting_date.isoformat(), "period": period.period})
+        raise ValidationError("accounting_period_locked", message=f"The accounting period for {accounting_date.isoformat()} is locked.", accounting_date=accounting_date.isoformat(), period=period.period if period else None)
     return True
 
 def _loan_active_for_accrual(loan):
