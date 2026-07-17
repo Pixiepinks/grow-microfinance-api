@@ -19,7 +19,7 @@ def setup_investor_agreement():
     seed_default_accounts()
     inv = create_investor({"full_name": "Investor A"})
     db.session.flush()
-    agr = create_agreement({"investor_id": inv.id, "agreement_date": "2026-07-01", "start_date": "2026-07-01", "interest_rate": "2"})
+    agr = create_agreement({"investor_id": inv.id, "agreement_date": "2026-07-01", "start_date": "2026-07-01", "interest_rate": "2", "status": "ACTIVE"})
     db.session.flush()
     return inv, agr
 

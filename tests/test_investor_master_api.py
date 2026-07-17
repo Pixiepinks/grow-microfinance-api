@@ -1,3 +1,5 @@
+from datetime import date
+
 from flask_jwt_extended import create_access_token
 
 from app.extensions import db
@@ -336,3 +338,120 @@ def test_create_agreement_invalid_liability_account_is_account_specific(app, cli
         "error": "account_mapping_invalid",
         "message": "investor_liability_account_id must be a liability account.",
     }
+
+
+def _seed_investor_agreement_dependencies():
+    from app.accounting import seed_default_accounts
+    from app.investor_funding import seed_investor_accounts
+
+    seed_default_accounts()
+    seed_investor_accounts()
+    db.session.commit()
+
+
+def _create_active_agreement(client, headers, investor_id, **overrides):
+    payload = {
+        "investor_id": investor_id,
+        "agreement_name": "Monthly Investor Funding Agreement",
+        "agreement_date": "2026-02-20",
+        "start_date": "2026-02-20",
+        "original_principal_amount": 50000,
+        "interest_rate": 2,
+        "status": "ACTIVE",
+    }
+    payload.update(overrides)
+    return client.post("/admin/investor-agreements", headers=headers, json=payload)
+
+
+def test_agreement_options_returns_zero_principal_active_agreement_without_transactions(app, client):
+    admin = _admin()
+    headers = _headers(app, admin)
+    _seed_investor_agreement_dependencies()
+    investor = client.post("/admin/investors", headers=headers, json=_payload()).get_json()
+    agreement = _create_active_agreement(client, headers, investor["id"]).get_json()
+
+    resp = client.get("/admin/investor-agreements/options", headers=headers)
+
+    assert resp.status_code == 200
+    assert InvestorFundingTransaction.query.count() == 0
+    assert resp.get_json()["items"] == [
+        {
+            "id": agreement["id"],
+            "agreement_id": agreement["id"],
+            "agreement_number": agreement["agreement_number"],
+            "agreement_name": "Monthly Investor Funding Agreement",
+            "investor_id": investor["id"],
+            "investor_number": "GROW-INV-000001",
+            "investor_name": "Prakash Vijayanga Withana",
+            "status": "ACTIVE",
+            "start_date": "2026-02-20",
+            "maturity_date": None,
+            "original_principal_amount": 50000.0,
+            "current_principal_balance": 0.0,
+            "allow_additional_funding": True,
+            "funding_account_id": agreement["account_mappings"]["funding_account_id"],
+            "investor_liability_account_id": agreement["account_mappings"]["investor_liability_account_id"],
+            "label": f"{agreement['agreement_number']} — Monthly Investor Funding Agreement",
+        }
+    ]
+
+
+def test_agreement_options_filters_by_investor_id(app, client):
+    admin = _admin()
+    headers = _headers(app, admin)
+    _seed_investor_agreement_dependencies()
+    first = client.post("/admin/investors", headers=headers, json=_payload(nic="1", email="one@example.com")).get_json()
+    second = client.post("/admin/investors", headers=headers, json=_payload(nic="2", email="two@example.com", mobile="0700000002")).get_json()
+    first_agreement = _create_active_agreement(client, headers, first["id"], agreement_name="First").get_json()
+    _create_active_agreement(client, headers, second["id"], agreement_name="Second")
+
+    resp = client.get(f"/admin/investor-agreements/options?investor_id={first['id']}", headers=headers)
+
+    assert resp.status_code == 200
+    items = resp.get_json()["items"]
+    assert [item["agreement_id"] for item in items] == [first_agreement["id"]]
+    assert items[0]["investor_id"] == first["id"]
+
+
+def test_agreement_options_excludes_closed_agreement_and_inactive_investor(app, client):
+    admin = _admin()
+    headers = _headers(app, admin)
+    _seed_investor_agreement_dependencies()
+    active = client.post("/admin/investors", headers=headers, json=_payload(nic="3", email="active@example.com")).get_json()
+    inactive = client.post("/admin/investors", headers=headers, json=_payload(nic="4", email="inactive@example.com", status="INACTIVE")).get_json()
+    _create_active_agreement(client, headers, active["id"], status="CLOSED")
+    inactive_agreement = InvestorFundingAgreement(
+        agreement_number="GROW-IFA-20260220-9999",
+        investor_id=inactive["id"],
+        agreement_name="Inactive investor agreement",
+        agreement_date=date(2026, 2, 20),
+        start_date=date(2026, 2, 20),
+        original_principal_amount=50000,
+        current_principal_balance=0,
+        investor_liability_account_id=1,
+        interest_expense_account_id=1,
+        accrued_interest_payable_account_id=1,
+        status="ACTIVE",
+    )
+    db.session.add(inactive_agreement)
+    db.session.commit()
+
+    resp = client.get("/admin/investor-agreements/options", headers=headers)
+
+    assert resp.status_code == 200
+    assert resp.get_json() == {"items": []}
+
+
+def test_agreement_options_preflight_then_get_returns_items(app, client):
+    admin = _admin()
+    headers = _headers(app, admin)
+    _seed_investor_agreement_dependencies()
+    investor = client.post("/admin/investors", headers=headers, json=_payload()).get_json()
+    _create_active_agreement(client, headers, investor["id"])
+
+    preflight = client.open("/admin/investor-agreements/options", method="OPTIONS")
+    resp = client.get("/admin/investor-agreements/options", headers=headers)
+
+    assert preflight.status_code == 204
+    assert resp.status_code == 200
+    assert len(resp.get_json()["items"]) == 1
