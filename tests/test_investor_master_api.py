@@ -548,3 +548,82 @@ def test_agreement_options_preflight_then_get_returns_items(app, client):
     assert preflight.status_code == 204
     assert resp.status_code == 200
     assert len(resp.get_json()["items"]) == 1
+
+
+def test_agreement_list_returns_zero_principal_null_maturity_agreement_without_transactions(app, client):
+    admin = _admin()
+    headers = _headers(app, admin)
+    _seed_investor_agreement_dependencies()
+    investor = client.post("/admin/investors", headers=headers, json=_payload()).get_json()
+    agreement = _create_active_agreement(
+        client,
+        headers,
+        investor["id"],
+        agreement_name="Monthly Investor Funding Agreement - Prakash",
+        calculation_method="MONTHLY_AVERAGE_DAILY_BALANCE",
+        maturity_date=None,
+    ).get_json()
+
+    resp = client.get("/admin/investor-agreements", headers=headers)
+
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["total"] == 1
+    assert len(body["items"]) == 1
+    item = body["items"][0]
+    assert item["id"] == agreement["id"]
+    assert item["agreement_id"] == agreement["id"]
+    assert item["agreement_number"] == agreement["agreement_number"]
+    assert item["agreement_name"] == "Monthly Investor Funding Agreement - Prakash"
+    assert item["investor_id"] == investor["id"]
+    assert item["investor"] == {
+        "id": investor["id"],
+        "investor_number": "GROW-INV-000001",
+        "display_name": "Prakash Vijayanga Withana",
+    }
+    assert item["investor_name"] == "Prakash Vijayanga Withana"
+    assert item["start_date"] == "2026-02-20"
+    assert item["maturity_date"] is None
+    assert item["original_principal_amount"] == 50000.0
+    assert item["current_principal_balance"] == 0
+    assert item["interest_rate"] == 2.0
+    assert item["interest_rate_period"] == "MONTHLY"
+    assert item["calculation_method"] == "MONTHLY_AVERAGE_DAILY_BALANCE"
+    assert item["accrued_interest"] == 0
+    assert item["status"] == "ACTIVE"
+    assert InvestorFundingTransaction.query.count() == 0
+
+
+def test_agreement_list_defaults_to_all_statuses_and_can_filter_active(app, client):
+    admin = _admin()
+    headers = _headers(app, admin)
+    _seed_investor_agreement_dependencies()
+    investor = client.post("/admin/investors", headers=headers, json=_payload()).get_json()
+    active = _create_active_agreement(client, headers, investor["id"], agreement_name="Active", status="ACTIVE").get_json()
+    draft = _create_active_agreement(client, headers, investor["id"], agreement_name="Draft", status="DRAFT").get_json()
+    closed = _create_active_agreement(client, headers, investor["id"], agreement_name="Closed", status="CLOSED").get_json()
+
+    default_resp = client.get("/admin/investor-agreements", headers=headers)
+    active_resp = client.get("/admin/investor-agreements?status=ACTIVE", headers=headers)
+
+    assert default_resp.status_code == 200
+    assert {item["agreement_id"] for item in default_resp.get_json()["items"]} == {active["id"], draft["id"], closed["id"]}
+    assert active_resp.status_code == 200
+    assert [item["agreement_id"] for item in active_resp.get_json()["items"]] == [active["id"]]
+
+
+def test_agreement_list_optional_filters_search_investor_and_date(app, client):
+    admin = _admin()
+    headers = _headers(app, admin)
+    _seed_investor_agreement_dependencies()
+    investor = client.post("/admin/investors", headers=headers, json=_payload()).get_json()
+    agreement = _create_active_agreement(client, headers, investor["id"], agreement_name="Searchable Agreement").get_json()
+
+    resp = client.get(
+        f"/admin/investor-agreements?q=Prakash&investor_id={investor['id']}&date_from=2026-02-20&date_to=2026-02-20",
+        headers=headers,
+    )
+
+    assert resp.status_code == 200
+    assert resp.get_json()["total"] == 1
+    assert resp.get_json()["items"][0]["agreement_id"] == agreement["id"]
