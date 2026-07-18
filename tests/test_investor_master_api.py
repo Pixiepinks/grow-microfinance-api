@@ -729,9 +729,9 @@ def test_investor_balance_report_invalid_filter_ids_return_404(app, client):
     missing_agreement = client.get("/admin/reports/investor-balances?as_of_date=2026-07-18&agreement_id=999", headers=headers)
 
     assert missing_investor.status_code == 404
-    assert missing_investor.get_json() == {"error": "investor_not_found", "message": "The investor was not found."}
+    assert missing_investor.get_json() == {"error": "investor_not_found", "message": "The selected investor was not found."}
     assert missing_agreement.status_code == 404
-    assert missing_agreement.get_json() == {"error": "investor_agreement_not_found", "message": "The investor funding agreement was not found."}
+    assert missing_agreement.get_json() == {"error": "agreement_not_found", "message": "The selected funding agreement was not found."}
 
 
 def test_investor_balance_report_empty_valid_filter_returns_200(app, client):
@@ -743,14 +743,78 @@ def test_investor_balance_report_empty_valid_filter_returns_200(app, client):
     resp = client.get(f"/admin/reports/investor-balances?as_of_date=2026-07-18&investor_id={investor['id']}&status=CLOSED", headers=headers)
 
     assert resp.status_code == 200
-    assert resp.get_json() == {
-        "as_of_date": "2026-07-18",
-        "items": [],
-        "summary": {
-            "total_investors": 0,
-            "total_agreements": 0,
-            "total_principal": 0,
-            "total_accrued_interest": 0,
-            "total_payable": 0,
-        },
-    }
+    body = resp.get_json()
+    assert body["as_of_date"] == "2026-07-18"
+    assert body["filters"] == {"investor_id": investor["id"], "agreement_id": None, "status": "CLOSED"}
+    assert body["items"] == []
+    assert body["summary"]["total_investors"] == 0
+    assert body["summary"]["total_agreements"] == 0
+    assert body["summary"]["current_principal"] == 0
+    assert body["summary"]["accrued_interest"] == 0
+    assert body["summary"]["total_payable"] == 0
+
+
+def test_exact_investor_funding_balance_report_route_registered(app):
+    rules = [rule for rule in app.url_map.iter_rules() if rule.rule == "/admin/investor-funding/reports/balances"]
+
+    assert len(rules) == 1
+    assert "GET" in rules[0].methods
+
+
+def test_exact_investor_funding_balance_report_route_preflight_and_get(app, client):
+    admin = _admin()
+    headers = _headers(app, admin)
+    _seed_investor_agreement_dependencies()
+    investor = client.post("/admin/investors", headers=headers, json=_payload()).get_json()
+    agreement = _create_active_agreement(client, headers, investor["id"], agreement_name="Exact Route Balance").get_json()
+
+    preflight = client.open("/admin/investor-funding/reports/balances", method="OPTIONS")
+    resp = client.get("/admin/investor-funding/reports/balances?as_of_date=2026-07-18&investor_id=&agreement_id=&status=ALL", headers=headers)
+
+    assert preflight.status_code == 204
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["filters"] == {"investor_id": None, "agreement_id": None, "status": "ALL"}
+    assert [item["agreement_id"] for item in body["items"]] == [agreement["id"]]
+
+
+def test_exact_investor_funding_balance_report_posted_funding_current_principal(app, client):
+    admin = _admin()
+    headers = _headers(app, admin)
+    _seed_investor_agreement_dependencies()
+    investor = client.post("/admin/investors", headers=headers, json=_payload()).get_json()
+    agreement = _create_active_agreement(client, headers, investor["id"], agreement_name="Funded Exact Route").get_json()
+    db.session.add(InvestorFundingTransaction(
+        transaction_number="GROW-IFT-20260220-0001",
+        investor_id=investor["id"],
+        agreement_id=agreement["id"],
+        transaction_type="INITIAL_FUNDING",
+        transaction_date=date(2026, 2, 20),
+        accounting_date=date(2026, 2, 20),
+        amount=50000,
+        status="POSTED",
+    ))
+    db.session.commit()
+
+    resp = client.get(f"/admin/investor-funding/reports/balances?as_of_date=2026-07-18&agreement_id={agreement['id']}", headers=headers)
+
+    assert resp.status_code == 200
+    item = resp.get_json()["items"][0]
+    assert item["current_principal"] == 50000
+    assert item["total_payable"] == 50000
+
+
+def test_exact_investor_funding_balance_report_errors(app, client):
+    admin = _admin()
+    headers = _headers(app, admin)
+
+    invalid_date = client.get("/admin/investor-funding/reports/balances?as_of_date=not-a-date", headers=headers)
+    missing_investor = client.get("/admin/investor-funding/reports/balances?as_of_date=2026-07-18&investor_id=999", headers=headers)
+    missing_agreement = client.get("/admin/investor-funding/reports/balances?as_of_date=2026-07-18&agreement_id=999", headers=headers)
+
+    assert invalid_date.status_code == 422
+    assert invalid_date.get_json() == {"error": "invalid_as_of_date", "message": "Enter a valid as-of date."}
+    assert missing_investor.status_code == 404
+    assert missing_investor.get_json() == {"error": "investor_not_found", "message": "The selected investor was not found."}
+    assert missing_agreement.status_code == 404
+    assert missing_agreement.get_json() == {"error": "agreement_not_found", "message": "The selected funding agreement was not found."}
