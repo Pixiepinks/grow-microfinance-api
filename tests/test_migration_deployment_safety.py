@@ -22,23 +22,39 @@ def _script_directory():
 
 def test_alembic_revision_ids_fit_production_version_column():
     max_revision_length = 32
+    message = (
+        "Alembic revision IDs must be 32 characters or fewer because "
+        "alembic_version.version_num is VARCHAR(32)."
+    )
 
-    for path in (ROOT / "migrations" / "versions").glob("*.py"):
-        tree = ast.parse(path.read_text())
+    def assigned_value(tree, name):
         for node in tree.body:
             if (
                 isinstance(node, ast.Assign)
                 and any(
-                    isinstance(target, ast.Name) and target.id == "revision"
+                    isinstance(target, ast.Name) and target.id == name
                     for target in node.targets
                 )
-                and isinstance(node.value, ast.Constant)
-                and isinstance(node.value.value, str)
             ):
-                assert len(node.value.value) <= max_revision_length, (
-                    f"{path}: revision {node.value.value!r} "
-                    f"exceeds {max_revision_length} characters"
-                )
+                return ast.literal_eval(node.value)
+        return None
+
+    for path in (ROOT / "migrations" / "versions").glob("*.py"):
+        tree = ast.parse(path.read_text())
+        revision = assigned_value(tree, "revision")
+        if isinstance(revision, str):
+            assert len(revision) <= max_revision_length, f"{path}: {message}"
+
+        down_revision = assigned_value(tree, "down_revision")
+        if isinstance(down_revision, str):
+            down_revisions = (down_revision,)
+        elif isinstance(down_revision, (tuple, list)):
+            down_revisions = down_revision
+        else:
+            down_revisions = ()
+
+        for down in down_revisions:
+            assert len(down) <= max_revision_length, f"{path}: {message}"
 
 
 def test_alembic_chain_has_one_head_and_valid_down_revisions():

@@ -1,13 +1,13 @@
 """add calendar days to investor interest accruals
 
-Revision ID: 0038_investor_accrual_calendar_days
+Revision ID: 0038_inv_accr_cal_days
 Revises: 0037_manual_journal_workflow
 Create Date: 2026-07-18 00:00:00.000000
 """
 from alembic import op
 import sqlalchemy as sa
 
-revision = "0038_investor_accrual_calendar_days"
+revision = "0038_inv_accr_cal_days"
 down_revision = "0037_manual_journal_workflow"
 branch_labels = None
 depends_on = None
