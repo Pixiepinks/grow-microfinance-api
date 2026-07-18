@@ -930,6 +930,7 @@ class InvestorInterestAccrual(db.Model):
     accrual_period_start = db.Column(db.Date, nullable=False)
     accrual_period_end = db.Column(db.Date, nullable=False, index=True)
     days_in_period = db.Column(db.Integer, nullable=False)
+    calendar_days_in_month = db.Column(db.Integer, nullable=False, default=0)
     opening_principal_balance = db.Column(Numeric(18, 2), nullable=False)
     closing_principal_balance = db.Column(Numeric(18, 2), nullable=False)
     average_daily_balance = db.Column(Numeric(18, 2), nullable=False)
@@ -955,3 +956,4 @@ class InvestorInterestAccrual(db.Model):
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
     agreement = relationship("InvestorFundingAgreement", backref="interest_accruals")
     investor = relationship("Investor")
+    journal_entry = relationship("AccountingJournalEntry", foreign_keys=[journal_entry_id])

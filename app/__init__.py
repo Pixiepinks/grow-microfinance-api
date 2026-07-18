@@ -132,8 +132,8 @@ def create_app():
     @click.option("--post/--no-post", default=False)
     def accrue_investor_interest(as_of_date, agreement_id, month, preview, post):
         from datetime import date as date_cls
-        from .models import InvestorFundingAgreement, InvestorInterestAccrual
-        from .investor_funding import month_bounds, completed_periods_for, calculate_investor_interest, post_investor_interest_accrual
+        from .models import InvestorFundingAgreement
+        from .investor_funding import catch_up_investor_interest, month_bounds
         as_of = date_cls.fromisoformat(as_of_date) if as_of_date else date_cls.today()
         q = InvestorFundingAgreement.query.filter_by(auto_accrual_enabled=True)
         if agreement_id:
@@ -142,24 +142,18 @@ def create_app():
             q = q.filter(InvestorFundingAgreement.status.in_(["ACTIVE", "MATURED"]))
         rows = []
         for agr in q.all():
-            periods = [month_bounds(month)] if month else completed_periods_for(agr, as_of)
-            for ps, pe in periods:
-                ps = max(ps, agr.start_date)
-                exists = InvestorInterestAccrual.query.filter_by(agreement_id=agr.id, accrual_period_start=ps, accrual_period_end=pe).first()
-                if exists and exists.status != "CALCULATED":
-                    rows.append({"agreement_id": agr.id, "period_end": pe.isoformat(), "status": "SKIPPED_EXISTING"})
-                    continue
-                if post and not preview:
-                    accrual = post_investor_interest_accrual(agr.id, ps, pe)
-                    rows.append({"agreement_id": agr.id, "period_end": pe.isoformat(), "status": accrual.status, "gross_interest": str(accrual.gross_interest_amount)})
-                else:
-                    calc = calculate_investor_interest(agr.id, ps, pe)
-                    rows.append({"agreement_id": agr.id, "period_start": ps.isoformat(), "period_end": pe.isoformat(), "status": "PREVIEW", "gross_interest": str(calc["gross_interest_amount"])})
+            if month:
+                _ps, pe = month_bounds(month)
+                result = catch_up_investor_interest(agr.id, pe, post=post and not preview, include_partial=True)
+            else:
+                result = catch_up_investor_interest(agr.id, as_of, post=post and not preview)
+            rows.append(result)
         if post and not preview:
             db.session.commit()
         else:
             db.session.rollback()
         print({"results": rows})
+
 
     @app.cli.group("accounting")
     def accounting_cli():

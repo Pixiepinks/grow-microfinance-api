@@ -489,12 +489,17 @@ def calculate_investor_interest(agreement_id, period_start, period_end):
     engine = daily_balance_engine(agr, period_start, period_end)
     rate = Decimal(str(agr.interest_rate)); method = agr.calculation_method
     base = engine["average_daily_balance"] if method == "MONTHLY_AVERAGE_DAILY_BALANCE" else engine["opening_balance"] if method == "MONTHLY_OPENING_BALANCE" else engine["closing_balance"]
+    days_in_calendar_month = calendar.monthrange(period_end.year, period_end.month)[1]
+    is_stub_month = period_start.day != 1 or period_end.day != days_in_calendar_month
     if agr.interest_rate_period == "MONTHLY" or method in MONTHLY_METHODS:
-        gross = money(base * rate / Decimal("100"))
+        gross_raw = base * rate / Decimal("100")
+        if is_stub_month:
+            gross_raw = gross_raw * Decimal(engine["days_in_period"]) / Decimal(days_in_calendar_month)
+        gross = money(gross_raw)
     else:
         gross = money(engine["sum_of_daily_balances"] * rate / Decimal("100") / Decimal("365" if method != "ANNUAL_ACTUAL_366" else "366"))
     tax = money(gross * Decimal(str(agr.withholding_tax_rate or 0)) / Decimal("100")) if agr.withholding_tax_rate and agr.withholding_tax_account_id else Decimal("0.00")
-    return {**engine, "interest_rate": rate, "interest_rate_period": agr.interest_rate_period, "calculation_method": method, "gross_interest_amount": gross, "withholding_tax_amount": tax, "net_interest_payable": money(gross - tax)}
+    return {**engine, "calendar_days_in_month": days_in_calendar_month, "interest_rate": rate, "interest_rate_period": agr.interest_rate_period, "calculation_method": method, "gross_interest_amount": gross, "withholding_tax_amount": tax, "net_interest_payable": money(gross - tax)}
 
 
 def post_investor_interest_accrual(agreement_id, period_start, period_end, requested_by=None):
@@ -504,6 +509,8 @@ def post_investor_interest_accrual(agreement_id, period_start, period_end, reque
     calc = calculate_investor_interest(agreement_id, period_start, period_end)
     accrual = existing or InvestorInterestAccrual(investor_id=agr.investor_id, agreement_id=agr.id, accrual_period_start=period_start, accrual_period_end=period_end, created_by=requested_by)
     accrual.days_in_period = calc["days_in_period"]
+    if hasattr(accrual, "calendar_days_in_month"):
+        accrual.calendar_days_in_month = calc["calendar_days_in_month"]
     accrual.opening_principal_balance = calc["opening_balance"]
     accrual.closing_principal_balance = calc["closing_balance"]
     accrual.average_daily_balance = calc["average_daily_balance"]
@@ -555,6 +562,119 @@ def completed_periods_for(agr, as_of):
         d = end + timedelta(days=1)
     return periods
 
+
+
+def latest_completed_month_end(as_of):
+    first = date(as_of.year, as_of.month, 1)
+    return first - timedelta(days=1)
+
+
+def first_posted_funding_date(agreement_id):
+    tx = InvestorFundingTransaction.query.filter_by(agreement_id=agreement_id, status="POSTED").filter(
+        InvestorFundingTransaction.transaction_type.in_(["INITIAL_FUNDING", "ADDITIONAL_FUNDING"]),
+        InvestorFundingTransaction.reversed_at.is_(None),
+    ).order_by(InvestorFundingTransaction.transaction_date, InvestorFundingTransaction.id).first()
+    return tx.transaction_date if tx else None
+
+
+def _periods_from_funding(funding_start, as_of, include_partial=False):
+    cutoff = as_of if include_partial else latest_completed_month_end(as_of)
+    periods = []
+    if not funding_start or cutoff < funding_start:
+        return periods
+    d = date(funding_start.year, funding_start.month, 1)
+    while d <= cutoff:
+        end = date(d.year, d.month, calendar.monthrange(d.year, d.month)[1])
+        ps = max(funding_start, d)
+        pe = min(end, cutoff)
+        if include_partial or pe == end:
+            periods.append((ps, pe))
+        d = end + timedelta(days=1)
+    return periods
+
+
+def _period_payload(accrual=None, calc=None, ps=None, pe=None, status=None, reason=None):
+    obj = accrual
+    return {
+        "period": f"{pe:%Y-%m}" if pe else None,
+        "period_start": (obj.accrual_period_start if obj else ps).isoformat(),
+        "period_end": (obj.accrual_period_end if obj else pe).isoformat(),
+        "status": status or (obj.status if obj else "PREVIEW"),
+        "interest": float((obj.gross_interest_amount if obj else calc["gross_interest_amount"])),
+        "average_daily_balance": float((obj.average_daily_balance if obj else calc["average_daily_balance"])),
+        "opening_principal_balance": float((obj.opening_principal_balance if obj else calc["opening_balance"])),
+        "closing_principal_balance": float((obj.closing_principal_balance if obj else calc["closing_balance"])),
+        "interest_rate": float((obj.interest_rate if obj else calc["interest_rate"])),
+        "journal_number": obj.journal_entry.journal_no if obj and obj.journal_entry_id and obj.journal_entry else None,
+        **({"reason": reason} if reason else {}),
+    }
+
+
+def catch_up_investor_interest(agreement_id, as_of_date, post=True, requested_by=None, include_partial=False):
+    agr = InvestorFundingAgreement.query.get(agreement_id)
+    if not agr:
+        raise ValidationError("Agreement not found")
+    funding_start = first_posted_funding_date(agreement_id)
+    result = {"agreement_id": agreement_id, "funding_start_date": funding_start.isoformat() if funding_start else None, "accrued_through": None, "created_periods": [], "existing_periods": [], "skipped_periods": [], "failed_periods": []}
+    if not funding_start:
+        result["skipped_periods"].append({"status": "SKIPPED", "reason": "No posted investor funding transaction exists."})
+        return result
+    for ps, pe in _periods_from_funding(funding_start, as_of_date, include_partial=include_partial):
+        existing = InvestorInterestAccrual.query.filter_by(agreement_id=agreement_id, accrual_period_start=ps, accrual_period_end=pe).first()
+        if existing and existing.status != "CALCULATED" and not existing.reversed_at:
+            result["existing_periods"].append(_period_payload(accrual=existing, status="EXISTING"))
+            result["accrued_through"] = pe.isoformat()
+            continue
+        try:
+            calc = calculate_investor_interest(agreement_id, ps, pe)
+            if calc["gross_interest_amount"] <= 0:
+                result["skipped_periods"].append(_period_payload(calc=calc, ps=ps, pe=pe, status="SKIPPED", reason="No interest-bearing principal balance."))
+                continue
+            require_open_accounting_period(pe)
+            if post:
+                accrual = post_investor_interest_accrual(agreement_id, ps, pe, requested_by)
+                result["created_periods"].append(_period_payload(accrual=accrual, status="CREATED"))
+            else:
+                payload = _period_payload(calc=calc, ps=ps, pe=pe, status="PREVIEW")
+                payload["accounting_period_status"] = "OPEN"
+                payload["expected_journal_lines"] = [{"account_id": agr.interest_expense_account_id, "debit": float(calc["gross_interest_amount"]), "credit": 0.0}, {"account_id": agr.accrued_interest_payable_account_id, "debit": 0.0, "credit": float(calc["gross_interest_amount"])}]
+                result["created_periods"].append(payload)
+            result["accrued_through"] = pe.isoformat()
+        except Exception as exc:
+            result["failed_periods"].append({"period": f"{pe:%Y-%m}", "period_start": ps.isoformat(), "period_end": pe.isoformat(), "status": "FAILED", "reason": getattr(exc, "message", str(exc))})
+    result["total_interest_created"] = float(sum(Decimal(str(p.get("interest", 0))) for p in result["created_periods"]))
+    return result
+
+
+def investor_interest_summary(agreement_id, as_of_date=None):
+    as_of_date = as_of_date or date.today()
+    funding_start = first_posted_funding_date(agreement_id)
+    posted = InvestorInterestAccrual.query.filter_by(agreement_id=agreement_id).filter(
+        InvestorInterestAccrual.status.in_(["POSTED", "PARTIALLY_PAID", "PAID", "CAPITALIZED"]),
+        InvestorInterestAccrual.reversed_at.is_(None),
+    ).all()
+    accrued = money(sum((a.gross_interest_amount for a in posted), Decimal("0.00")))
+    unpaid = money(sum((a.net_interest_payable - a.payment_amount - a.capitalization_amount for a in posted), Decimal("0.00")))
+    last = max([a.accrual_period_end for a in posted], default=None)
+    missing = 0
+    if funding_start:
+        for ps, pe in _periods_from_funding(funding_start, as_of_date):
+            exists = next((a for a in posted if a.accrual_period_start == ps and a.accrual_period_end == pe), None)
+            if not exists:
+                missing += 1
+    next_accrual = None
+    if funding_start:
+        base = (last + timedelta(days=1)) if last else funding_start
+        next_accrual = date(base.year, base.month, calendar.monthrange(base.year, base.month)[1])
+    return {
+        "accrued_interest": accrued,
+        "accrued_unpaid_interest": unpaid,
+        "last_accrued_through": last,
+        "next_accrual_date": next_accrual,
+        "missing_accrual_periods": missing,
+        "interest_catch_up_required": missing > 0,
+        "accrual_status": "CATCH_UP_REQUIRED" if missing > 0 else "CURRENT",
+    }
 
 def reverse_investor_transaction(tx_id, reversal_date, reason, user_id=None):
     tx = db.session.get(InvestorFundingTransaction, tx_id)
