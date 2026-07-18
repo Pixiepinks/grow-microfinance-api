@@ -627,3 +627,130 @@ def test_agreement_list_optional_filters_search_investor_and_date(app, client):
     assert resp.status_code == 200
     assert resp.get_json()["total"] == 1
     assert resp.get_json()["items"][0]["agreement_id"] == agreement["id"]
+
+
+def test_investor_balance_report_blank_filters_returns_all_agreements(app, client):
+    admin = _admin()
+    headers = _headers(app, admin)
+    _seed_investor_agreement_dependencies()
+    investor = client.post("/admin/investors", headers=headers, json=_payload()).get_json()
+    agreement = _create_active_agreement(client, headers, investor["id"], agreement_name="Report Agreement").get_json()
+
+    resp = client.get("/admin/reports/investor-balances?as_of_date=2026-07-18", headers=headers)
+
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["as_of_date"] == "2026-07-18"
+    assert [item["agreement_id"] for item in body["items"]] == [agreement["id"]]
+    assert body["summary"]["total_investors"] == 1
+    assert body["summary"]["total_agreements"] == 1
+
+
+def test_investor_balance_report_filters_by_investor_id(app, client):
+    admin = _admin()
+    headers = _headers(app, admin)
+    _seed_investor_agreement_dependencies()
+    first = client.post("/admin/investors", headers=headers, json=_payload(nic="51", email="balance-one@example.com")).get_json()
+    second = client.post("/admin/investors", headers=headers, json=_payload(nic="52", email="balance-two@example.com", mobile="0700000052")).get_json()
+    first_agreement = _create_active_agreement(client, headers, first["id"], agreement_name="First Balance").get_json()
+    _create_active_agreement(client, headers, second["id"], agreement_name="Second Balance")
+
+    resp = client.get(f"/admin/reports/investor-balances?as_of_date=2026-07-18&investor_id={first['id']}", headers=headers)
+
+    assert resp.status_code == 200
+    items = resp.get_json()["items"]
+    assert [item["agreement_id"] for item in items] == [first_agreement["id"]]
+    assert items[0]["investor_id"] == first["id"]
+
+
+def test_investor_balance_report_filters_by_agreement_id(app, client):
+    admin = _admin()
+    headers = _headers(app, admin)
+    _seed_investor_agreement_dependencies()
+    investor = client.post("/admin/investors", headers=headers, json=_payload()).get_json()
+    first = _create_active_agreement(client, headers, investor["id"], agreement_name="Selected Balance").get_json()
+    _create_active_agreement(client, headers, investor["id"], agreement_name="Other Balance")
+
+    resp = client.get(f"/admin/reports/investor-balances?as_of_date=2026-07-18&agreement_id={first['id']}", headers=headers)
+
+    assert resp.status_code == 200
+    assert [item["agreement_id"] for item in resp.get_json()["items"]] == [first["id"]]
+
+
+def test_investor_balance_report_agreement_without_transactions_returns_zero_row(app, client):
+    admin = _admin()
+    headers = _headers(app, admin)
+    _seed_investor_agreement_dependencies()
+    investor = client.post("/admin/investors", headers=headers, json=_payload()).get_json()
+    agreement = _create_active_agreement(client, headers, investor["id"], agreement_name="Unfunded Balance").get_json()
+
+    resp = client.get(f"/admin/reports/investor-balances?as_of_date=2026-07-18&agreement_id={agreement['id']}", headers=headers)
+
+    assert resp.status_code == 200
+    item = resp.get_json()["items"][0]
+    assert InvestorFundingTransaction.query.count() == 0
+    assert item["current_principal"] == 0
+    assert item["accrued_interest"] == 0
+
+
+def test_investor_balance_report_posted_funding_sets_current_principal(app, client):
+    admin = _admin()
+    headers = _headers(app, admin)
+    _seed_investor_agreement_dependencies()
+    investor = client.post("/admin/investors", headers=headers, json=_payload()).get_json()
+    agreement = _create_active_agreement(client, headers, investor["id"], agreement_name="Funded Balance").get_json()
+    tx = InvestorFundingTransaction(
+        transaction_number="GROW-IFT-20260220-0001",
+        investor_id=investor["id"],
+        agreement_id=agreement["id"],
+        transaction_type="INITIAL_FUNDING",
+        transaction_date=date(2026, 2, 20),
+        accounting_date=date(2026, 2, 20),
+        amount=50000,
+        status="POSTED",
+    )
+    db.session.add(tx)
+    db.session.commit()
+
+    resp = client.get(f"/admin/reports/investor-balances?as_of_date=2026-07-18&agreement_id={agreement['id']}", headers=headers)
+
+    assert resp.status_code == 200
+    item = resp.get_json()["items"][0]
+    assert item["total_funding"] == 50000
+    assert item["current_principal"] == 50000
+    assert item["total_amount_payable"] == 50000
+
+
+def test_investor_balance_report_invalid_filter_ids_return_404(app, client):
+    admin = _admin()
+    headers = _headers(app, admin)
+
+    missing_investor = client.get("/admin/reports/investor-balances?as_of_date=2026-07-18&investor_id=999", headers=headers)
+    missing_agreement = client.get("/admin/reports/investor-balances?as_of_date=2026-07-18&agreement_id=999", headers=headers)
+
+    assert missing_investor.status_code == 404
+    assert missing_investor.get_json() == {"error": "investor_not_found", "message": "The investor was not found."}
+    assert missing_agreement.status_code == 404
+    assert missing_agreement.get_json() == {"error": "investor_agreement_not_found", "message": "The investor funding agreement was not found."}
+
+
+def test_investor_balance_report_empty_valid_filter_returns_200(app, client):
+    admin = _admin()
+    headers = _headers(app, admin)
+    _seed_investor_agreement_dependencies()
+    investor = client.post("/admin/investors", headers=headers, json=_payload()).get_json()
+
+    resp = client.get(f"/admin/reports/investor-balances?as_of_date=2026-07-18&investor_id={investor['id']}&status=CLOSED", headers=headers)
+
+    assert resp.status_code == 200
+    assert resp.get_json() == {
+        "as_of_date": "2026-07-18",
+        "items": [],
+        "summary": {
+            "total_investors": 0,
+            "total_agreements": 0,
+            "total_principal": 0,
+            "total_accrued_interest": 0,
+            "total_payable": 0,
+        },
+    }
