@@ -1,10 +1,11 @@
 from datetime import date
+from decimal import Decimal
 from flask import Blueprint, current_app, jsonify, request
 from sqlalchemy import or_
 from flask_jwt_extended import get_jwt_identity
 from ..extensions import db
-from ..models import Investor, InvestorFundingAgreement, InvestorFundingTransaction, InvestorInterestAccrual
-from ..investor_funding import create_investor, create_agreement, record_funding, principal_repayment, calculate_investor_interest, post_investor_interest_accrual, pay_interest, capitalize_interest, month_bounds, completed_periods_for, reverse_investor_transaction, investor_reconciliation, reverse_interest_accrual, catch_up_investor_interest, investor_interest_summary
+from ..models import AccountingJournalEntry, Investor, InvestorFundingAgreement, InvestorFundingTransaction, InvestorInterestAccrual
+from ..investor_funding import INCREASE_TYPES, DECREASE_TYPES, create_investor, create_agreement, record_funding, principal_repayment, calculate_investor_interest, post_investor_interest_accrual, pay_interest, capitalize_interest, month_bounds, completed_periods_for, reverse_investor_transaction, investor_reconciliation, reverse_interest_accrual, catch_up_investor_interest, investor_interest_summary
 from ..accounting import ValidationError, AccountingError
 from .utils import role_required
 
@@ -535,9 +536,159 @@ def rep_funding(): return jsonify({"items":[tx_dict(t) for t in InvestorFundingT
 @investors_bp.route("/reports/investor-interest")
 @role_required(["admin"])
 def rep_interest(): return jsonify({"items":[ac_dict(a) for a in InvestorInterestAccrual.query.all()]})
+def _optional_int_filter(name):
+    raw = request.args.get(name)
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise ValidationError("invalid_filter", message=f"{name} must be an integer.")
+    if value <= 0:
+        raise ValidationError("invalid_filter", message=f"{name} must be a positive integer.")
+    return value
+
+
+def _balance_report_as_of_date():
+    raw = (request.args.get("as_of_date") or "").strip()
+    if not raw:
+        raise ValidationError("invalid_filter", message="as_of_date is required.")
+    try:
+        return date.fromisoformat(raw)
+    except ValueError:
+        raise ValidationError("invalid_filter", message="as_of_date must be a valid ISO date.")
+
+
+def _posted_transaction_query(as_of):
+    return (
+        InvestorFundingTransaction.query.outerjoin(
+            AccountingJournalEntry,
+            InvestorFundingTransaction.journal_entry_id == AccountingJournalEntry.id,
+        )
+        .filter(
+            InvestorFundingTransaction.status.in_(["POSTED", "APPROVED"]),
+            InvestorFundingTransaction.reversed_at.is_(None),
+            InvestorFundingTransaction.transaction_date <= as_of,
+            InvestorFundingTransaction.accounting_date <= as_of,
+            or_(
+                InvestorFundingTransaction.journal_entry_id.is_(None),
+                db.and_(
+                    AccountingJournalEntry.status == "POSTED",
+                    AccountingJournalEntry.reversed_at.is_(None),
+                    AccountingJournalEntry.journal_date <= as_of,
+                ),
+            ),
+        )
+    )
+
+
+def _investor_balance_item(agreement, as_of, txs, accruals):
+    investor = agreement.investor
+    total_funding = Decimal("0.00")
+    principal_repayments = Decimal("0.00")
+    current_principal = Decimal("0.00")
+    last_funding_date = None
+    for tx in txs:
+        amount = Decimal(tx.amount or 0)
+        if tx.transaction_type in INCREASE_TYPES:
+            current_principal += amount
+            if tx.transaction_type in {"INITIAL_FUNDING", "ADDITIONAL_FUNDING"}:
+                total_funding += amount
+                if last_funding_date is None or tx.transaction_date > last_funding_date:
+                    last_funding_date = tx.transaction_date
+        elif tx.transaction_type in DECREASE_TYPES:
+            current_principal -= amount
+            if tx.transaction_type in {"PRINCIPAL_REPAYMENT", "PRINCIPAL_WITHDRAWAL"}:
+                principal_repayments += amount
+
+    accrued_interest = Decimal("0.00")
+    interest_paid = Decimal("0.00")
+    withholding_tax = Decimal("0.00")
+    last_accrual_date = None
+    for accrual in accruals:
+        gross = Decimal(accrual.gross_interest_amount or 0)
+        tax = Decimal(accrual.withholding_tax_amount or 0)
+        paid = Decimal(accrual.payment_amount or 0)
+        capitalized = Decimal(accrual.capitalization_amount or 0)
+        accrued_interest += gross - tax - paid - capitalized
+        interest_paid += paid
+        withholding_tax += tax
+        if last_accrual_date is None or accrual.accrual_period_end > last_accrual_date:
+            last_accrual_date = accrual.accrual_period_end
+
+    total_payable = current_principal + accrued_interest
+    return {
+        "investor_id": investor.id if investor else agreement.investor_id,
+        "investor_number": investor.investor_number if investor else None,
+        "investor_name": investor_display_name(investor) if investor else None,
+        "agreement_id": agreement.id,
+        "agreement_number": agreement.agreement_number,
+        "agreement_name": agreement.agreement_name,
+        "agreement_status": normalize_status(agreement.status),
+        "status": normalize_status(agreement.status),
+        "original_principal": dec(agreement.original_principal_amount) or 0,
+        "total_funding": dec(total_funding) or 0,
+        "principal_repayments": dec(principal_repayments) or 0,
+        "current_principal": dec(current_principal) or 0,
+        "accrued_interest": dec(accrued_interest) or 0,
+        "interest_paid": dec(interest_paid) or 0,
+        "withholding_tax": dec(withholding_tax) or 0,
+        "total_amount_payable": dec(total_payable) or 0,
+        "last_funding_date": last_funding_date.isoformat() if last_funding_date else None,
+        "last_accrual_date": last_accrual_date.isoformat() if last_accrual_date else None,
+        "as_of_date": as_of.isoformat(),
+    }
+
+
 @investors_bp.route("/reports/investor-balances")
 @role_required(["admin"])
-def rep_balances(): return jsonify({"items":[agr_dict(a) for a in InvestorFundingAgreement.query.all()]})
+def rep_balances():
+    try:
+        as_of = _balance_report_as_of_date()
+        investor_id = _optional_int_filter("investor_id")
+        agreement_id = _optional_int_filter("agreement_id")
+    except ValidationError as exc:
+        return error(exc)
+
+    status = normalize_status(request.args.get("status"))
+    if investor_id is not None and db.session.get(Investor, investor_id) is None:
+        return investor_not_found()
+    agreement = db.session.get(InvestorFundingAgreement, agreement_id) if agreement_id is not None else None
+    if agreement_id is not None and agreement is None:
+        return investor_agreement_not_found()
+
+    query = InvestorFundingAgreement.query.join(Investor)
+    if investor_id is not None:
+        query = query.filter(InvestorFundingAgreement.investor_id == investor_id)
+    if agreement_id is not None:
+        query = query.filter(InvestorFundingAgreement.id == agreement_id)
+    if status:
+        query = query.filter(db.func.upper(InvestorFundingAgreement.status) == status)
+    agreements = query.order_by(Investor.investor_number, InvestorFundingAgreement.agreement_number).all()
+    agreement_ids = [a.id for a in agreements]
+
+    txs_by_agreement = {aid: [] for aid in agreement_ids}
+    accruals_by_agreement = {aid: [] for aid in agreement_ids}
+    if agreement_ids:
+        for tx in _posted_transaction_query(as_of).filter(InvestorFundingTransaction.agreement_id.in_(agreement_ids)).all():
+            txs_by_agreement.setdefault(tx.agreement_id, []).append(tx)
+        for accrual in InvestorInterestAccrual.query.filter(
+            InvestorInterestAccrual.agreement_id.in_(agreement_ids),
+            InvestorInterestAccrual.accrual_period_end <= as_of,
+            InvestorInterestAccrual.status.in_(["POSTED", "APPROVED", "PARTIALLY_PAID", "PAID", "CAPITALIZED"]),
+            InvestorInterestAccrual.reversed_at.is_(None),
+        ).all():
+            accruals_by_agreement.setdefault(accrual.agreement_id, []).append(accrual)
+
+    items = [_investor_balance_item(a, as_of, txs_by_agreement.get(a.id, []), accruals_by_agreement.get(a.id, [])) for a in agreements]
+    summary = {
+        "total_investors": len({item["investor_id"] for item in items}),
+        "total_agreements": len(items),
+        "total_principal": dec(sum((Decimal(str(item["current_principal"])) for item in items), Decimal("0.00"))) or 0,
+        "total_accrued_interest": dec(sum((Decimal(str(item["accrued_interest"])) for item in items), Decimal("0.00"))) or 0,
+        "total_payable": dec(sum((Decimal(str(item["total_amount_payable"])) for item in items), Decimal("0.00"))) or 0,
+    }
+    return jsonify({"as_of_date": as_of.isoformat(), "items": items, "summary": summary})
 @investors_bp.route("/reports/investor-reconciliation")
 @role_required(["admin"])
 def rep_recon(): return jsonify(investor_reconciliation())
