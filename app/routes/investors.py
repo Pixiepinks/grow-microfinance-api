@@ -549,14 +549,18 @@ def _optional_int_filter(name):
     return value
 
 
-def _balance_report_as_of_date():
-    raw = (request.args.get("as_of_date") or "").strip()
+def _parse_balance_report_as_of_date(as_of_date):
+    raw = (as_of_date or "").strip()
     if not raw:
-        raise ValidationError("invalid_filter", message="as_of_date is required.")
+        raise ValidationError("invalid_as_of_date", message="Enter a valid as-of date.")
     try:
         return date.fromisoformat(raw)
     except ValueError:
-        raise ValidationError("invalid_filter", message="as_of_date must be a valid ISO date.")
+        raise ValidationError("invalid_as_of_date", message="Enter a valid as-of date.")
+
+
+def _balance_report_as_of_date():
+    return _parse_balance_report_as_of_date(request.args.get("as_of_date"))
 
 
 def _posted_transaction_query(as_of):
@@ -630,9 +634,11 @@ def _investor_balance_item(agreement, as_of, txs, accruals):
         "total_funding": dec(total_funding) or 0,
         "principal_repayments": dec(principal_repayments) or 0,
         "current_principal": dec(current_principal) or 0,
-        "accrued_interest": dec(accrued_interest) or 0,
+        "gross_interest_accrued": dec(sum((Decimal(a.gross_interest_amount or 0) for a in accruals), Decimal("0.00"))) or 0,
         "interest_paid": dec(interest_paid) or 0,
         "withholding_tax": dec(withholding_tax) or 0,
+        "accrued_interest": dec(accrued_interest) or 0,
+        "total_payable": dec(total_payable) or 0,
         "total_amount_payable": dec(total_payable) or 0,
         "last_funding_date": last_funding_date.isoformat() if last_funding_date else None,
         "last_accrual_date": last_accrual_date.isoformat() if last_accrual_date else None,
@@ -640,29 +646,32 @@ def _investor_balance_item(agreement, as_of, txs, accruals):
     }
 
 
-@investors_bp.route("/reports/investor-balances")
-@role_required(["admin"])
-def rep_balances():
-    try:
-        as_of = _balance_report_as_of_date()
-        investor_id = _optional_int_filter("investor_id")
-        agreement_id = _optional_int_filter("agreement_id")
-    except ValidationError as exc:
-        return error(exc)
+def build_investor_balance_report(as_of_date, investor_id=None, agreement_id=None, status=None):
+    as_of = _parse_balance_report_as_of_date(as_of_date)
 
-    status = normalize_status(request.args.get("status"))
+    def parse_optional_int(value, name):
+        if value is None or str(value).strip() == "":
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            raise ValidationError("invalid_filter", message=f"{name} must be an integer.")
+
+    investor_id = parse_optional_int(investor_id, "investor_id")
+    agreement_id = parse_optional_int(agreement_id, "agreement_id")
+    status = normalize_status(status or "ALL") or "ALL"
+
     if investor_id is not None and db.session.get(Investor, investor_id) is None:
-        return investor_not_found()
-    agreement = db.session.get(InvestorFundingAgreement, agreement_id) if agreement_id is not None else None
-    if agreement_id is not None and agreement is None:
-        return investor_agreement_not_found()
+        raise ValidationError("investor_not_found", message="The selected investor was not found.", status_code=404)
+    if agreement_id is not None and db.session.get(InvestorFundingAgreement, agreement_id) is None:
+        raise ValidationError("agreement_not_found", message="The selected funding agreement was not found.", status_code=404)
 
     query = InvestorFundingAgreement.query.join(Investor)
     if investor_id is not None:
         query = query.filter(InvestorFundingAgreement.investor_id == investor_id)
     if agreement_id is not None:
         query = query.filter(InvestorFundingAgreement.id == agreement_id)
-    if status:
+    if status != "ALL":
         query = query.filter(db.func.upper(InvestorFundingAgreement.status) == status)
     agreements = query.order_by(Investor.investor_number, InvestorFundingAgreement.agreement_number).all()
     agreement_ids = [a.id for a in agreements]
@@ -684,11 +693,49 @@ def rep_balances():
     summary = {
         "total_investors": len({item["investor_id"] for item in items}),
         "total_agreements": len(items),
-        "total_principal": dec(sum((Decimal(str(item["current_principal"])) for item in items), Decimal("0.00"))) or 0,
-        "total_accrued_interest": dec(sum((Decimal(str(item["accrued_interest"])) for item in items), Decimal("0.00"))) or 0,
-        "total_payable": dec(sum((Decimal(str(item["total_amount_payable"])) for item in items), Decimal("0.00"))) or 0,
+        "original_principal": dec(sum((Decimal(str(item["original_principal"])) for item in items), Decimal("0.00"))) or 0,
+        "total_funding": dec(sum((Decimal(str(item["total_funding"])) for item in items), Decimal("0.00"))) or 0,
+        "current_principal": dec(sum((Decimal(str(item["current_principal"])) for item in items), Decimal("0.00"))) or 0,
+        "accrued_interest": dec(sum((Decimal(str(item["accrued_interest"])) for item in items), Decimal("0.00"))) or 0,
+        "total_payable": dec(sum((Decimal(str(item["total_payable"])) for item in items), Decimal("0.00"))) or 0,
     }
-    return jsonify({"as_of_date": as_of.isoformat(), "items": items, "summary": summary})
+    summary["total_principal"] = summary["current_principal"]
+    summary["total_accrued_interest"] = summary["accrued_interest"]
+    return {
+        "as_of_date": as_of.isoformat(),
+        "filters": {"investor_id": investor_id, "agreement_id": agreement_id, "status": status},
+        "items": items,
+        "summary": summary,
+    }
+
+
+@investors_bp.route("/investor-funding/reports/balances", methods=["GET"], strict_slashes=False)
+@role_required(["admin"])
+def investor_balance_report():
+    try:
+        result = build_investor_balance_report(
+            as_of_date=request.args.get("as_of_date"),
+            investor_id=request.args.get("investor_id"),
+            agreement_id=request.args.get("agreement_id"),
+            status=request.args.get("status"),
+        )
+    except ValidationError as exc:
+        return error(exc)
+    return jsonify(result), 200
+
+
+@investors_bp.route("/reports/investor-balances")
+@role_required(["admin"])
+def rep_balances():
+    try:
+        return jsonify(build_investor_balance_report(
+            as_of_date=request.args.get("as_of_date"),
+            investor_id=request.args.get("investor_id"),
+            agreement_id=request.args.get("agreement_id"),
+            status=request.args.get("status"),
+        ))
+    except ValidationError as exc:
+        return error(exc)
 @investors_bp.route("/reports/investor-reconciliation")
 @role_required(["admin"])
 def rep_recon(): return jsonify(investor_reconciliation())
