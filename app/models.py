@@ -125,6 +125,12 @@ class Customer(db.Model):
     eligibility_status = db.Column(db.String(32), nullable=False, default="UNKNOWN")
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
+    __table_args__ = (
+        Index("ix_customers_nic_number", "nic_number"),
+        Index("ix_customers_mobile", "mobile"),
+        Index("ix_customers_lower_full_name", func.lower(full_name)),
+    )
+
     user = relationship("User", back_populates="customer_profile")
     loans = relationship("Loan", back_populates="customer")
     loan_applications = relationship("LoanApplication", back_populates="customer")

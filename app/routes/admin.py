@@ -5,6 +5,7 @@ from sqlalchemy.exc import IntegrityError
 import logging
 import secrets
 from flask_jwt_extended import get_jwt_identity
+from sqlalchemy import String, case, cast, false, func, or_
 from sqlalchemy.orm import joinedload
 
 from app.supabase_client import build_public_url
@@ -38,6 +39,67 @@ from .utils import role_required
 
 admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
 logger = logging.getLogger(__name__)
+
+
+
+def _parse_customer_search_limit(raw_limit) -> int:
+    try:
+        parsed_limit = int(raw_limit) if raw_limit is not None else 10
+    except (TypeError, ValueError):
+        parsed_limit = 10
+    return min(max(parsed_limit, 1), 20)
+
+
+def _normalized_phone_expression(column):
+    normalized = func.coalesce(column, "")
+    for old in (" ", "-", "+", "(", ")", "."):
+        normalized = func.replace(normalized, old, "")
+    return normalized
+
+
+def _phone_search_variants(query: str) -> set[str]:
+    digits = "".join(ch for ch in query if ch.isdigit())
+    if not digits:
+        return set()
+
+    variants = {digits}
+    if digits.startswith("94") and len(digits) > 2:
+        variants.add("0" + digits[2:])
+        variants.add(digits[2:])
+    elif digits.startswith("0") and len(digits) > 1:
+        variants.add("94" + digits[1:])
+        variants.add(digits[1:])
+    else:
+        variants.add("0" + digits)
+        variants.add("94" + digits)
+    return {variant for variant in variants if variant}
+
+
+def _serialize_customer_search_item(customer: Customer) -> dict:
+    customer_number = customer.customer_code
+    full_name = customer.full_name
+    mobile = customer.mobile
+    label_parts = [part for part in (customer_number, full_name, mobile) if part]
+    return {
+        "id": customer.id,
+        "customer_id": customer.id,
+        "customer_number": customer_number,
+        "full_name": full_name,
+        "nic": customer.nic_number,
+        "mobile": mobile,
+        "email": customer.user.email if customer.user else None,
+        "address_line_1": (
+            customer.permanent_address_line1
+            or customer.current_address_line1
+            or customer.address
+        ),
+        "address_line_2": customer.permanent_address_line2 or customer.current_address_line2,
+        "city": customer.permanent_city or customer.current_city,
+        "district": customer.permanent_district or customer.current_district,
+        "province": customer.permanent_province or customer.current_province,
+        "date_of_birth": customer.date_of_birth.isoformat() if customer.date_of_birth else None,
+        "label": " — ".join(label_parts),
+    }
 
 def _compact_account(account):
     if not account:
@@ -243,6 +305,94 @@ def create_customer():
     db.session.commit()
 
     return jsonify({"message": "Customer created", "customer_id": customer.id})
+
+
+
+
+@admin_bp.route("/customers/search", methods=["GET"], strict_slashes=False)
+@role_required(["admin"])
+def search_customers():
+    query_text = str(request.args.get("q") or "").strip()
+    limit = _parse_customer_search_limit(request.args.get("limit"))
+    if not query_text:
+        return jsonify({"items": [], "total": 0, "query": ""})
+
+    try:
+        search = f"%{query_text}%"
+        prefix = f"{query_text}%"
+        exact_lower = query_text.lower()
+        numeric_id = int(query_text) if query_text.isdigit() else None
+        mobile_normalized = _normalized_phone_expression(Customer.mobile)
+        guarantor_mobile_normalized = _normalized_phone_expression(
+            Customer.guarantor_mobile
+        )
+        phone_variants = _phone_search_variants(query_text)
+
+        filters = [
+            Customer.customer_code.ilike(search),
+            Customer.full_name.ilike(search),
+            Customer.nic_number.ilike(search),
+            Customer.mobile.ilike(search),
+            Customer.guarantor_mobile.ilike(search),
+            User.email.ilike(search),
+            cast(Customer.id, String).ilike(search),
+        ]
+        for variant in phone_variants:
+            filters.extend(
+                [
+                    mobile_normalized.like(f"%{variant}%"),
+                    guarantor_mobile_normalized.like(f"%{variant}%"),
+                ]
+            )
+
+        rank = case(
+            (Customer.id == numeric_id, 1),
+            (func.lower(Customer.customer_code) == exact_lower, 2),
+            (func.lower(Customer.nic_number) == exact_lower, 3),
+            (
+                or_(*[mobile_normalized == variant for variant in phone_variants])
+                if phone_variants
+                else false(),
+                4,
+            ),
+            (
+                or_(
+                    Customer.nic_number.ilike(prefix),
+                    *[mobile_normalized.like(f"{variant}%") for variant in phone_variants],
+                ),
+                5,
+            ),
+            (Customer.full_name.ilike(prefix), 6),
+            else_=7,
+        )
+
+        customer_query = Customer.query.outerjoin(User)
+        include_inactive = str(
+            request.args.get("include_inactive", "false")
+        ).lower() in ("1", "true", "yes", "on")
+        if not include_inactive:
+            customer_query = customer_query.filter(
+                Customer.status.in_(["Active", "ACTIVE", "active"])
+            )
+
+        customers = (
+            customer_query.filter(or_(*filters))
+            .order_by(rank.asc(), Customer.customer_code.asc(), Customer.id.asc())
+            .limit(limit)
+            .all()
+        )
+        return jsonify(
+            {
+                "items": [
+                    _serialize_customer_search_item(customer) for customer in customers
+                ],
+                "total": len(customers),
+                "query": query_text,
+            }
+        )
+    except Exception as exc:  # pragma: no cover - defensive logging
+        current_app.logger.exception("Customer search failed: %s", exc)
+        return jsonify({"message": "Failed to search customers"}), 500
 
 
 @admin_bp.route("/customers", methods=["GET"])
