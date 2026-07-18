@@ -40,6 +40,9 @@ from .utils import role_required
 admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
 logger = logging.getLogger(__name__)
 
+ACTIVE_LOAN_STATUSES = {"ACTIVE", "DISBURSED"}
+POSTED_PAYMENT_STATUSES = {"POSTED"}
+
 
 
 def _parse_customer_search_limit(raw_limit) -> int:
@@ -812,26 +815,76 @@ def repair_payment_accounting(payment_id):
 @admin_bp.route("/dashboard", methods=["GET"])
 @role_required(["admin"])
 def dashboard():
-    total_customers = Customer.query.count()
-    active_loans = Loan.query.filter(Loan.status.in_(["Active", "ACTIVE"])).all()
-    total_active_loans = len(active_loans)
+    normalized_loan_status = func.upper(func.trim(Loan.status))
+    normalized_payment_status = func.upper(func.trim(Payment.status))
+
+    total_customers = int(Customer.query.count() or 0)
+    active_loans_query = Loan.query.filter(normalized_loan_status.in_(ACTIVE_LOAN_STATUSES))
+    active_loans = active_loans_query.all()
+    active_loans_count = int(
+        db.session.query(func.count(Loan.id))
+        .filter(normalized_loan_status.in_(ACTIVE_LOAN_STATUSES))
+        .scalar()
+        or 0
+    )
     total_outstanding = sum((loan.outstanding for loan in active_loans), Decimal("0"))
 
     today = date.today()
-    todays_payments = Payment.query.filter(Payment.collection_date == today).all()
-    todays_collection = sum((p.amount_collected for p in todays_payments), Decimal("0"))
-
-    return jsonify(
-        {
-            "total_customers": total_customers,
-            "total_active_loans": total_active_loans,
-            "currency": CURRENCY_CODE,
-            "total_outstanding": float(total_outstanding),
-            "total_outstanding_formatted": format_currency(total_outstanding),
-            "todays_collection": float(todays_collection),
-            "todays_collection_formatted": format_currency(todays_collection),
-        }
+    payments_today = int(
+        db.session.query(func.count(Payment.id))
+        .filter(
+            Payment.collection_date == today,
+            normalized_payment_status.in_(POSTED_PAYMENT_STATUSES),
+            Payment.reversed_at.is_(None),
+        )
+        .scalar()
+        or 0
     )
+    todays_collection = (
+        db.session.query(func.coalesce(func.sum(Payment.amount_collected), 0))
+        .filter(
+            Payment.collection_date == today,
+            normalized_payment_status.in_(POSTED_PAYMENT_STATUSES),
+            Payment.reversed_at.is_(None),
+        )
+        .scalar()
+        or Decimal("0")
+    )
+
+    status_distribution = (
+        db.session.query(Loan.status, func.count(Loan.id))
+        .group_by(Loan.status)
+        .order_by(Loan.status)
+        .all()
+    )
+    response = {
+        "total_customers": total_customers,
+        "totalCustomers": total_customers,
+        "active_loans": active_loans_count,
+        "activeLoans": active_loans_count,
+        "total_active_loans": active_loans_count,
+        "totalActiveLoans": active_loans_count,
+        "payments_today": payments_today,
+        "paymentsToday": payments_today,
+        "currency": CURRENCY_CODE,
+        "total_outstanding": float(total_outstanding),
+        "total_outstanding_formatted": format_currency(total_outstanding),
+        "todays_collection": float(todays_collection),
+        "todays_collection_formatted": format_currency(todays_collection),
+    }
+    current_app.logger.info(
+        "Dashboard loan status distribution=%s active_statuses=%s",
+        [(status, int(count or 0)) for status, count in status_distribution],
+        sorted(ACTIVE_LOAN_STATUSES),
+    )
+    current_app.logger.info(
+        "Dashboard metrics total_customers=%s active_loans=%s payments_today=%s response_keys=%s",
+        total_customers,
+        active_loans_count,
+        payments_today,
+        sorted(response.keys()),
+    )
+    return jsonify(response)
 
 
 @admin_bp.route("/documents/repository", methods=["GET"])
