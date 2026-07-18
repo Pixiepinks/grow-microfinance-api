@@ -76,3 +76,51 @@ def test_interest_payment_clears_payable_to_bank(app):
         assert journal.lines[0].debit == Decimal("20000.00")
         assert journal.lines[1].account_id == agr.funding_account_id
         assert journal.lines[1].credit == Decimal("20000.00")
+
+
+def test_historical_catch_up_starts_from_posted_funding_and_skips_incomplete_month(app):
+    from app.investor_funding import catch_up_investor_interest
+
+    with app.app_context():
+        seed_default_accounts()
+        inv = create_investor({"full_name": "Historical Investor"})
+        db.session.flush()
+        agr = create_agreement({"investor_id": inv.id, "agreement_date": "2026-02-20", "start_date": "2026-02-20", "interest_rate": "2", "status": "ACTIVE"})
+        db.session.flush()
+
+        no_funding = catch_up_investor_interest(agr.id, date(2026, 7, 18), post=False)
+        assert no_funding["skipped_periods"][0]["reason"] == "No posted investor funding transaction exists."
+
+        record_funding(agr.id, {"transaction_date": "2026-02-20", "amount": "50000"})
+        result = catch_up_investor_interest(agr.id, date(2026, 7, 18), post=True)
+        db.session.commit()
+
+        assert [p["period_start"] for p in result["created_periods"]] == ["2026-02-20", "2026-03-01", "2026-04-01", "2026-05-01", "2026-06-01"]
+        assert [Decimal(str(p["interest"])).quantize(Decimal("0.01")) for p in result["created_periods"]] == [Decimal("321.43"), Decimal("1000.00"), Decimal("1000.00"), Decimal("1000.00"), Decimal("1000.00")]
+        assert InvestorInterestAccrual.query.count() == 5
+        assert sum((a.gross_interest_amount for a in InvestorInterestAccrual.query.all()), Decimal("0.00")) == Decimal("4321.43")
+
+        second = catch_up_investor_interest(agr.id, date(2026, 7, 18), post=True)
+        db.session.commit()
+        assert second["created_periods"] == []
+        assert len(second["existing_periods"]) == 5
+        assert InvestorInterestAccrual.query.count() == 5
+
+
+def test_catch_up_uses_actual_funding_date_not_agreement_start(app):
+    from app.investor_funding import catch_up_investor_interest
+
+    with app.app_context():
+        seed_default_accounts()
+        inv = create_investor({"full_name": "Later Funded Investor"})
+        db.session.flush()
+        agr = create_agreement({"investor_id": inv.id, "agreement_date": "2026-02-20", "start_date": "2026-02-20", "interest_rate": "2", "status": "ACTIVE"})
+        db.session.flush()
+        record_funding(agr.id, {"transaction_date": "2026-03-15", "amount": "50000"})
+
+        result = catch_up_investor_interest(agr.id, date(2026, 7, 18), post=False)
+        assert result["funding_start_date"] == "2026-03-15"
+        assert result["created_periods"][0]["period_start"] == "2026-03-15"
+        assert result["created_periods"][0]["period_end"] == "2026-03-31"
+        assert Decimal(str(result["created_periods"][0]["interest"])).quantize(Decimal("0.01")) == Decimal("548.39")
+        assert all(not p["period_start"].startswith("2026-02") for p in result["created_periods"])

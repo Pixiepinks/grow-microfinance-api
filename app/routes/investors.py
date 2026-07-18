@@ -4,7 +4,7 @@ from sqlalchemy import or_
 from flask_jwt_extended import get_jwt_identity
 from ..extensions import db
 from ..models import Investor, InvestorFundingAgreement, InvestorFundingTransaction, InvestorInterestAccrual
-from ..investor_funding import create_investor, create_agreement, record_funding, principal_repayment, calculate_investor_interest, post_investor_interest_accrual, pay_interest, capitalize_interest, month_bounds, completed_periods_for, reverse_investor_transaction, investor_reconciliation, reverse_interest_accrual
+from ..investor_funding import create_investor, create_agreement, record_funding, principal_repayment, calculate_investor_interest, post_investor_interest_accrual, pay_interest, capitalize_interest, month_bounds, completed_periods_for, reverse_investor_transaction, investor_reconciliation, reverse_interest_accrual, catch_up_investor_interest, investor_interest_summary
 from ..accounting import ValidationError, AccountingError
 from .utils import role_required
 
@@ -178,10 +178,11 @@ def agreement_list_dict(a, accrued_interest=0):
 
 def agr_dict(a):
     posted = [x for x in a.interest_accruals if x.status in {"POSTED","PARTIALLY_PAID","PAID","CAPITALIZED"}]
-    unpaid = sum((x.net_interest_payable - x.payment_amount - x.capitalization_amount for x in posted), 0)
     paid = sum((x.payment_amount for x in posted), 0); cap = sum((x.capitalization_amount for x in posted), 0)
-    last = max([x.accrual_period_end for x in posted], default=None)
-    return {"id":a.id,"agreement_id":a.id,"agreement_number":a.agreement_number,"investor_id":a.investor_id,"investor":inv_dict(a.investor),"agreement_name":a.agreement_name,"agreement_date":a.agreement_date.isoformat() if a.agreement_date else None,"start_date":a.start_date.isoformat() if a.start_date else None,"original_principal":dec(a.original_principal_amount),"original_principal_amount":dec(a.original_principal_amount),"current_principal":dec(a.current_principal_balance),"current_principal_balance":dec(a.current_principal_balance),"interest_rate":dec(a.interest_rate),"interest_rate_period":a.interest_rate_period,"interest_rate_label":f"{a.interest_rate:.2f}% per {a.interest_rate_period.lower()}","calculation_method":a.calculation_method,"accrued_unpaid_interest":dec(unpaid),"interest_paid":dec(paid),"capitalized_interest":dec(cap),"maturity_date":a.maturity_date.isoformat() if a.maturity_date else None,"next_accrual_date":None,"last_accrued_through":last.isoformat() if last else None,"status":a.status,"created_at":a.created_at.isoformat() if a.created_at else None,"account_mappings":{"funding_account_id":a.funding_account_id,"investor_liability_account_id":a.investor_liability_account_id,"interest_expense_account_id":a.interest_expense_account_id,"accrued_interest_payable_account_id":a.accrued_interest_payable_account_id,"withholding_tax_account_id":a.withholding_tax_account_id},"warnings":[],"reconciliation_status":"OK"}
+    summary = investor_interest_summary(a.id)
+    last = summary["last_accrued_through"]
+    next_date = summary["next_accrual_date"]
+    return {"id":a.id,"agreement_id":a.id,"agreement_number":a.agreement_number,"investor_id":a.investor_id,"investor":inv_dict(a.investor),"agreement_name":a.agreement_name,"agreement_date":a.agreement_date.isoformat() if a.agreement_date else None,"start_date":a.start_date.isoformat() if a.start_date else None,"original_principal":dec(a.original_principal_amount),"original_principal_amount":dec(a.original_principal_amount),"current_principal":dec(a.current_principal_balance),"current_principal_balance":dec(a.current_principal_balance),"interest_rate":dec(a.interest_rate),"interest_rate_period":a.interest_rate_period,"interest_rate_label":f"{a.interest_rate:.2f}% per {a.interest_rate_period.lower()}","calculation_method":a.calculation_method,"accrued_interest":dec(summary["accrued_interest"]),"accrued_unpaid_interest":dec(summary["accrued_unpaid_interest"]),"interest_paid":dec(paid),"capitalized_interest":dec(cap),"maturity_date":a.maturity_date.isoformat() if a.maturity_date else None,"next_accrual_date":next_date.isoformat() if next_date else None,"last_accrued_through":last.isoformat() if last else None,"missing_accrual_periods":summary["missing_accrual_periods"],"interest_catch_up_required":summary["interest_catch_up_required"],"accrual_status":summary["accrual_status"],"status":a.status,"created_at":a.created_at.isoformat() if a.created_at else None,"account_mappings":{"funding_account_id":a.funding_account_id,"investor_liability_account_id":a.investor_liability_account_id,"interest_expense_account_id":a.interest_expense_account_id,"accrued_interest_payable_account_id":a.accrued_interest_payable_account_id,"withholding_tax_account_id":a.withholding_tax_account_id},"warnings":[],"reconciliation_status":"OK"}
 
 def tx_dict(t): return {"id":t.id,"transaction_number":t.transaction_number,"transaction_date":t.transaction_date.isoformat(),"accounting_date":t.accounting_date.isoformat(),"transaction_type":t.transaction_type,"amount":dec(t.amount),"reference":t.reference,"status":t.status,"journal_entry_id":t.journal_entry_id}
 def ac_dict(a): return {"id":a.id,"agreement_id":a.agreement_id,"period_start":a.accrual_period_start.isoformat(),"period_end":a.accrual_period_end.isoformat(),"average_daily_balance":dec(a.average_daily_balance),"gross_interest_amount":dec(a.gross_interest_amount),"withholding_tax_amount":dec(a.withholding_tax_amount),"net_interest_payable":dec(a.net_interest_payable),"payment_amount":dec(a.payment_amount),"capitalization_amount":dec(a.capitalization_amount),"status":a.status,"journal_entry_id":a.journal_entry_id}
@@ -426,7 +427,10 @@ def agreement(aid):
     return jsonify(agr_dict(a))
 @investors_bp.route("/investor-agreements/<int:aid>/activate", methods=["POST"])
 @role_required(["admin"])
-def activate_agreement(aid): a=InvestorFundingAgreement.query.get_or_404(aid); a.status="ACTIVE"; db.session.commit(); return jsonify(agr_dict(a))
+def activate_agreement(aid):
+    a=InvestorFundingAgreement.query.get_or_404(aid); a.status="ACTIVE"
+    catchup=catch_up_investor_interest(aid, date.today(), post=True, requested_by=uid())
+    db.session.commit(); body=agr_dict(a); body["interest_catch_up"]=catchup; return jsonify(body)
 @investors_bp.route("/investor-agreements/<int:aid>/close", methods=["POST"])
 @role_required(["admin"])
 def close_agreement(aid):
@@ -437,7 +441,12 @@ def close_agreement(aid):
 @investors_bp.route("/investor-agreements/<int:aid>/funding", methods=["POST"])
 @role_required(["admin"])
 def funding(aid):
-    try: t=record_funding(aid, request.get_json() or {}, uid()); db.session.commit(); return jsonify(tx_dict(t)),201
+    try:
+        t=record_funding(aid, request.get_json() or {}, uid())
+        db.session.commit()
+        catchup=catch_up_investor_interest(aid, date.today(), post=True, requested_by=uid())
+        db.session.commit()
+        body=tx_dict(t); body["interest_catch_up"]=catchup; return jsonify(body),201
     except Exception as e: return error(e)
 @investors_bp.route("/investor-agreements/<int:aid>/principal-repayment", methods=["POST"])
 @role_required(["admin"])
@@ -466,6 +475,28 @@ def get_investor_funding(tid):
 def reverse_tx(tid):
     data=request.get_json() or {}
     try: rev=reverse_investor_transaction(tid, date.fromisoformat(data["reversal_date"]), data.get("reason","Investor transaction reversal"), uid()); db.session.commit(); return jsonify({"reversal_journal_id":rev.id}),201
+    except Exception as e: return error(e)
+
+
+@investors_bp.route("/investor-agreements/<int:aid>/interest-catch-up", methods=["POST"])
+@role_required(["admin"])
+def interest_catch_up(aid):
+    data=request.get_json() or {}; as_of=date.fromisoformat(data.get("as_of_date")) if data.get("as_of_date") else date.today()
+    post=not bool(data.get("preview_only", False))
+    try:
+        result=catch_up_investor_interest(aid, as_of, post=post, requested_by=uid(), include_partial=bool(data.get("include_partial", False)))
+        if post: db.session.commit()
+        else: db.session.rollback()
+        return jsonify(result)
+    except Exception as e: return error(e)
+
+@investors_bp.route("/investor-agreements/<int:aid>/interest-catch-up/preview", methods=["POST"])
+@role_required(["admin"])
+def interest_catch_up_preview(aid):
+    data=request.get_json() or {}; as_of=date.fromisoformat(data.get("as_of_date")) if data.get("as_of_date") else date.today()
+    try:
+        result=catch_up_investor_interest(aid, as_of, post=False, requested_by=uid(), include_partial=bool(data.get("include_partial", False)))
+        db.session.rollback(); return jsonify(result)
     except Exception as e: return error(e)
 
 @investors_bp.route("/investor-agreements/<int:aid>/interest-preview", methods=["POST"])
