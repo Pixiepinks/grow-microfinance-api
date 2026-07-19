@@ -11,10 +11,23 @@ from .models import Loan
 
 SETTLEMENT_TOLERANCE = Decimal("0.01")
 PRESERVED_STATUSES = {"WRITTEN_OFF", "CANCELLED"}
+AUTHORITATIVE_STATUS_FIELD = "status"
 
 
 def _amount(value):
     return Decimal(str(value or "0"))
+
+
+def serialize_loan_status(loan):
+    """Serialize the persisted, authoritative Loan.status value.
+
+    This deliberately does not infer a status from payments, total_payable, or
+    a ledger row.  ``Loan.status`` is a VARCHAR column and is the one status
+    used by every loan API surface.
+    """
+    value = getattr(loan, AUTHORITATIVE_STATUS_FIELD, None)
+    value = getattr(value, "value", value)  # safe if a future enum is used
+    return str(value or "").strip().upper()
 
 
 def contractual_balances(loan):

@@ -40,7 +40,8 @@ from .utils import role_required
 
 admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
 logger = logging.getLogger(__name__)
-from ..settlement_reconciliation import preview as settlement_preview, post as post_settlement_reconciliation
+from ..settlement_reconciliation import preview as settlement_preview, finalize_loan_reconciliation
+from ..loan_status import serialize_loan_status
 from ..early_settlement import preview_early_loan_settlement, post_early_loan_settlement, reverse_early_loan_settlement, EarlySettlementError
 
 ACTIVE_LOAN_STATUSES = {"ACTIVE", "DISBURSED"}
@@ -659,7 +660,7 @@ def list_loans():
             "customer_credit_balance": float(credit_balance), "disbursement_date": loan.start_date.isoformat() if loan.start_date else None,
             "start_date": loan.start_date.isoformat() if loan.start_date else None,
             "maturity_date": loan.maturity_date.isoformat() if loan.maturity_date else (loan.end_date.isoformat() if loan.end_date else None),
-            "settled_date": loan.settled_date.isoformat() if loan.settled_date else None, "status": loan.status,
+            "settled_date": loan.settled_date.isoformat() if loan.settled_date else None, "status": serialize_loan_status(loan),
             "settlement_reconciliation_required": reconciliation_required,
             "available_actions": [],
             # Legacy list consumers use these keys; monetary values remain numeric.
@@ -729,9 +730,7 @@ def settlement_reconciliation_preview(loan_id):
 def settlement_reconciliation_post(loan_id):
     if not (request.get_json(silent=True) or {}).get("confirm"):
         return jsonify({"error": "confirmation_required", "message": "Confirm the settlement reconciliation before posting."}), 422
-    # Lock the authoritative Loan row so status and reconciliation entries are
-    # persisted together rather than serializing a stale ACTIVE instance.
-    loan = Loan.query.filter_by(id=loan_id).with_for_update().first()
+    loan = Loan.query.get(loan_id)
     if loan is None:
         return jsonify({"error": "loan_not_found", "message": "The selected loan was not found."}), 404
     payload = request.get_json(silent=True) or {}
@@ -748,15 +747,12 @@ def settlement_reconciliation_post(loan_id):
             return jsonify({"error": "stale_settlement_preview", "message": "The supplied customer credit no longer matches the server calculation.", "proposed_customer_credit": float(current_credit)}), 409
     previous_status = loan.status
     try:
-        result = post_settlement_reconciliation(loan, get_jwt_identity(),
+        waiver_amount = payload.get("delay_interest_waiver_amount") if payload.get("waive_delay_interest") else None
+        loan, result = finalize_loan_reconciliation(
+            loan_id, user_id=get_jwt_identity(), waiver_amount=waiver_amount,
+            approval_reference=payload.get("approval_reference"), reason=payload.get("reason"),
             waive_delay_interest=bool(payload.get("waive_delay_interest")),
-            delay_interest_waiver_amount=payload.get("delay_interest_waiver_amount"),
-            approval_reference=payload.get("approval_reference"), reason=payload.get("reason"))
-        if not result.get("processed"):
-            db.session.rollback()
-            return jsonify(_canonical_reconciliation_result(loan, previous_status, result))
-        db.session.commit()
-        db.session.refresh(loan)
+        )
     except Exception as exc:
         db.session.rollback()
         return jsonify({"error": "settlement_reconciliation_failed", "message": str(exc)}), 422
@@ -824,8 +820,8 @@ def _canonical_reconciliation_result(loan, previous_status, result):
         "loan_id": loan.id,
         "loan_number": loan.loan_number,
         "previous_status": previous_status,
-        "new_status": loan.status if result.get("processed") else previous_status,
-        "status": loan.status if result.get("processed") else previous_status,
+        "new_status": serialize_loan_status(loan),
+        "status": serialize_loan_status(loan),
         "settled_date": settled.isoformat() if hasattr(settled, "isoformat") else settled,
         "settled_at": loan.settled_at.isoformat() if result.get("processed") and loan.settled_at else None,
         "reconciliation_id": result.get("settlement_journal_id"),
@@ -964,7 +960,7 @@ def _loan_to_dict(loan: Loan) -> dict:
             if config.get("final_installment_due_date")
             else None
         ),
-        "status": loan.status,
+        "status": serialize_loan_status(loan),
         "total_paid": float(totals["cash_paid"]),
         "cash_paid": float(totals["cash_paid"]),
         "principal_paid": float(totals["principal_paid"]),
