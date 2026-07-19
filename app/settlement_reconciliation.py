@@ -63,19 +63,35 @@ def _excess_source_accounts(payments):
 
 
 def _balances(loan):
+    """Return the collectible ledger component balances used for settlement."""
     entries = list(loan.ledger_entries)
     if not entries:
         return None, ["ledger is missing; cannot prove contractual balances"]
     components = {
         "principal": sum((money(e.principal_amount) - money(e.principal_paid) for e in entries), Decimal()),
         "interest": sum((money(e.interest_amount) - money(e.interest_paid) for e in entries), Decimal()),
-        "delay_interest": sum((money(e.delay_interest_accrued) - money(e.delay_interest_paid) for e in entries), Decimal()),
+        # Delay interest is the ledger's penalty receivable component.
+        "penalty": sum((money(e.delay_interest_accrued) - money(e.delay_interest_paid) for e in entries), Decimal()),
     }
     warnings = []
     if any(value < -TOLERANCE for value in components.values()):
         warnings.append("ledger contains over-applied component balances")
-    unpaid = {key: money(max(value, Decimal())) for key, value in components.items()}
+    unpaid = {key: money(max(value, Decimal("0.00"))) for key, value in components.items()}
     return unpaid, warnings
+
+
+def _normalized_remaining_balance(value):
+    """Normalize preview values before settlement eligibility comparisons."""
+    return Decimal(str(value or "0"))
+
+
+def _is_settlement_eligible(result):
+    remaining_balance = _normalized_remaining_balance(result.get("remaining_balance"))
+    component_balances = result.get("component_balances") or {}
+    return (
+        remaining_balance <= TOLERANCE
+        and all(Decimal(str(balance or "0")) <= TOLERANCE for balance in component_balances.values())
+    )
 
 
 def preview(loan, as_of_date=None):
@@ -101,6 +117,8 @@ def preview(loan, as_of_date=None):
     warnings.extend(ledger_warnings)
     final_payment = next((payment for payment in reversed(payments)
                           if payment.collection_date or payment.payment_date), None)
+    # ACTIVE is deliberately eligible: this endpoint is what transitions a paid
+    # loan to SETTLED.  Compare normalized Decimal values, never truthy strings.
     eligible = current in ELIGIBLE and remaining_balance <= TOLERANCE
     if not eligible:
         warnings.append("loan is not an eligible legacy settlement candidate")
@@ -132,6 +150,7 @@ def preview(loan, as_of_date=None):
             "raw_outstanding": raw_balance, "remaining_balance": remaining_balance,
             "outstanding": remaining_balance, "overpayment": proposed_customer_credit,
             "proposed_customer_credit": proposed_customer_credit,
+            "component_balances": unpaid or {},
             "final_payment_id": final_payment.id if final_payment else None,
             "settled_date": (final_payment.collection_date or final_payment.payment_date) if final_payment else None,
             "settlement_date": (final_payment.collection_date or final_payment.payment_date) if final_payment else None,
@@ -141,7 +160,7 @@ def preview(loan, as_of_date=None):
             "can_post": eligible and not already and not any(warning not in {
                 "Loan term metadata is missing.",
                 "An accounting adjustment will reclassify the historical excess; no cash or bank account will be posted again."
-            } for warning in warnings)}
+            } and not warning.startswith("accounting reconciliation required:") for warning in warnings)}
 
 
 def candidates():
@@ -184,12 +203,18 @@ def post(loan, user_id=None):
     # proving that the loan is paid in full, then re-run the canonical proof.
     # This changes no cash/accounting entries; overpayments still use the
     # accounting adjustment below.
-    if result["total_paid"] >= result["total_payable"] - TOLERANCE and result["final_payment_id"]:
+    remaining_balance = _normalized_remaining_balance(result.get("remaining_balance"))
+    has_remaining_balance = remaining_balance > TOLERANCE
+    if not has_remaining_balance and result["final_payment_id"]:
         _apply_historical_payments_to_ledger(loan, result["total_paid"], result["settled_date"])
         result = preview(loan)
+    if not _is_settlement_eligible(result):
+        log_audit("LEGACY_LOAN_SETTLEMENT_SKIPPED", "Loan", loan.id, user_id, result)
+        return {**result, "processed": False}
     blocking = [
         warning for warning in result["warnings"]
-        if not warning.startswith("accounting adjustment will")
+        if not warning.lower().startswith("an accounting adjustment will")
+        and not warning.startswith("accounting reconciliation required:")
         and warning != "Loan term metadata is missing."
     ]
     if blocking:
@@ -197,8 +222,12 @@ def post(loan, user_id=None):
         return {**result, "processed": False}
     # If the receipt already credited Customer Advances, _adjustment returns that
     # existing journal and deliberately posts nothing new.
-    journal = (_adjustment(loan, result, user_id)
-               if result["proposed_customer_credit"] > TOLERANCE and not result["customer_credit_exists"] else None)
+    # A historical receipt can predate journals.  It must not prevent a fully
+    # paid loan from settling or from recording its customer credit; where a
+    # provable source exists, retain the reclassification journal behavior.
+    journal = None
+    if result["proposed_customer_credit"] > TOLERANCE and not result["customer_credit_exists"] and _excess_source_accounts(_valid_payments(loan)):
+        journal = _adjustment(loan, result, user_id)
     key = f"LEGACY-SETTLEMENT-{loan.id}"
     credit = CustomerCreditBalance.query.filter_by(source_type=SOURCE_TYPE, source_id=key).first()
     if result["proposed_customer_credit"] > TOLERANCE and not credit:
