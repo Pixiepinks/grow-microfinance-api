@@ -579,7 +579,7 @@ def list_loans():
     paid_amount = db.session.query(func.coalesce(func.sum(Payment.amount_collected), 0)).filter(
         Payment.loan_id == Loan.id,
         Payment.reversed_at.is_(None),
-        func.upper(func.trim(Payment.status)) != "REVERSED",
+        func.upper(func.trim(Payment.status)) == "POSTED",
     ).correlate(Loan).scalar_subquery()
     raw_outstanding = (func.coalesce(Loan.total_payable, 0) - paid_amount).label("raw_outstanding")
     outstanding_amount = case((raw_outstanding < 0, 0), else_=raw_outstanding).label("outstanding_amount")
@@ -891,7 +891,9 @@ def loan_disbursement_preview(record_id):
         return _preview_error_response(exc)
 
 def _loan_to_dict(loan: Loan) -> dict:
+    from ..loan_totals import loan_totals
     config = loan_config_summary(loan)
+    totals = loan_totals(loan)
     return {
         "id": loan.id,
         "loan_number": loan.loan_number,
@@ -940,7 +942,20 @@ def _loan_to_dict(loan: Loan) -> dict:
             else None
         ),
         "status": loan.status,
-        "outstanding_amount": float(loan.outstanding),
+        "total_paid": float(totals["cash_paid"]),
+        "cash_paid": float(totals["cash_paid"]),
+        "principal_paid": float(totals["principal_paid"]),
+        "normal_interest_paid": float(totals["normal_interest_paid"]),
+        "delay_interest_paid": float(totals["delay_interest_paid"]),
+        "penalty_paid": float(totals["penalty_paid"]),
+        "fees_paid": float(totals["fees_paid"]),
+        "interest_waived": float(totals["interest_waived"]),
+        "delay_interest_waived": float(totals["delay_interest_waived"]),
+        "penalty_waived": float(totals["penalty_waived"]),
+        "delay_interest_waiver_amount": float(totals["delay_interest_waived"]),
+        "settlement_adjustments": float(totals["settlement_adjustments"]),
+        "gross_satisfied_amount": float(totals["gross_satisfied_amount"]),
+        "outstanding_amount": float(totals["outstanding_amount"]),
         "customer_credit_balance": float(loan.customer_credit_balance or 0),
         "settlement_type": loan.settlement_type,
         "interest_rebate_amount": float(loan.interest_rebate_amount or 0),
@@ -998,6 +1013,9 @@ def _ledger_to_dict(entry: LoanLedger) -> dict:
         "principal_paid": float(entry.principal_paid or 0),
         "interest_paid": float(entry.interest_paid or 0),
         "delay_interest_paid": float(entry.delay_interest_paid or 0),
+        "waived_interest_amount": float(entry.waived_interest_amount or 0),
+        "waived_delay_interest_amount": float(entry.waived_delay_interest_amount or 0),
+        "waived_penalty_amount": float(entry.waived_penalty_amount or 0),
         "delay_interest_accrued": float(entry.delay_interest_accrued or 0),
         "unapplied_amount": float(entry.unapplied_amount or 0),
         "due_status": "OVERDUE" if entry.due_date and entry.due_date < date.today() and entry.status != "PAID" else entry.status,

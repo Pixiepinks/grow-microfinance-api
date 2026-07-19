@@ -317,6 +317,9 @@ class Loan(db.Model):
     early_settlement_id = db.Column(db.Integer)
     interest_rebate_amount = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
     penalty_waiver_amount = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    delay_interest_waiver_amount = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    # Reconciled cache only; receipt aggregation remains the source of truth.
+    cash_paid_cache = db.Column(Numeric(18, 2))
     outstanding_amount = db.Column(Numeric(18, 2))
 
     customer = relationship("Customer", back_populates="loans")
@@ -333,13 +336,13 @@ class Loan(db.Model):
 
     @property
     def total_paid(self) -> Decimal:
-        return sum(
-            (payment.amount_collected for payment in self.payments if not payment.reversed_at and payment.status != "REVERSED"), Decimal("0")
-        )
+        from .loan_totals import loan_totals
+        return loan_totals(self)["cash_paid"]
 
     @property
     def outstanding(self) -> Decimal:
-        return max(Decimal("0.00"), Decimal(self.total_payable or 0) - self.total_paid)
+        from .loan_totals import loan_totals
+        return loan_totals(self)["outstanding_amount"]
 
     def expected_to_date(self) -> Decimal:
         today = date.today()
@@ -416,6 +419,7 @@ class LoanLedger(db.Model):
     status = db.Column(db.String(20), nullable=False, default="PENDING")
     waived_interest_amount = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
     waived_penalty_amount = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    waived_delay_interest_amount = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
     waiver_reason = db.Column(db.String(100))
     early_settlement_id = db.Column(db.Integer)
     original_interest_amount = db.Column(Numeric(18, 2))
