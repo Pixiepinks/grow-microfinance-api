@@ -1,13 +1,13 @@
 """add delay-interest accrual waiver audit fields
 
-Revision ID: 0040_delay_interest_accrual_waiver
-Revises: 0039_loan_settlement
+Revision ID: 0040_delay_interest_waiver
+Revises: 0040_early_loan_settlement
 """
 from alembic import op
 import sqlalchemy as sa
 
-revision = "0040_delay_interest_accrual_waiver"
-down_revision = "0039_loan_settlement"
+revision = "0040_delay_interest_waiver"
+down_revision = "0040_early_loan_settlement"
 branch_labels = None
 depends_on = None
 
