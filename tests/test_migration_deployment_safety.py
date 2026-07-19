@@ -67,7 +67,7 @@ def test_alembic_chain_has_one_head_and_valid_down_revisions():
             assert down_revision in revisions
 
 
-def test_migration_from_0021_to_head_succeeds(tmp_path):
+def test_migration_from_0038_to_head_succeeds(tmp_path):
     database_url = os.getenv("TEST_DATABASE_URL")
     if not database_url:
         import pytest
@@ -80,7 +80,7 @@ def test_migration_from_0021_to_head_succeeds(tmp_path):
         JWT_SECRET_KEY="x" * 32,
     )
     subprocess.run(
-        [sys.executable, "-m", "flask", "--app", "app:create_app", "db", "upgrade", "0021"],
+        [sys.executable, "-m", "flask", "--app", "app:create_app", "db", "upgrade", "0038_inv_accr_cal_days"],
         cwd=ROOT,
         env=env,
         check=True,
@@ -99,7 +99,7 @@ def test_migration_from_0021_to_head_succeeds(tmp_path):
         text=True,
         capture_output=True,
     )
-    assert "0025_ledger_start_nullable" in current.stdout
+    assert "0039_loan_settlement" in current.stdout
 
 
 def test_loan_model_columns_exist_after_schema_creation(app):
