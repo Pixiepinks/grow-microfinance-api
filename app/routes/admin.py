@@ -734,6 +734,18 @@ def settlement_reconciliation_post(loan_id):
     if loan is None:
         return jsonify({"error": "loan_not_found", "message": "The selected loan was not found."}), 404
     payload = request.get_json(silent=True) or {}
+    # The UI uses this explicit name.  Retain the original spelling for older
+    # clients, but never make a zero waiver require waiver documentation.
+    waiver_requested = bool(payload.get("waive_remaining_delay_interest", payload.get("waive_delay_interest", False)))
+    raw_waiver_amount = payload.get("delay_interest_waiver_amount", "0.00")
+    try:
+        waiver_amount = Decimal(str(raw_waiver_amount or "0.00")).quantize(Decimal("0.01"))
+    except Exception:
+        return jsonify({"error": "invalid_delay_interest_waiver", "message": "delay_interest_waiver_amount must be a currency amount."}), 422
+    if waiver_amount < 0:
+        return jsonify({"error": "invalid_delay_interest_waiver", "message": "delay_interest_waiver_amount cannot be negative."}), 422
+    if waiver_amount > 0 and not str(payload.get("reason") or "").strip():
+        return jsonify({"error": "waiver_reason_required", "message": "reason is required for a delay interest waiver."}), 422
     # Credit is calculated from posted receipts on the server; a stale client
     # preview may be supplied only as an optimistic-concurrency assertion.
     supplied_credit = payload.get("proposed_customer_credit", payload.get("customer_credit"))
@@ -747,11 +759,10 @@ def settlement_reconciliation_post(loan_id):
             return jsonify({"error": "stale_settlement_preview", "message": "The supplied customer credit no longer matches the server calculation.", "proposed_customer_credit": float(current_credit)}), 409
     previous_status = loan.status
     try:
-        waiver_amount = payload.get("delay_interest_waiver_amount") if payload.get("waive_delay_interest") else None
         loan, result = finalize_loan_reconciliation(
             loan_id, user_id=get_jwt_identity(), waiver_amount=waiver_amount,
             approval_reference=payload.get("approval_reference"), reason=payload.get("reason"),
-            waive_delay_interest=bool(payload.get("waive_delay_interest")),
+            waive_delay_interest=waiver_requested,
         )
     except Exception as exc:
         db.session.rollback()
@@ -825,6 +836,8 @@ def _canonical_reconciliation_result(loan, previous_status, result):
         "settled_date": settled.isoformat() if hasattr(settled, "isoformat") else settled,
         "settled_at": loan.settled_at.isoformat() if result.get("processed") and loan.settled_at else None,
         "reconciliation_id": result.get("settlement_journal_id"),
+        "reclassification_journal_id": result.get("reclassification_journal_id"),
+        "waiver_journal_id": result.get("waiver_journal_id"),
         "total_payable": number(result["total_payable"]),
         "total_paid": number(result["total_paid"]),
         "total_cash_received": number(result["total_cash_received"]),
@@ -837,6 +850,11 @@ def _canonical_reconciliation_result(loan, previous_status, result):
         "delay_interest_outstanding": number(result.get("delay_interest_outstanding")),
         "overpayment": number(result["overpayment"]),
         "proposed_customer_credit": number(result["proposed_customer_credit"]),
+        "customer_credit_created": number(result.get("customer_credit_created", 0)),
+        "customer_credit_balance": number(result.get("customer_credit_balance", 0)),
+        "delay_interest_reclassified": number(result.get("delay_interest_reclassified", 0)),
+        "effective_delay_interest_paid": number(result.get("effective_delay_interest_paid", 0)),
+        "delay_interest_waived": number(result.get("delay_interest_waived_this_reconciliation", 0)),
         "customer_credit": (
             {"available_amount": number(result["proposed_customer_credit"]), "status": "AVAILABLE"}
             if result.get("processed") and result["proposed_customer_credit"] > Decimal("0.00") else None

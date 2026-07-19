@@ -195,7 +195,13 @@ def test_reconciliation_settles_contractual_loan_with_delay_interest_outstanding
     loan.ledger_entries[0].delay_interest_accrued = Decimal("125.00")
     db.session.commit()
 
-    response = client.post(f"/admin/loans/{loan.id}/reconciliation", headers=_headers(app, admin), json={"confirm": True})
+    response = client.post(f"/admin/loans/{loan.id}/reconciliation", headers=_headers(app, admin), json={
+        "confirm": True,
+        "waive_remaining_delay_interest": False,
+        "delay_interest_waiver_amount": "0.00",
+        "reason": "",
+        "approval_reference": "",
+    })
     assert response.status_code == 200
     body = response.get_json()
     assert body["status"] == "SETTLED"
@@ -203,6 +209,7 @@ def test_reconciliation_settles_contractual_loan_with_delay_interest_outstanding
     assert body["principal_outstanding"] == 0.0
     assert body["contractual_interest_outstanding"] == 0.0
     assert body["delay_interest_outstanding"] == 125.0
+    assert body["delay_interest_waived"] == 0.0
     db.session.expire_all()
     assert Loan.query.get(loan.id).status == "SETTLED"
     # Every API surface serializes the committed authoritative Loan.status,
