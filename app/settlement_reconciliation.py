@@ -1,6 +1,7 @@
 """Safe, explicit reconciliation for loans paid before automatic settlement existed."""
 from datetime import datetime
 from decimal import Decimal
+import logging
 from .extensions import db
 from .models import Loan, Payment, CustomerCreditBalance, AccountingJournalEntry, AccountingJournalLine
 from .accounting import (money, customer_advance_account, account_subtype, create_draft_journal,
@@ -8,14 +9,57 @@ from .accounting import (money, customer_advance_account, account_subtype, creat
 from .loan_repair import repair_legacy_loan_configuration
 
 TOLERANCE = Decimal("0.01")
+logger = logging.getLogger(__name__)
 ELIGIBLE = {"ACTIVE", "OVERDUE", "DISBURSED"}
 SOURCE_TYPE = "LEGACY_LOAN_RECONCILIATION"
 RECONCILIATION_SOURCE_TYPE = "LOAN_RECONCILIATION"
 
 
 def _valid_payments(loan):
-    return sorted([p for p in loan.payments if not p.reversed_at and (p.status or "").upper() != "REVERSED"],
-                  key=lambda p: (p.collection_date or p.payment_date, p.created_at, p.id))
+    """Receipts that represent cash successfully received from the customer.
+
+    Allocation fields deliberately are not used here: legacy receipts can contain
+    cash that was never allocated to a principal/interest ledger component.
+    """
+    return sorted([
+        payment for payment in loan.payments
+        if (payment.status or "").upper() == "POSTED" and not payment.reversed_at
+    ], key=lambda payment: (payment.collection_date or payment.payment_date, payment.created_at, payment.id))
+
+
+def _receipt_journals(payments):
+    return [journal for payment in payments if payment.journal_id
+            for journal in [AccountingJournalEntry.query.get(payment.journal_id)]
+            if journal and (journal.status or "").upper() == "POSTED"]
+
+
+def _existing_advance_journal(payments, required_amount=Decimal("0.00")):
+    # A missing configuration must not make a read-only preview fail.  Posting
+    # will still require the configured liability account if reclassification is needed.
+    try:
+        advance = customer_advance_account()
+    except AccountingError:
+        return None
+    for journal in _receipt_journals(payments):
+        credited = money(sum((money(line.credit) for line in journal.lines if line.account_id == advance.id), Decimal("0.00")))
+        if credited >= money(required_amount) - TOLERANCE:
+            return journal
+    return None
+
+
+def _excess_source_accounts(payments):
+    """Return receivable/suspense accounts that the posted receipt credits prove.
+
+    We never infer a source from cash/bank or income lines.  If none is provable,
+    posting is blocked rather than creating an unsupported reclassification.
+    """
+    allowed = {"LOAN_RECEIVABLE", "INTEREST_RECEIVABLE", "PENALTY_RECEIVABLE", "OTHER_CURRENT_ASSET", "SUSPENSE"}
+    result = []
+    for journal in _receipt_journals(payments):
+        for line in journal.lines:
+            if money(line.credit) > TOLERANCE and account_subtype(line.account) in allowed:
+                result.append((line.account_id, line.account.account_name, money(line.credit)))
+    return result
 
 
 def _balances(loan):
@@ -35,65 +79,69 @@ def _balances(loan):
 
 
 def preview(loan, as_of_date=None):
-    """Return a non-mutating proof/result.  A warning means it must not be posted."""
+    """Return a non-mutating, cash-receipt-based settlement proof/result."""
     warnings = []
-    # Early disbursements did not always retain display-only term metadata.  The
-    # repayment ledger and monetary totals remain the proof used below, so this
-    # must not prevent an otherwise provable historical settlement.
     if not loan.term_type or loan.term_value is None:
         warnings.append("Loan term metadata is missing.")
     current = (loan.status or "").strip().upper()
     payments = _valid_payments(loan)
     if as_of_date is not None:
-        payments = [
-            payment for payment in payments
-            if (payment.collection_date or payment.payment_date) and
-            (payment.collection_date or payment.payment_date) <= as_of_date
-        ]
-    paid = money(sum((money(p.amount_collected) for p in payments), Decimal()))
-    due = money(loan.total_payable)
+        payments = [payment for payment in payments if (payment.collection_date or payment.payment_date)
+                    and (payment.collection_date or payment.payment_date) <= as_of_date]
+    total_cash_received = money(sum((money(payment.amount_collected) for payment in payments), Decimal("0.00")))
+    # total_payable is the established contractual due.  Do not derive this from
+    # clamped display balances or payment allocation fields.
+    legitimate_loan_due = money(loan.total_payable)
+    total_applied_to_loan = money(min(total_cash_received, legitimate_loan_due))
+    unapplied_excess = money(max(total_cash_received - total_applied_to_loan, Decimal("0.00")))
+    raw_balance = money(legitimate_loan_due - total_cash_received)
+    remaining_balance = money(max(raw_balance, Decimal("0.00")))
+    proposed_customer_credit = money(max(-raw_balance, Decimal("0.00")))
     unpaid, ledger_warnings = _balances(loan)
     warnings.extend(ledger_warnings)
-    raw_outstanding = money(due - paid)
-    final_payment = None
-    cumulative = Decimal()
-    for payment in payments:
-        cumulative = money(cumulative + money(payment.amount_collected))
-        if cumulative >= due - TOLERANCE:
-            final_payment = payment
-            break
-    eligible = current in ELIGIBLE and (paid >= due - TOLERANCE or raw_outstanding <= TOLERANCE)
+    final_payment = next((payment for payment in reversed(payments)
+                          if payment.collection_date or payment.payment_date), None)
+    eligible = current in ELIGIBLE and remaining_balance <= TOLERANCE
     if not eligible:
         warnings.append("loan is not an eligible legacy settlement candidate")
-    if unpaid is not None and any(amount > TOLERANCE for amount in unpaid.values()):
-        warnings.append("unpaid principal, interest, penalties, delay interest, or collectible fees remain")
-    if not final_payment or not (final_payment.collection_date or final_payment.payment_date):
+    # When historical allocations are incomplete, post() reconstructs them from
+    # the valid receipts after this full-cash proof succeeds.
+    if not final_payment:
         warnings.append("settlement date requires review")
     key = f"LEGACY-SETTLEMENT-{loan.id}"
     credit = CustomerCreditBalance.query.filter_by(source_type=SOURCE_TYPE, source_id=key).first()
-    overpayment = money(max(Decimal(), paid - due))
-    adjustment_required = overpayment > TOLERANCE and not credit
+    advance_journal = _existing_advance_journal(payments, proposed_customer_credit) if proposed_customer_credit > TOLERANCE else None
+    source_accounts = _excess_source_accounts(payments) if proposed_customer_credit > TOLERANCE else []
+    adjustment_required = proposed_customer_credit > TOLERANCE and not credit and not advance_journal
     if adjustment_required:
-        journal = AccountingJournalEntry.query.filter_by(id=final_payment.journal_id).first() if final_payment.journal_id else None
-        if not journal or (journal.status or "").upper() != "POSTED":
-            warnings.append("accounting reconciliation required: final payment has no complete posted journal")
+        if not source_accounts:
+            warnings.append("accounting reconciliation required: no receivable or suspense source can be proven")
         else:
-            warnings.append("accounting adjustment will reclassify historical excess; no cash or bank is posted")
+            warnings.append("An accounting adjustment will reclassify the historical excess; no cash or bank account will be posted again.")
     already = current == "SETTLED" and loan.settlement_reason == "LEGACY_FULLY_REPAID"
     if already:
         warnings.append("already reconciled")
+    logger.info("Legacy settlement preview loan_id=%s contractual_due=%s posted_cash_received=%s total_applied_to_receivables=%s raw_balance=%s remaining_balance=%s proposed_customer_credit=%s excess_source_accounts=%s",
+                loan.id, legitimate_loan_due, total_cash_received, total_applied_to_loan, raw_balance,
+                remaining_balance, proposed_customer_credit, source_accounts)
     return {"loan_id": loan.id, "loan_number": loan.loan_number, "customer_id": loan.customer_id,
             "customer_name": loan.customer.full_name if loan.customer else None, "current_status": loan.status,
-            "total_payable": due, "total_paid": paid, "raw_outstanding": raw_outstanding,
-            "outstanding": max(Decimal(), raw_outstanding), "overpayment": overpayment,
+            "total_payable": legitimate_loan_due, "total_paid": total_cash_received,
+            "total_cash_received": total_cash_received, "total_applied_to_loan": total_applied_to_loan,
+            "unapplied_excess": unapplied_excess, "raw_balance": raw_balance,
+            "raw_outstanding": raw_balance, "remaining_balance": remaining_balance,
+            "outstanding": remaining_balance, "overpayment": proposed_customer_credit,
+            "proposed_customer_credit": proposed_customer_credit,
             "final_payment_id": final_payment.id if final_payment else None,
             "settled_date": (final_payment.collection_date or final_payment.payment_date) if final_payment else None,
+            "settlement_date": (final_payment.collection_date or final_payment.payment_date) if final_payment else None,
             "proposed_status": "SETTLED" if eligible else loan.status,
             "customer_credit_exists": bool(credit), "accounting_adjustment_required": adjustment_required,
             "warnings": warnings,
-            "can_post": eligible and not already and not any(
-                warning != "Loan term metadata is missing." for warning in warnings
-            )}
+            "can_post": eligible and not already and not any(warning not in {
+                "Loan term metadata is missing.",
+                "An accounting adjustment will reclassify the historical excess; no cash or bank account will be posted again."
+            } for warning in warnings)}
 
 
 def candidates():
@@ -103,20 +151,25 @@ def candidates():
 
 
 def _adjustment(loan, result, user_id):
-    final_payment = Payment.query.get(result["final_payment_id"])
-    original = AccountingJournalEntry.query.get(final_payment.journal_id)
+    payments = _valid_payments(loan)
+    existing_advance = _existing_advance_journal(payments, result["proposed_customer_credit"])
+    if existing_advance:
+        return existing_advance
+    sources = _excess_source_accounts(payments)
+    if not sources:
+        raise AccountingError("accounting reconciliation required: no receivable or suspense source can be proven")
+    # A receipt can have several receivable credits; choose only a source whose
+    # recorded credit can cover the reclassification, never an arbitrary income
+    # or cash/bank line.
+    source = next((account_id for account_id, _name, amount in reversed(sources)
+                   if amount >= result["proposed_customer_credit"]), None)
+    if source is None:
+        raise AccountingError("accounting reconciliation required: excess source account cannot be proven")
     advance = customer_advance_account()
-    # A prior posting to Customer Advances is already the required liability.
-    if any(line.account_id == advance.id and money(line.credit) > 0 for line in original.lines):
-        return None
-    candidates = [line for line in original.lines if money(line.credit) > 0 and line.account_id != advance.id]
-    if not candidates:
-        raise AccountingError("accounting reconciliation required: no credit source can be proven")
-    source = candidates[-1].account_id
     require_open_accounting_period(result["settled_date"])
     entry = create_draft_journal(result["settled_date"], "Legacy loan overpayment reclassification",
-        [{"account_id": source, "debit": result["overpayment"], "customer_id": loan.customer_id, "loan_id": loan.id},
-         {"account_id": advance.id, "credit": result["overpayment"], "customer_id": loan.customer_id, "loan_id": loan.id}],
+        [{"account_id": source, "debit": result["proposed_customer_credit"], "customer_id": loan.customer_id, "loan_id": loan.id},
+         {"account_id": advance.id, "credit": result["proposed_customer_credit"], "customer_id": loan.customer_id, "loan_id": loan.id}],
         "LEGACY_LOAN_SETTLEMENT", loan.id, "LOANS", user_id, f"LEGACY-SETTLEMENT:{loan.id}")
     entry.loan_id = loan.id; entry.customer_id = loan.customer_id
     return post_journal(entry, user_id)
@@ -142,16 +195,19 @@ def post(loan, user_id=None):
     if blocking:
         log_audit("LEGACY_LOAN_SETTLEMENT_SKIPPED", "Loan", loan.id, user_id, result)
         return {**result, "processed": False}
-    journal = _adjustment(loan, result, user_id) if result["accounting_adjustment_required"] else None
+    # If the receipt already credited Customer Advances, _adjustment returns that
+    # existing journal and deliberately posts nothing new.
+    journal = (_adjustment(loan, result, user_id)
+               if result["proposed_customer_credit"] > TOLERANCE and not result["customer_credit_exists"] else None)
     key = f"LEGACY-SETTLEMENT-{loan.id}"
     credit = CustomerCreditBalance.query.filter_by(source_type=SOURCE_TYPE, source_id=key).first()
-    if result["overpayment"] > TOLERANCE and not credit:
+    if result["proposed_customer_credit"] > TOLERANCE and not credit:
         credit = CustomerCreditBalance(customer_id=loan.customer_id, loan_id=loan.id, payment_id=None,
           credit_number=f"GROW-LR-{loan.id:08d}", credit_date=result["settled_date"], source_type=SOURCE_TYPE, source_id=key,
-          original_amount=result["overpayment"], available_amount=result["overpayment"], applied_amount=Decimal(), refunded_amount=Decimal(),
+          original_amount=result["proposed_customer_credit"], available_amount=result["proposed_customer_credit"], applied_amount=Decimal(), refunded_amount=Decimal(),
           status="AVAILABLE", reference=key, remarks="Legacy loan settlement reconciliation", journal_entry_id=journal.id if journal else None, created_by_id=user_id)
         db.session.add(credit)
-    loan.status = "SETTLED"; loan.customer_credit_balance = result["overpayment"]
+    loan.status = "SETTLED"; loan.customer_credit_balance = result["proposed_customer_credit"]
     loan.settled_date = result["settled_date"]; loan.settled_at = datetime.combine(result["settled_date"], datetime.min.time())
     loan.settled_by_id = user_id; loan.settlement_payment_id = result["final_payment_id"]
     loan.settlement_journal_id = journal.id if journal else loan.settlement_journal_id; loan.settlement_reason = "LEGACY_FULLY_REPAID"

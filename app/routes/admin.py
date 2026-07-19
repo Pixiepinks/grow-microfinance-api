@@ -544,6 +544,18 @@ def settlement_reconciliation_post(loan_id):
     loan = Loan.query.get(loan_id)
     if loan is None:
         return jsonify({"error": "loan_not_found", "message": "The selected loan was not found."}), 404
+    payload = request.get_json(silent=True) or {}
+    # Credit is calculated from posted receipts on the server; a stale client
+    # preview may be supplied only as an optimistic-concurrency assertion.
+    supplied_credit = payload.get("proposed_customer_credit", payload.get("customer_credit"))
+    if supplied_credit is not None:
+        try:
+            supplied_credit = Decimal(str(supplied_credit)).quantize(Decimal("0.01"))
+        except Exception:
+            return jsonify({"error": "invalid_customer_credit", "message": "customer credit must be a currency amount."}), 422
+        current_credit = settlement_preview(loan)["proposed_customer_credit"]
+        if supplied_credit != current_credit:
+            return jsonify({"error": "stale_settlement_preview", "message": "The supplied customer credit no longer matches the server calculation.", "proposed_customer_credit": float(current_credit)}), 409
     previous_status = loan.status
     try:
         result = post_settlement_reconciliation(loan, get_jwt_identity())
@@ -570,9 +582,14 @@ def _canonical_reconciliation_result(loan, previous_status, result):
         "settled_date": settled.isoformat() if hasattr(settled, "isoformat") else settled,
         "total_payable": number(result["total_payable"]),
         "total_paid": number(result["total_paid"]),
+        "total_cash_received": number(result["total_cash_received"]),
+        "total_applied_to_loan": number(result["total_applied_to_loan"]),
+        "unapplied_excess": number(result["unapplied_excess"]),
+        "remaining_balance": number(result["remaining_balance"]),
         "outstanding": number(result["outstanding"]),
         "overpayment": number(result["overpayment"]),
-        "customer_credit": number(result["overpayment"]) if result["overpayment"] > 0 else None,
+        "proposed_customer_credit": number(result["proposed_customer_credit"]),
+        "customer_credit": number(result["proposed_customer_credit"]) if result["proposed_customer_credit"] > 0 else None,
         "warnings": result["warnings"],
         "message": (
             "Loan reconciled and settled successfully."

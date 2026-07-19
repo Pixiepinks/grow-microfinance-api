@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 
 from flask_jwt_extended import create_access_token
@@ -105,3 +105,47 @@ def test_reconciliation_options_and_preview_alias_are_available(app, client):
     assert client.options("/admin/loans/1/reconciliation").status_code == 204
     assert client.options("/admin/loans/1/settlement-reconciliation/preview").status_code == 204
     assert client.options("/admin/loans/1/reconciliation/preview").status_code == 204
+
+
+def test_preview_preserves_negative_raw_balance_as_automatic_customer_credit(app, client):
+    admin = User(email="overpaid-admin@example.com", name="Admin", role="admin")
+    admin.set_password("password")
+    db.session.add(admin)
+    db.session.commit()
+    loan = _legacy_loan(admin, amount_paid="19500.00", number="SETTLE-OVERPAID")
+
+    response = client.post(
+        f"/admin/loans/{loan.id}/settlement-reconciliation/preview",
+        headers=_headers(app, admin), json={},
+    )
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["total_paid"] == 19500.0  # backward-compatible name
+    assert body["total_cash_received"] == 19500.0
+    assert body["total_applied_to_loan"] == 18900.0
+    assert body["unapplied_excess"] == 600.0
+    assert body["raw_balance"] == -600.0
+    assert body["remaining_balance"] == 0.0
+    assert body["proposed_customer_credit"] == 600.0
+
+
+def test_preview_excludes_reversed_receipts_and_post_rejects_stale_manual_credit(app, client):
+    admin = User(email="reversed-admin@example.com", name="Admin", role="admin")
+    admin.set_password("password")
+    db.session.add(admin)
+    db.session.commit()
+    loan = _legacy_loan(admin, amount_paid="18900.00", number="SETTLE-REVERSED")
+    payment = loan.payments[0]
+    payment.reversed_at = datetime.utcnow()
+    db.session.commit()
+    headers = _headers(app, admin)
+
+    preview = client.post(f"/admin/loans/{loan.id}/settlement-reconciliation/preview", headers=headers, json={})
+    assert preview.get_json()["total_cash_received"] == 0.0
+    assert preview.get_json()["remaining_balance"] == 18900.0
+
+    stale = client.post(f"/admin/loans/{loan.id}/settlement-reconciliation", headers=headers,
+                        json={"confirm": True, "customer_credit": 600})
+    assert stale.status_code == 409
+    assert stale.get_json()["proposed_customer_credit"] == 0.0
