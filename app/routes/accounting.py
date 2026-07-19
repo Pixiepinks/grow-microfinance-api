@@ -1,7 +1,10 @@
 from datetime import date
+import re
 import time
 from flask import Blueprint, Response, jsonify, request, current_app
 from flask_jwt_extended import get_jwt_identity
+from sqlalchemy import func, or_
+from sqlalchemy.orm import joinedload, selectinload
 
 from ..extensions import db
 from ..models import AccountingAccount, AccountingJournalEntry, AccountingJournalLine, Customer, Loan
@@ -76,6 +79,7 @@ def list_accounts():
     q = AccountingAccount.query
     if request.args.get("account_type"): q=q.filter_by(account_type=request.args["account_type"])
     if request.args.get("active") is not None: q=q.filter(AccountingAccount.is_active.is_(request.args.get("active").lower()=="true"))
+    if request.args.get("posting_allowed") is not None: q=q.filter(AccountingAccount.allow_manual_posting.is_(request.args.get("posting_allowed").lower()=="true"))
     if request.args.get("parent_id"): q=q.filter_by(parent_id=request.args.get("parent_id"))
     if request.args.get("search"):
         s=f"%{request.args['search']}%"; q=q.filter((AccountingAccount.account_code.ilike(s)) | (AccountingAccount.account_name.ilike(s)))
@@ -165,28 +169,67 @@ def funding_accounts():
     accounts=AccountingAccount.query.order_by(AccountingAccount.account_code).all()
     return jsonify({"accounts":[{"id":a.id,"account_code":a.account_code,"account_name":a.account_name,"account_subtype":account_subtype(a),"is_default":a.id in default_ids} for a in accounts if is_funding_account(a) and account_subtype(a) in subtypes]})
 
+def _journal_filter_error(error, message):
+    return jsonify({"error": error, "message": message}), 422
+
+def _journal_arg(name):
+    value = request.args.get(name)
+    return value.strip() if value and value.strip() else None
+
+def _journal_id_arg(name):
+    value = _journal_arg(name)
+    if value is None: return None, None
+    try: return int(value), None
+    except ValueError: return None, _journal_filter_error(f"invalid_{name}", f"{name} must be a numeric ID.")
+
+@accounting_bp.route("/journal-entries", methods=["GET"])
 @accounting_bp.route("/journals", methods=["GET"])
 @role_required(["admin"])
 def list_journals():
-    q=AccountingJournalEntry.query
-    if request.args.get("date_from"): q=q.filter(AccountingJournalEntry.journal_date>=date.fromisoformat(request.args["date_from"]))
-    if request.args.get("date_to"): q=q.filter(AccountingJournalEntry.journal_date<=date.fromisoformat(request.args["date_to"]))
-    for f in ["status","reference_type"]:
-        if request.args.get(f): q=q.filter(getattr(AccountingJournalEntry,f)==request.args[f])
-    if request.args.get("journal_no"): q=q.filter(AccountingJournalEntry.journal_no.ilike(f"%{request.args['journal_no']}%"))
-    if request.args.get("reference_id"): q=q.filter(AccountingJournalEntry.reference_id==request.args["reference_id"])
-    if request.args.get("search"):
-        s=f"%{request.args['search']}%"; q=q.filter((AccountingJournalEntry.journal_no.ilike(s)) | (AccountingJournalEntry.description.ilike(s)))
-    if request.args.get("loan_number"):
-        q=q.join(AccountingJournalEntry.lines).join(Loan, AccountingJournalLine.loan_id==Loan.id).filter(Loan.loan_number.ilike(f"%{request.args['loan_number']}%"))
-    if request.args.get("customer_name"):
-        q=q.join(AccountingJournalEntry.lines).join(Customer, AccountingJournalLine.customer_id==Customer.id).filter(Customer.full_name.ilike(f"%{request.args['customer_name']}%"))
-    if request.args.get("account_id"): q=q.join(AccountingJournalEntry.lines).filter_by(account_id=request.args.get("account_id"))
-    if request.args.get("customer_id"): q=q.join(AccountingJournalEntry.lines).filter_by(customer_id=request.args.get("customer_id"))
-    if request.args.get("loan_id"): q=q.join(AccountingJournalEntry.lines).filter_by(loan_id=request.args.get("loan_id"))
-    page=int(request.args.get("page",1)); per=int(request.args.get("per_page",50))
-    items=q.order_by(AccountingJournalEntry.journal_date.desc(), AccountingJournalEntry.id.desc()).paginate(page=page, per_page=per, error_out=False)
-    return jsonify({"items":[serialize_journal(e) for e in items.items],"total":items.total,"page":page,"per_page":per})
+    try:
+        raw_from, raw_to = _journal_arg("date_from"), _journal_arg("date_to")
+        try:
+            if any(value and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value) for value in (raw_from, raw_to)): raise ValueError
+            date_from, date_to = (date.fromisoformat(raw_from) if raw_from else None), (date.fromisoformat(raw_to) if raw_to else None)
+        except ValueError: return _journal_filter_error("invalid_date", "Dates must use YYYY-MM-DD format.")
+        if date_from and date_to and date_from > date_to: return _journal_filter_error("invalid_date_range", "Date From cannot be later than Date To.")
+        ids = {}
+        for name in ("account_id", "customer_id", "loan_id"):
+            ids[name], error = _journal_id_arg(name)
+            if error: return error
+        try:
+            page = max(1, int(_journal_arg("page") or 1)); page_size = min(100, max(1, int(_journal_arg("page_size") or _journal_arg("per_page") or 25)))
+        except ValueError: return _journal_filter_error("invalid_pagination", "page and page_size must be positive integers.")
+        status = _journal_arg("status"); status = status.upper() if status and status.upper() != "ALL" else None
+        reference_type = _journal_arg("reference_type"); reference_type = reference_type.upper() if reference_type else None
+        search = _journal_arg("search"); effective_date = func.coalesce(AccountingJournalEntry.accounting_date, AccountingJournalEntry.journal_date)
+        q = AccountingJournalEntry.query.options(selectinload(AccountingJournalEntry.lines).joinedload(AccountingJournalLine.account), selectinload(AccountingJournalEntry.lines).joinedload(AccountingJournalLine.customer), selectinload(AccountingJournalEntry.lines).joinedload(AccountingJournalLine.loan), selectinload(AccountingJournalEntry.reversal_journals), joinedload(AccountingJournalEntry.reversal_of), joinedload(AccountingJournalEntry.created_by), joinedload(AccountingJournalEntry.posted_by))
+        if date_from: q = q.filter(effective_date >= date_from)
+        if date_to: q = q.filter(effective_date <= date_to)
+        if status: q = q.filter(func.upper(func.trim(AccountingJournalEntry.status)) == status)
+        if reference_type: q = q.filter(or_(func.upper(func.trim(AccountingJournalEntry.source_type)) == reference_type, func.upper(func.trim(AccountingJournalEntry.reference_type)) == reference_type))
+        if ids["account_id"] is not None: q = q.filter(AccountingJournalEntry.lines.any(AccountingJournalLine.account_id == ids["account_id"]))
+        if ids["customer_id"] is not None: q = q.filter(or_(AccountingJournalEntry.customer_id == ids["customer_id"], AccountingJournalEntry.lines.any(AccountingJournalLine.customer_id == ids["customer_id"])))
+        if ids["loan_id"] is not None: q = q.filter(or_(AccountingJournalEntry.loan_id == ids["loan_id"], AccountingJournalEntry.lines.any(AccountingJournalLine.loan_id == ids["loan_id"])))
+        if search:
+            pattern = f"%{search}%"
+            matching_customers = db.session.query(Customer.id).filter(or_(Customer.full_name.ilike(pattern), Customer.customer_code.ilike(pattern)))
+            matching_loans = db.session.query(Loan.id).filter(Loan.loan_number.ilike(pattern))
+            q = q.filter(or_(AccountingJournalEntry.journal_no.ilike(pattern), AccountingJournalEntry.description.ilike(pattern), AccountingJournalEntry.reference.ilike(pattern), AccountingJournalEntry.reference_type.ilike(pattern), AccountingJournalEntry.source_type.ilike(pattern), AccountingJournalEntry.reversal_of.has(AccountingJournalEntry.journal_no.ilike(pattern)), AccountingJournalEntry.reversal_journals.any(AccountingJournalEntry.journal_no.ilike(pattern)), AccountingJournalEntry.loan_id.in_(matching_loans), AccountingJournalEntry.customer_id.in_(matching_customers), AccountingJournalEntry.lines.any(AccountingJournalLine.loan.has(Loan.loan_number.ilike(pattern))), AccountingJournalEntry.lines.any(AccountingJournalLine.customer.has(or_(Customer.full_name.ilike(pattern), Customer.customer_code.ilike(pattern))))))
+        columns = {"accounting_date": effective_date, "journal_date": effective_date, "journal_number": AccountingJournalEntry.journal_no, "journal_no": AccountingJournalEntry.journal_no, "status": AccountingJournalEntry.status}
+        column = columns.get((_journal_arg("sort_by") or "accounting_date").lower(), effective_date)
+        ordering = column.asc() if (_journal_arg("sort_direction") or "desc").lower() == "asc" else column.desc()
+        total = q.order_by(None).count(); entries = q.order_by(ordering, AccountingJournalEntry.id.desc()).offset((page - 1) * page_size).limit(page_size).all(); total_pages = (total + page_size - 1) // page_size
+        return jsonify({"items": [serialize_journal(e) for e in entries], "total": total, "page": page, "per_page": page_size, "pagination": {"page": page, "page_size": page_size, "total_items": total, "total_pages": total_pages, "has_next": page < total_pages, "has_previous": page > 1}, "applied_filters": {"date_from": raw_from, "date_to": raw_to, "status": status, "reference_type": reference_type, **ids, "search": search}})
+    except Exception:
+        current_app.logger.exception("Journal list query failed")
+        return jsonify({"error": "journal_list_error", "message": "Unable to retrieve journal entries."}), 500
+
+@accounting_bp.route("/journal-reference-types", methods=["GET"])
+@role_required(["admin"])
+def journal_reference_types():
+    source = func.coalesce(AccountingJournalEntry.source_type, AccountingJournalEntry.reference_type)
+    return jsonify({"items": [value for (value,) in db.session.query(source).filter(source.isnot(None)).distinct().order_by(source).all() if value]})
 
 @accounting_bp.route("/journals/<int:journal_id>", methods=["GET"])
 @accounting_bp.route("/journal-entries/<int:journal_id>", methods=["GET"])

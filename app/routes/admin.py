@@ -421,6 +421,21 @@ def list_customers():
     return jsonify(results)
 
 
+@admin_bp.route("/loans/search", methods=["GET"], strict_slashes=False)
+@role_required(["admin"])
+def search_loans():
+    query_text = str(request.args.get("q") or "").strip()
+    try:
+        limit = min(max(int(request.args.get("limit", 10)), 1), 20)
+    except (TypeError, ValueError):
+        limit = 10
+    if not query_text:
+        return jsonify({"items": [], "total": 0, "query": ""})
+    pattern = f"%{query_text}%"
+    loans = (Loan.query.join(Customer).filter(or_(Loan.loan_number.ilike(pattern), Customer.full_name.ilike(pattern), Customer.customer_code.ilike(pattern))).order_by(Loan.loan_number, Loan.id).limit(limit).all())
+    return jsonify({"items": [{"id": loan.id, "loan_number": loan.loan_number, "customer_id": loan.customer_id, "customer_name": loan.customer.full_name if loan.customer else None, "customer_number": loan.customer.customer_code if loan.customer else None, "status": loan.status} for loan in loans], "total": len(loans), "query": query_text})
+
+
 @admin_bp.route("/loans", methods=["POST"])
 @role_required(["admin"])
 def create_loan():
