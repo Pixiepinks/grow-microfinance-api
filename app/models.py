@@ -313,6 +313,11 @@ class Loan(db.Model):
     settlement_journal_id = db.Column(db.Integer, db.ForeignKey("accounting_journal_entries.id"))
     settlement_reason = db.Column(db.String(50))
     customer_credit_balance = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    settlement_type = db.Column(db.String(50))
+    early_settlement_id = db.Column(db.Integer)
+    interest_rebate_amount = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    penalty_waiver_amount = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    outstanding_amount = db.Column(Numeric(18, 2))
 
     customer = relationship("Customer", back_populates="loans")
     created_by = relationship(
@@ -347,6 +352,30 @@ class Loan(db.Model):
         expected = self.expected_to_date()
         paid = self.total_paid
         return expected - paid if expected > paid else Decimal("0")
+
+
+
+class LoanEarlySettlement(db.Model):
+    __tablename__ = "loan_early_settlements"
+    id = db.Column(db.Integer, primary_key=True)
+    settlement_number = db.Column(db.String(60), unique=True, nullable=False)
+    loan_id = db.Column(db.Integer, db.ForeignKey("loans.id"), nullable=False, index=True)
+    customer_id = db.Column(db.Integer, db.ForeignKey("customers.id"), nullable=False)
+    settlement_date = db.Column(db.Date, nullable=False)
+    requested_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    requested_by_id = db.Column(db.Integer, db.ForeignKey("users.id"))
+    approved_at = db.Column(db.DateTime)
+    approved_by_id = db.Column(db.Integer, db.ForeignKey("users.id"))
+    original_principal = db.Column(Numeric(18,2), nullable=False); original_total_payable = db.Column(Numeric(18,2), nullable=False)
+    total_paid_before_settlement = db.Column(Numeric(18,2), nullable=False)
+    principal_outstanding_before = db.Column(Numeric(18,2), nullable=False); accrued_interest_outstanding_before = db.Column(Numeric(18,2), nullable=False); future_unearned_interest_before = db.Column(Numeric(18,2), nullable=False)
+    penalty_outstanding_before = db.Column(Numeric(18,2), nullable=False); delay_interest_outstanding_before = db.Column(Numeric(18,2), nullable=False); fee_outstanding_before = db.Column(Numeric(18,2), nullable=False)
+    approved_interest_rebate = db.Column(Numeric(18,2), nullable=False); future_interest_rebate = db.Column(Numeric(18,2), nullable=False); accrued_interest_rebate = db.Column(Numeric(18,2), nullable=False); approved_penalty_waiver = db.Column(Numeric(18,2), nullable=False, default=Decimal("0.00")); final_settlement_amount = db.Column(Numeric(18,2), nullable=False)
+    settlement_payment_id = db.Column(db.Integer, db.ForeignKey("payments.id")); rebate_journal_entry_id = db.Column(db.Integer, db.ForeignKey("accounting_journal_entries.id")); settlement_journal_entry_id = db.Column(db.Integer, db.ForeignKey("accounting_journal_entries.id"))
+    approval_reference = db.Column(db.String(120)); reason = db.Column(db.Text); status = db.Column(db.String(20), nullable=False, default="DRAFT")
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False); updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    loan = relationship("Loan", foreign_keys=[loan_id], backref="early_settlements")
+    rebate_journal_entry = relationship("AccountingJournalEntry", foreign_keys=[rebate_journal_entry_id])
 
 
 class LoanLedger(db.Model):
@@ -385,6 +414,12 @@ class LoanLedger(db.Model):
     delay_interest_paid = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
     unapplied_amount = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
     status = db.Column(db.String(20), nullable=False, default="PENDING")
+    waived_interest_amount = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    waived_penalty_amount = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    waiver_reason = db.Column(db.String(100))
+    early_settlement_id = db.Column(db.Integer)
+    original_interest_amount = db.Column(Numeric(18, 2))
+    revised_interest_amount = db.Column(Numeric(18, 2))
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(
         db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
