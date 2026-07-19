@@ -5,7 +5,7 @@ Alembic version row was written.  The guards below deliberately make the
 schema changes safe to replay: existing data is retained and only missing
 objects (or NULL values in the new required amount column) are changed.
 
-Revision ID: 0040_delay_interest_accrual_waiver
+Revision ID: 0040_delay_interest_waiver
 Revises: 0039_loan_settlement
 """
 import re
@@ -14,7 +14,7 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = "0040_delay_interest_accrual_waiver"
+revision = "0040_delay_interest_waiver"
 down_revision = "0039_loan_settlement"
 branch_labels = None
 depends_on = None
