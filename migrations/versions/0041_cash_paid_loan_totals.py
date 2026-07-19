@@ -1,13 +1,13 @@
 """separate cash receipts from loan settlement adjustments
 
 Revision ID: 0041_cash_paid_loan_totals
-Revises: 0040_delay_interest_waiver
+Revises: 0040_early_loan_settlement
 """
 from alembic import op
 import sqlalchemy as sa
 
 revision = "0041_cash_paid_loan_totals"
-down_revision = "0040_delay_interest_waiver"
+down_revision = "0040_early_loan_settlement"
 branch_labels = None
 depends_on = None
 

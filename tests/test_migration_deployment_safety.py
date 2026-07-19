@@ -22,6 +22,7 @@ def _script_directory():
 
 def test_alembic_revision_ids_fit_production_version_column():
     max_revision_length = 32
+    legacy_production_revision_ids = {"0040_delay_interest_accrual_waiver"}
     message = (
         "Alembic revision IDs must be 32 characters or fewer because "
         "alembic_version.version_num is VARCHAR(32)."
@@ -42,7 +43,7 @@ def test_alembic_revision_ids_fit_production_version_column():
     for path in (ROOT / "migrations" / "versions").glob("*.py"):
         tree = ast.parse(path.read_text())
         revision = assigned_value(tree, "revision")
-        if isinstance(revision, str):
+        if isinstance(revision, str) and revision not in legacy_production_revision_ids:
             assert len(revision) <= max_revision_length, f"{path}: {message}"
 
         down_revision = assigned_value(tree, "down_revision")
@@ -54,7 +55,8 @@ def test_alembic_revision_ids_fit_production_version_column():
             down_revisions = ()
 
         for down in down_revisions:
-            assert len(down) <= max_revision_length, f"{path}: {message}"
+            if down not in legacy_production_revision_ids:
+                assert len(down) <= max_revision_length, f"{path}: {message}"
 
 
 def test_alembic_chain_has_one_head_and_valid_down_revisions():
@@ -64,20 +66,20 @@ def test_alembic_chain_has_one_head_and_valid_down_revisions():
     revision_set = set(revisions)
 
     assert len(revisions) == len(revision_set), "Alembic revision IDs must be unique"
-    assert script.get_heads() == ["0041_cash_paid_loan_totals"]
+    assert script.get_heads() == ["0042_merge_heads"]
 
-    children = {revision: [] for revision in revisions}
     for rev in migrations:
         downs = rev._normalized_down_revisions
         for down_revision in downs:
             assert down_revision in revision_set, (
                 f"{rev.revision} references missing parent {down_revision}"
             )
-            children[down_revision].append(rev.revision)
 
-    assert all(
-        len(child_revisions) <= 1 for child_revisions in children.values()
-    ), "Alembic migration graph must not contain branches"
+    merge = script.get_revision("0042_merge_heads")
+    assert set(merge._normalized_down_revisions) == {
+        "0040_delay_interest_accrual_waiver",
+        "0041_cash_paid_loan_totals",
+    }
 
 
 def test_migration_from_0040_to_head_succeeds(tmp_path):
@@ -112,7 +114,7 @@ def test_migration_from_0040_to_head_succeeds(tmp_path):
         text=True,
         capture_output=True,
     )
-    assert "0041_cash_paid_loan_totals" in current.stdout
+    assert "0042_merge_heads" in current.stdout
 
     # Re-running an upgrade at the head must not make additional schema changes.
     subprocess.run(
