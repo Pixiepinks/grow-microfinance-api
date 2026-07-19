@@ -5,10 +5,12 @@ from .extensions import db
 from .models import Loan, Payment, CustomerCreditBalance, AccountingJournalEntry, AccountingJournalLine
 from .accounting import (money, customer_advance_account, account_subtype, create_draft_journal,
                          post_journal, require_open_accounting_period, log_audit, AccountingError)
+from .loan_repair import repair_legacy_loan_configuration
 
 TOLERANCE = Decimal("0.01")
 ELIGIBLE = {"ACTIVE", "OVERDUE", "DISBURSED"}
 SOURCE_TYPE = "LEGACY_LOAN_RECONCILIATION"
+RECONCILIATION_SOURCE_TYPE = "LOAN_RECONCILIATION"
 
 
 def _valid_payments(loan):
@@ -134,3 +136,82 @@ def post(loan, user_id=None):
         if paid >= due - TOLERANCE: entry.status = "PAID"; entry.paid_amount = min(paid, due)
     log_audit("LEGACY_LOAN_SETTLEMENT_POSTED", "Loan", loan.id, user_id, {**result, "journal_id": journal.id if journal else None})
     return {**result, "processed": True, "settlement_journal_id": journal.id if journal else None}
+
+
+def _apply_historical_payments_to_ledger(loan, amount, paid_date):
+    """Rebuild ledger balances from historical cash without posting new journals."""
+    remaining = money(amount)
+    for entry in sorted(loan.ledger_entries, key=lambda item: (item.due_date, item.installment_no)):
+        for due_field, paid_field in (("delay_interest_accrued", "delay_interest_paid"),
+                                      ("interest_amount", "interest_paid"),
+                                      ("principal_amount", "principal_paid")):
+            if remaining <= 0:
+                break
+            due = money(getattr(entry, due_field) or 0)
+            already_paid = money(getattr(entry, paid_field) or 0)
+            applied = min(remaining, max(Decimal("0.00"), due - already_paid))
+            if applied:
+                setattr(entry, paid_field, money(already_paid + applied))
+                remaining = money(remaining - applied)
+        paid = money((entry.principal_paid or 0) + (entry.interest_paid or 0) + (entry.delay_interest_paid or 0))
+        due = money((entry.principal_amount or 0) + (entry.interest_amount or 0) + (entry.delay_interest_accrued or 0))
+        entry.paid_amount = min(paid, due)
+        entry.paid_date = paid_date if entry.paid_amount else entry.paid_date
+        entry.status = "PAID" if entry.paid_amount >= due - TOLERANCE else ("PARTIAL" if entry.paid_amount else "PENDING")
+    return remaining
+
+
+def reconcile(loan, user_id=None):
+    """Repair and settle a legacy loan, returning the button's compact JSON contract."""
+    repaired_fields = repair_legacy_loan_configuration(loan, user_id=user_id)
+    payments = _valid_payments(loan)
+    paid = money(sum((money(payment.amount_collected) for payment in payments), Decimal("0.00")))
+    due = money(loan.total_payable)
+    remaining = max(Decimal("0.00"), money(due - paid))
+    last_payment = next((payment for payment in reversed(payments) if payment.collection_date or payment.payment_date), None)
+    settlement_date = ((last_payment.collection_date or last_payment.payment_date) if last_payment else None)
+
+    if remaining > TOLERANCE:
+        log_audit("LOAN_RECONCILIATION", "Loan", loan.id, user_id,
+                  {"repaired_fields": repaired_fields, "remaining_balance": str(remaining)})
+        return {"success": True, "loan_repaired": bool(repaired_fields), "loan_settled": False,
+                "remaining_balance": remaining}
+
+    if not settlement_date:
+        raise ValueError("A payment date is required to settle this loan.")
+    unapplied = _apply_historical_payments_to_ledger(loan, paid, settlement_date)
+    # Cash beyond the contract is customer money, not a negative receivable.
+    credit_amount = money(max(Decimal("0.00"), paid - due))
+    credit = CustomerCreditBalance.query.filter_by(
+        source_type=RECONCILIATION_SOURCE_TYPE, source_id=str(loan.id)
+    ).first()
+    if credit_amount > TOLERANCE and not credit:
+        credit = CustomerCreditBalance(
+            customer_id=loan.customer_id, loan_id=loan.id, payment_id=None,
+            credit_number=f"GROW-RC-{loan.id:08d}", credit_date=settlement_date,
+            source_type=RECONCILIATION_SOURCE_TYPE, source_id=str(loan.id),
+            original_amount=credit_amount, available_amount=credit_amount,
+            applied_amount=Decimal("0.00"), refunded_amount=Decimal("0.00"), status="AVAILABLE",
+            reference=f"LOAN-RECONCILIATION:{loan.id}", remarks="Loan reconciliation overpayment",
+            created_by_id=user_id,
+        )
+        db.session.add(credit)
+    loan.customer_credit_balance = money(sum((Decimal(item.available_amount or 0) for item in
+        CustomerCreditBalance.query.filter_by(loan_id=loan.id).filter(
+            CustomerCreditBalance.status.in_(("AVAILABLE", "PARTIALLY_APPLIED"))).all()), Decimal("0.00")) + (credit_amount if credit_amount > TOLERANCE and not credit else Decimal("0.00")))
+    loan.status = "SETTLED"
+    loan.settled_date = settlement_date
+    loan.settled_at = datetime.combine(settlement_date, datetime.min.time())
+    loan.settled_by_id = user_id
+    loan.settlement_payment_id = last_payment.id
+    loan.settlement_reason = "RECONCILED_FULLY_REPAID"
+    # SETTLED is excluded by the accrual job; this marker also records its final boundary.
+    loan.accrual_processed_through = max((loan.accrual_processed_through or settlement_date), settlement_date)
+    log_audit("LOAN_RECONCILED", "Loan", loan.id, user_id,
+              {"repaired_fields": repaired_fields, "customer_credit": str(credit_amount), "unapplied": str(unapplied)})
+    result = {"success": True, "loan_repaired": bool(repaired_fields), "loan_settled": True}
+    if credit_amount > TOLERANCE:
+        result["customer_credit"] = credit_amount
+    if repaired_fields or credit_amount > TOLERANCE:
+        result["message"] = "Loan reconciled successfully."
+    return result

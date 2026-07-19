@@ -40,7 +40,7 @@ from .utils import role_required
 
 admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
 logger = logging.getLogger(__name__)
-from ..settlement_reconciliation import preview as settlement_preview, post as post_settlement_reconciliation
+from ..settlement_reconciliation import preview as settlement_preview, post as post_settlement_reconciliation, reconcile as reconcile_loan
 
 ACTIVE_LOAN_STATUSES = {"ACTIVE", "DISBURSED"}
 POSTED_PAYMENT_STATUSES = {"POSTED"}
@@ -536,6 +536,31 @@ def settlement_reconciliation_post(loan_id):
         db.session.rollback()
         return jsonify({"error": "settlement_reconciliation_failed", "message": str(exc)}), 422
     return jsonify({k: (float(v) if isinstance(v, Decimal) else (v.isoformat() if hasattr(v, "isoformat") else v)) for k, v in result.items()})
+
+
+def _json_reconciliation_result(result):
+    return {key: (float(value) if isinstance(value, Decimal) else value) for key, value in result.items()}
+
+
+@admin_bp.route("/loans/<int:loan_id>/reconcile", methods=["POST"], strict_slashes=False)
+@admin_bp.route("/loans/<int:loan_id>/reconcile-loan", methods=["POST"], strict_slashes=False)
+@role_required(["admin"])
+def reconcile_legacy_loan(loan_id):
+    """JSON endpoint used by the Reconcile Loan action (no HTML 404/500 responses)."""
+    loan = Loan.query.get(loan_id)
+    if loan is None:
+        return jsonify({"success": False, "error": "loan_not_found", "message": "Loan not found."}), 404
+    try:
+        result = reconcile_loan(loan, get_jwt_identity())
+        db.session.commit()
+        return jsonify(_json_reconciliation_result(result))
+    except (ValueError, AccountingError) as exc:
+        db.session.rollback()
+        return jsonify({"success": False, "error": "loan_reconciliation_failed", "message": str(exc)}), 422
+    except Exception:
+        db.session.rollback()
+        logger.exception("Loan reconciliation failed for loan %s", loan_id)
+        return jsonify({"success": False, "error": "loan_reconciliation_failed", "message": "Unable to reconcile loan."}), 500
 
 
 def _preview_error_response(exc):

@@ -124,3 +124,44 @@ def repair_loan_term_metadata_from_ledger(loan_id: int, *, user_id=None) -> dict
     log_audit("LOAN_TERM_METADATA_REPAIR", "Loan", loan.id, user_id, {"changed_fields": changed, "ledger_rows": len(entries), "totals": after_totals})
     db.session.commit()
     return {"loan_id": loan.id, "changed_fields": changed, "ledger_rows": len(entries), "totals": after_totals, "audit_logged": True}
+
+
+def repair_legacy_loan_configuration(loan: Loan, *, user_id=None) -> list[str]:
+    """Fill configuration omitted by early disbursements without changing the schedule.
+
+    The ledger is the historical repayment schedule, so it is the authoritative
+    source for the term and installment count.  Monetary values are rebuilt from
+    the approved/principal amount and contractual total, rather than regenerated,
+    which keeps already-collected loans auditable.
+    """
+    entries = sorted(list(loan.ledger_entries), key=lambda e: (e.installment_no or 0, e.due_date))
+    if not entries:
+        return []
+    derived = derive_loan_metadata_from_ledger(loan)
+    changed = []
+    for field in ("term_type", "term_value", "loan_days", "repayment_frequency",
+                  "installment_count", "number_of_installments", "maturity_date",
+                  "final_installment_due_date"):
+        _set_missing(loan, field, derived.get(field), changed)
+
+    count = loan.installment_count or loan.number_of_installments or len(entries)
+    principal = money(loan.principal_amount)
+    # A legacy loan can have a stale total_repayment, but total_payable is the
+    # amount used by the payment history and must therefore win.
+    payable = money(loan.total_payable or sum((money(e.installment_amount) for e in entries), Decimal()))
+    if loan.total_repayment is None:
+        loan.total_repayment = payable
+        changed.append("total_repayment")
+    if loan.total_interest is None:
+        loan.total_interest = money(payable - principal)
+        changed.append("total_interest")
+    if loan.installment_amount is None and count:
+        loan.installment_amount = money(payable / Decimal(count))
+        changed.append("installment_amount")
+    if loan.end_date is None and derived.get("end_date"):
+        loan.end_date = derived["end_date"]
+        changed.append("end_date")
+    if changed:
+        log_audit("LEGACY_LOAN_CONFIGURATION_REPAIRED", "Loan", loan.id, user_id,
+                  {"changed_fields": changed, "total_payable": str(payable), "principal": str(principal)})
+    return changed
