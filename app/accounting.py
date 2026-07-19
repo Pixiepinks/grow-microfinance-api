@@ -32,7 +32,7 @@ from .models import (
 CENT = Decimal("0.01")
 ACCOUNT_TYPES = {"ASSET", "LIABILITY", "EQUITY", "INCOME", "EXPENSE"}
 NORMAL_BALANCES = {"DEBIT", "CREDIT"}
-ACCOUNT_SUBTYPES = {"CASH", "BANK", "COLLECTION_CLEARING", "COLLECTION_CLEARING_CONTROL", "LOAN_RECEIVABLE", "INTEREST_RECEIVABLE", "PENALTY_RECEIVABLE", "OTHER_CURRENT_ASSET", "FIXED_ASSET", "ACCOUNTS_PAYABLE", "BORROWING", "CUSTOMER_ADVANCE", "CAPITAL", "RETAINED_EARNINGS", "INTEREST_INCOME", "PENALTY_INCOME", "FEE_INCOME", "OPERATING_EXPENSE", "WRITE_OFF_EXPENSE", "SUSPENSE", "OTHER"}
+ACCOUNT_SUBTYPES = {"CASH", "BANK", "COLLECTION_CLEARING", "COLLECTION_CLEARING_CONTROL", "LOAN_RECEIVABLE", "INTEREST_RECEIVABLE", "PENALTY_RECEIVABLE", "OTHER_CURRENT_ASSET", "FIXED_ASSET", "ACCOUNTS_PAYABLE", "BORROWING", "CUSTOMER_ADVANCE", "CAPITAL", "RETAINED_EARNINGS", "INTEREST_INCOME", "PENALTY_INCOME", "FEE_INCOME", "OPERATING_EXPENSE", "WRITE_OFF_EXPENSE", "DELAY_INTEREST_WAIVER", "SUSPENSE", "OTHER"}
 SYSTEM_MAPPINGS = {
     "DEFAULT_DISBURSEMENT_ACCOUNT": "1010",
     "DEFAULT_CASH_COLLECTION_ACCOUNT": "1000",
@@ -52,6 +52,7 @@ SYSTEM_MAPPINGS = {
     "LOAN_INTEREST_INCOME": "4000",
     "PENALTY_INCOME_ACCOUNT": "4010",
     "DELAY_INTEREST_INCOME": "4010",
+    "DELAY_INTEREST_WAIVER_EXPENSE": "5060",
     "UNAPPLIED_CUSTOMER_FUNDS": "1990",
     "DOCUMENTATION_FEE_INCOME": "4030",
     "PROCESSING_FEE_INCOME_ACCOUNT": "4020",
@@ -90,6 +91,7 @@ DEFAULT_ACCOUNTS = [
     ("5030", "Transport Expense", "EXPENSE", "DEBIT", False, "OPERATING_EXPENSE"),
     ("5040", "Office Expense", "EXPENSE", "DEBIT", False, "OPERATING_EXPENSE"),
     ("5050", "Loan Write-off Expense", "EXPENSE", "DEBIT", True, "WRITE_OFF_EXPENSE"),
+    ("5060", "Delay Interest Waiver Expense", "EXPENSE", "DEBIT", True, "DELAY_INTEREST_WAIVER"),
     ("1990", "Suspense Account", "ASSET", "DEBIT", True, "SUSPENSE"),
 ]
 SETTING_VALIDATION = {
@@ -118,6 +120,7 @@ SETTING_VALIDATION = {
     "DELAY_INTEREST_RECEIVABLE": ({"ASSET"}, {"PENALTY_RECEIVABLE"}),
     "LOAN_INTEREST_INCOME": ({"INCOME"}, {"INTEREST_INCOME", "FEE_INCOME", "OTHER"}),
     "DELAY_INTEREST_INCOME": ({"INCOME"}, {"PENALTY_INCOME", "FEE_INCOME", "OTHER"}),
+    "DELAY_INTEREST_WAIVER_EXPENSE": ({"EXPENSE"}, {"DELAY_INTEREST_WAIVER", "OPERATING_EXPENSE", "OTHER"}),
     "UNAPPLIED_CUSTOMER_FUNDS": ({"ASSET", "LIABILITY"}, {"SUSPENSE", "ACCOUNTS_PAYABLE", "OTHER"}),
     "RETAINED_EARNINGS_ACCOUNT": ({"EQUITY"}, {"RETAINED_EARNINGS"}),
 }
@@ -1426,6 +1429,44 @@ def accrue_due_loan_interest(as_of_date, loan_id=None, historical=False, request
             if not historical:
                 raise
     return summary
+
+def accrue_delay_interest(through_date, loan_id=None, preview=False, requested_by=None):
+    """Accrue overdue delay interest through a boundary date.
+
+    The source key includes the loan, installment, start and end dates, making a
+    catch-up/scheduled run safe to repeat.  Accrual is deliberately a job, not a
+    request-side effect.
+    """
+    if isinstance(through_date, str): through_date = date.fromisoformat(through_date)
+    result = {"processed_installments": 0, "total_delay_interest_accrued": Decimal("0.00"), "journal_ids": [], "skipped": []}
+    query = LoanLedger.query.join(Loan).filter(LoanLedger.due_date < through_date)
+    if loan_id: query = query.filter(LoanLedger.loan_id == loan_id)
+    receivable, income = resolve_system_account("DELAY_INTEREST_RECEIVABLE"), resolve_system_account("DELAY_INTEREST_INCOME")
+    for ledger in query.order_by(LoanLedger.due_date, LoanLedger.id):
+        loan = ledger.loan
+        if str(loan.status).upper() in {"SETTLED", "CANCELLED", "WRITTEN_OFF"}:
+            result["skipped"].append({"ledger_id": ledger.id, "reason": "loan_status"}); continue
+        end = min(through_date, loan.settled_date) if loan.settled_date else through_date
+        start = max(ledger.due_date, ledger.delay_interest_accrued_at.date() if ledger.delay_interest_accrued_at else ledger.due_date)
+        if end <= start: continue
+        days = Decimal((end - start).days)
+        amount = money(Decimal(ledger.opening_balance or 0) * (Decimal(loan.interest_rate or 0) / Decimal("100") / Decimal("30")) * days)
+        if amount <= 0: continue
+        source_id = f"{loan.id}:{ledger.id}:{start.isoformat()}:{end.isoformat()}"
+        existing = AccountingJournalEntry.query.filter_by(source_type="DELAY_INTEREST_ACCRUAL", source_id=source_id).first()
+        if existing:
+            result["skipped"].append({"ledger_id": ledger.id, "reason": "existing_journal"}); continue
+        result["processed_installments"] += 1; result["total_delay_interest_accrued"] = money(result["total_delay_interest_accrued"] + amount)
+        if preview: continue
+        require_open_accounting_period(end)
+        entry = create_draft_journal(end, f"Delay interest accrual – Loan {loan.loan_number} – Installment {ledger.installment_no}",
+            [{"account_id": receivable.id, "debit": amount, "loan_id": loan.id, "customer_id": loan.customer_id}, {"account_id": income.id, "credit": amount, "loan_id": loan.id, "customer_id": loan.customer_id}],
+            "DELAY_INTEREST_ACCRUAL", source_id, "LOANS", requested_by, f"DELAY_INTEREST_ACCRUAL:{source_id}")
+        entry.loan_id = loan.id; entry.customer_id = loan.customer_id; post_journal(entry, requested_by)
+        ledger.delay_interest_accrued = money(Decimal(ledger.delay_interest_accrued or 0) + amount)
+        ledger.delay_interest = ledger.delay_interest_accrued; ledger.delay_interest_accrued_at = datetime.combine(end, datetime.min.time()); ledger.delay_interest_accrual_journal_id = entry.id
+        result["journal_ids"].append(entry.id)
+    return result
 
 def allocate_payment(loan, amount, paid_date):
     if str(getattr(loan, "interest_accounting_method", LOAN_ACCRUAL_METHOD)) == LOAN_ACCRUAL_METHOD:

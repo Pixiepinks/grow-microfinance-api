@@ -735,7 +735,10 @@ def settlement_reconciliation_post(loan_id):
             return jsonify({"error": "stale_settlement_preview", "message": "The supplied customer credit no longer matches the server calculation.", "proposed_customer_credit": float(current_credit)}), 409
     previous_status = loan.status
     try:
-        result = post_settlement_reconciliation(loan, get_jwt_identity())
+        result = post_settlement_reconciliation(loan, get_jwt_identity(),
+            waive_delay_interest=bool(payload.get("waive_delay_interest")),
+            delay_interest_waiver_amount=payload.get("delay_interest_waiver_amount"),
+            approval_reference=payload.get("approval_reference"), reason=payload.get("reason"))
         if not result.get("processed"):
             db.session.rollback()
             return jsonify(_canonical_reconciliation_result(loan, previous_status, result))
