@@ -156,6 +156,8 @@ def log_audit(action, entity_type, entity_id=None, user_id=None, details=None):
 def seed_default_accounts():
     try:
         for code, name, typ, normal, system, category in DEFAULT_ACCOUNTS:
+            if typ not in ACCOUNT_TYPES or normal not in NORMAL_BALANCES or category not in ACCOUNT_SUBTYPES:
+                raise AccountingError(f"Invalid default account definition for {code}")
             account_data = {
                 "account_code": code,
                 "account_name": name,
@@ -176,7 +178,11 @@ def seed_default_accounts():
                 continue
 
             acct.is_system_account = bool(system) or acct.is_system_account
-            if not account_has_activity(acct):
+            # This SELECT must not flush pending changes to a legacy account
+            # before its valid subtype and other fields have been assigned.
+            with db.session.no_autoflush:
+                has_activity = account_has_activity(acct)
+            if not has_activity:
                 acct.account_name = name
                 acct.account_type = typ
                 acct.normal_balance = normal
