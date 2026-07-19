@@ -22,7 +22,6 @@ def _script_directory():
 
 def test_alembic_revision_ids_fit_production_version_column():
     max_revision_length = 32
-    legacy_production_revision_ids = {"0040_delay_interest_accrual_waiver"}
     message = (
         "Alembic revision IDs must be 32 characters or fewer because "
         "alembic_version.version_num is VARCHAR(32)."
@@ -43,7 +42,7 @@ def test_alembic_revision_ids_fit_production_version_column():
     for path in (ROOT / "migrations" / "versions").glob("*.py"):
         tree = ast.parse(path.read_text())
         revision = assigned_value(tree, "revision")
-        if isinstance(revision, str) and revision not in legacy_production_revision_ids:
+        if isinstance(revision, str):
             assert len(revision) <= max_revision_length, f"{path}: {message}"
 
         down_revision = assigned_value(tree, "down_revision")
@@ -55,8 +54,7 @@ def test_alembic_revision_ids_fit_production_version_column():
             down_revisions = ()
 
         for down in down_revisions:
-            if down not in legacy_production_revision_ids:
-                assert len(down) <= max_revision_length, f"{path}: {message}"
+            assert len(down) <= max_revision_length, f"{path}: {message}"
 
 
 def test_alembic_chain_has_one_head_and_valid_down_revisions():
@@ -77,12 +75,12 @@ def test_alembic_chain_has_one_head_and_valid_down_revisions():
 
     merge = script.get_revision("0042_merge_heads")
     assert set(merge._normalized_down_revisions) == {
-        "0040_delay_interest_accrual_waiver",
+        "0040_delay_interest_waiver",
         "0041_cash_paid_loan_totals",
     }
 
 
-def test_migration_from_0040_to_head_succeeds(tmp_path):
+def test_migration_from_production_revision_to_head_succeeds(tmp_path):
     database_url = os.getenv("TEST_DATABASE_URL")
     if not database_url:
         import pytest
@@ -95,7 +93,7 @@ def test_migration_from_0040_to_head_succeeds(tmp_path):
         JWT_SECRET_KEY="x" * 32,
     )
     subprocess.run(
-        [sys.executable, "-m", "flask", "--app", "app:create_app", "db", "upgrade", "0040_early_loan_settlement"],
+        [sys.executable, "-m", "flask", "--app", "app:create_app", "db", "upgrade", "0041_cash_paid_loan_totals"],
         cwd=ROOT,
         env=env,
         check=True,
