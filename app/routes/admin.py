@@ -41,6 +41,7 @@ from .utils import role_required
 admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
 logger = logging.getLogger(__name__)
 from ..settlement_reconciliation import preview as settlement_preview, post as post_settlement_reconciliation
+from ..early_settlement import preview_early_loan_settlement, post_early_loan_settlement, reverse_early_loan_settlement, EarlySettlementError
 
 ACTIVE_LOAN_STATUSES = {"ACTIVE", "DISBURSED"}
 POSTED_PAYMENT_STATUSES = {"POSTED"}
@@ -569,6 +570,58 @@ def settlement_reconciliation_post(loan_id):
     return jsonify(_canonical_reconciliation_result(loan, previous_status, result))
 
 
+
+def _early_json(value):
+    if isinstance(value, Decimal): return float(value)
+    if isinstance(value, date): return value.isoformat()
+    if isinstance(value, list): return [_early_json(item) for item in value]
+    if isinstance(value, dict): return {key: _early_json(item) for key, item in value.items()}
+    return value
+
+def _early_payload():
+    payload = request.get_json(silent=True) or {}
+    try: settlement_date = date.fromisoformat(payload.get("settlement_date"))
+    except (TypeError, ValueError): raise EarlySettlementError("invalid_settlement_date", "settlement_date must be YYYY-MM-DD.")
+    return payload, settlement_date
+
+@admin_bp.route("/loans/<int:loan_id>/early-settlement/preview", methods=["POST"], strict_slashes=False)
+@role_required(["admin"])
+def early_settlement_preview(loan_id):
+    try:
+        payload, settlement_date = _early_payload()
+        return jsonify(_early_json(preview_early_loan_settlement(loan_id, settlement_date, payload.get("interest_rebate", 0), payload.get("penalty_waiver", 0))))
+    except LookupError: return jsonify({"error":"loan_not_found", "message":"The selected loan was not found."}), 404
+    except EarlySettlementError as exc: return jsonify({"error":exc.error,"message":exc.message}), 422
+
+@admin_bp.route("/loans/<int:loan_id>/early-settlement", methods=["POST"], strict_slashes=False)
+@role_required(["admin"])
+def early_settlement_post(loan_id):
+    try:
+        payload, settlement_date = _early_payload()
+        if not payload.get("confirm"): return jsonify({"error":"confirmation_required","message":"Confirm the early settlement before posting."}), 422
+        # If a UI sends its preview total, treat it as an optimistic-concurrency
+        # assertion; balances are still recalculated by the service.
+        fresh = preview_early_loan_settlement(loan_id, settlement_date, payload.get("interest_rebate", 0), payload.get("penalty_waiver", 0))
+        supplied_total = payload.get("final_settlement_amount")
+        if supplied_total is not None and Decimal(str(supplied_total)).quantize(Decimal("0.01")) != fresh["final_settlement_amount"]:
+            return jsonify({"error":"settlement_preview_stale", "message":"Loan balances changed after preview. Review the settlement again."}), 409
+        result=post_early_loan_settlement(loan_id, settlement_date, payload.get("interest_rebate", 0), payload.get("penalty_waiver", 0), payload.get("approval_reference"), payload.get("reason"), get_jwt_identity())
+        if result.get("posted"): db.session.commit()
+        else: db.session.rollback()
+        return jsonify(_early_json(result))
+    except LookupError: db.session.rollback(); return jsonify({"error":"loan_not_found", "message":"The selected loan was not found."}), 404
+    except EarlySettlementError as exc: db.session.rollback(); return jsonify({"error":exc.error,"message":exc.message}), 422
+    except Exception as exc: db.session.rollback(); return jsonify({"error":"early_settlement_failed","message":str(exc)}), 422
+
+@admin_bp.route("/loans/<int:loan_id>/early-settlement/<int:settlement_id>/reverse", methods=["POST"], strict_slashes=False)
+@role_required(["admin"])
+def early_settlement_reverse(loan_id, settlement_id):
+    try:
+        settlement=reverse_early_loan_settlement(loan_id, settlement_id, get_jwt_identity(), (request.get_json(silent=True) or {}).get("reason")); db.session.commit()
+        return jsonify({"loan_id":loan_id,"settlement_id":settlement.id,"status":settlement.status})
+    except EarlySettlementError as exc: db.session.rollback(); return jsonify({"error":exc.error,"message":exc.message}), 422
+
+
 def _canonical_reconciliation_result(loan, previous_status, result):
     """Keep every reconciliation URL on the same stable JSON contract."""
     number = lambda value: float(value) if isinstance(value, Decimal) else value
@@ -713,6 +766,15 @@ def _loan_to_dict(loan: Loan) -> dict:
         "status": loan.status,
         "outstanding_amount": float(loan.outstanding),
         "customer_credit_balance": float(loan.customer_credit_balance or 0),
+        "settlement_type": loan.settlement_type,
+        "interest_rebate_amount": float(loan.interest_rebate_amount or 0),
+        "penalty_waiver_amount": float(loan.penalty_waiver_amount or 0),
+        "final_settlement_amount": float(loan.early_settlements[-1].final_settlement_amount) if loan.early_settlements else None,
+        "original_total_payable": float(loan.total_payable or 0),
+        "revised_settlement_total": float((loan.total_payable or 0) - (loan.interest_rebate_amount or 0) - (loan.penalty_waiver_amount or 0)),
+        "early_settlement_status": loan.early_settlements[-1].status if loan.early_settlements else None,
+        "early_settlement_date": loan.early_settlements[-1].settlement_date.isoformat() if loan.early_settlements else None,
+        "early_settlement_reference": loan.early_settlements[-1].settlement_number if loan.early_settlements else None,
         "settled_date": loan.settled_date.isoformat() if loan.settled_date else None,
         "interest_accounting_method": loan.interest_accounting_method,
         "historical_accrual_mode": loan.historical_accrual_mode,
