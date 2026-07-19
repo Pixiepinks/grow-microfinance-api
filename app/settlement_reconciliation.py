@@ -196,6 +196,12 @@ def preview(loan, as_of_date=None):
         warnings.append("settlement date requires review")
     key = f"LEGACY-SETTLEMENT-{loan.id}"
     credit = CustomerCreditBalance.query.filter_by(source_type=SOURCE_TYPE, source_id=key).first()
+    # Preserve legacy allocation fields for audit, while exposing the effect of
+    # this non-destructive accounting reclassification separately.
+    reclassification = AccountingJournalEntry.query.filter_by(
+        idempotency_key=f"LOAN-RECONCILIATION:RECLASSIFICATION:{loan.id}"
+    ).first()
+    delay_reclassified = money(reclassification.total_debit) if reclassification and reclassification.status == "POSTED" else Decimal("0.00")
     advance_journal = _existing_advance_journal(payments, proposed_customer_credit) if proposed_customer_credit > TOLERANCE else None
     source_accounts = _excess_source_accounts(payments) if proposed_customer_credit > TOLERANCE else []
     adjustment_required = proposed_customer_credit > TOLERANCE and not credit and not advance_journal
@@ -224,6 +230,9 @@ def preview(loan, as_of_date=None):
             "contractual_interest_paid": money(sum((money(e.interest_paid) for e in loan.ledger_entries), Decimal())),
             "contractual_interest_outstanding": (unpaid or {}).get("interest", Decimal("0.00")),
             "delay_interest_accrued": delay_accrued, "delay_interest_collected": delay_paid,
+            "historical_delay_interest_allocated": delay_paid,
+            "delay_interest_reclassified": delay_reclassified,
+            "effective_delay_interest_paid": money(max(Decimal("0.00"), delay_paid-delay_reclassified)),
             "delay_interest_outstanding": money(max(Decimal(), delay_accrued-delay_paid-delay_waived)),
             "proposed_delay_interest_waiver": Decimal("0.00"),
             "delay_interest_waived": delay_waived,
@@ -258,6 +267,16 @@ def _adjustment(loan, result, user_id):
     if existing_advance:
         return existing_advance
     sources = _excess_source_accounts(payments)
+    # Old allocations recorded ordinary cash as delay-interest payment.  The
+    # delay receivable is the proven classification source in that case; do
+    # not ever use the receipt's cash/bank line for this correction.
+    historical_delay = money(result.get("historical_delay_interest_allocated", 0))
+    if historical_delay >= result["proposed_customer_credit"] - TOLERANCE:
+        try:
+            receivable = __import__("app.accounting", fromlist=["resolve_system_account"]).resolve_system_account("DELAY_INTEREST_RECEIVABLE")
+            sources.append((receivable.id, receivable.account_name, historical_delay))
+        except AccountingError:
+            pass
     if not sources:
         raise AccountingError("accounting reconciliation required: no receivable or suspense source can be proven")
     # A receipt can have several receivable credits; choose only a source whose
@@ -269,12 +288,25 @@ def _adjustment(loan, result, user_id):
         raise AccountingError("accounting reconciliation required: excess source account cannot be proven")
     advance = customer_advance_account()
     require_open_accounting_period(result["settled_date"])
-    entry = create_draft_journal(result["settled_date"], "Legacy loan overpayment reclassification",
+    entry = create_draft_journal(result["settled_date"], "Reclassification of historical ordinary payment previously allocated to delay interest; transferred to customer credit during loan reconciliation.",
         [{"account_id": source, "debit": result["proposed_customer_credit"], "customer_id": loan.customer_id, "loan_id": loan.id},
          {"account_id": advance.id, "credit": result["proposed_customer_credit"], "customer_id": loan.customer_id, "loan_id": loan.id}],
-        "LEGACY_LOAN_SETTLEMENT", loan.id, "LOANS", user_id, f"LEGACY-SETTLEMENT:{loan.id}")
+        "LOAN_RECONCILIATION", loan.id, "LOANS", user_id, f"LOAN-RECONCILIATION:RECLASSIFICATION:{loan.id}")
     entry.loan_id = loan.id; entry.customer_id = loan.customer_id
     return post_journal(entry, user_id)
+
+
+def _has_provable_reclassification_source(loan, result):
+    if _excess_source_accounts(_valid_payments(loan)):
+        return True
+    if money(result.get("historical_delay_interest_allocated", 0)) < result["proposed_customer_credit"] - TOLERANCE:
+        return False
+    try:
+        __import__("app.accounting", fromlist=["resolve_system_account"]).resolve_system_account("DELAY_INTEREST_RECEIVABLE")
+        customer_advance_account()
+        return True
+    except AccountingError:
+        return False
 
 
 def post(loan, user_id=None, waive_delay_interest=False, delay_interest_waiver_amount=None, approval_reference=None, reason=None):
@@ -282,12 +314,22 @@ def post(loan, user_id=None, waive_delay_interest=False, delay_interest_waiver_a
     if "already reconciled" in result["warnings"]:
         log_audit("LEGACY_LOAN_SETTLEMENT_SKIPPED", "Loan", loan.id, user_id, result)
         return {**result, "processed": False}
-    if waive_delay_interest:
+    # A waiver is an independent optional operation.  In particular, a false
+    # checkbox is *not* a reason to skip reclassification or settlement.
+    requested_waiver = money(delay_interest_waiver_amount or 0)
+    if waive_delay_interest and delay_interest_waiver_amount is None:
+        raise AccountingError("delay_interest_waiver_amount must be explicitly entered")
+    waiver_journal_id = None
+    if requested_waiver > TOLERANCE:
+        if not waive_delay_interest:
+            # Amount is authoritative; tolerate clients with the newer field
+            # but an omitted legacy boolean.
+            waive_delay_interest = True
         if delay_interest_waiver_amount is None:
             raise AccountingError("delay_interest_waiver_amount must be explicitly entered")
         if not reason or not str(reason).strip():
             raise AccountingError("reason is required for a delay interest waiver")
-        requested = money(delay_interest_waiver_amount)
+        requested = requested_waiver
         if requested <= 0 or requested > result["delay_interest_outstanding"] + TOLERANCE:
             raise AccountingError("delay interest waiver must not exceed unpaid delay interest")
         settlement_date = result["settled_date"] or datetime.utcnow().date()
@@ -297,7 +339,7 @@ def post(loan, user_id=None, waive_delay_interest=False, delay_interest_waiver_a
         waiver = LoanChargeWaiver(waiver_number=f"GROW-DIW-{loan.id:08d}-{LoanChargeWaiver.query.count()+1:04d}", loan_id=loan.id, customer_id=loan.customer_id, waiver_type="DELAY_INTEREST", waiver_date=settlement_date, amount=requested, receivable_account_id=receivable.id, expense_account_id=expense.id, approval_reference=approval_reference, reason=reason, status="APPROVED", approved_by=user_id, approved_at=datetime.utcnow())
         db.session.add(waiver); db.session.flush()
         journal = create_draft_journal(settlement_date, "Delay interest waiver", [{"account_id": expense.id, "debit": requested, "loan_id": loan.id, "customer_id": loan.customer_id}, {"account_id": receivable.id, "credit": requested, "loan_id": loan.id, "customer_id": loan.customer_id}], "DELAY_INTEREST_WAIVER", waiver.id, "LOANS", user_id, f"DELAY_INTEREST_WAIVER:{waiver.id}")
-        journal.loan_id=loan.id; journal.customer_id=loan.customer_id; post_journal(journal, user_id); waiver.status="POSTED"; waiver.journal_entry_id=journal.id
+        journal.loan_id=loan.id; journal.customer_id=loan.customer_id; post_journal(journal, user_id); waiver.status="POSTED"; waiver.journal_entry_id=journal.id; waiver_journal_id=journal.id
         remaining = requested
         for entry in sorted(loan.ledger_entries, key=lambda x: (x.due_date, x.installment_no)):
             applied=min(remaining, money(entry.delay_interest_accrued)-money(entry.delay_interest_paid)-money(entry.delay_interest_waived)); entry.delay_interest_waived=money(entry.delay_interest_waived+applied); remaining=money(remaining-applied)
@@ -344,7 +386,8 @@ def post(loan, user_id=None, waive_delay_interest=False, delay_interest_waiver_a
     # paid loan from settling or from recording its customer credit; where a
     # provable source exists, retain the reclassification journal behavior.
     journal = None
-    if result["proposed_customer_credit"] > TOLERANCE and not result["customer_credit_exists"] and _excess_source_accounts(_valid_payments(loan)):
+    if (result["proposed_customer_credit"] > TOLERANCE and not result["customer_credit_exists"]
+            and _has_provable_reclassification_source(loan, result)):
         journal = _adjustment(loan, result, user_id)
     key = f"LEGACY-SETTLEMENT-{loan.id}"
     credit = CustomerCreditBalance.query.filter_by(source_type=SOURCE_TYPE, source_id=key).first()
@@ -357,22 +400,32 @@ def post(loan, user_id=None, waive_delay_interest=False, delay_interest_waiver_a
     # Status is based only on contractual principal and normal interest.  This
     # is the missing persistence step behind previews that proposed SETTLED.
     loan, balances = update_loan_settlement_status(loan.id, result["settled_date"], user_id, loan=loan)
-    loan.customer_credit_balance = result["proposed_customer_credit"]
+    # Do not report a preview value: report the persisted available liability.
+    persisted_credit = money(credit.available_amount) if credit else Decimal("0.00")
+    loan.customer_credit_balance = persisted_credit
     loan.settlement_payment_id = result["final_payment_id"]
     loan.settlement_journal_id = journal.id if journal else loan.settlement_journal_id; loan.settlement_reason = "LEGACY_FULLY_REPAID"
     for entry in loan.ledger_entries:
         due = money(entry.principal_amount) + money(entry.interest_amount) + money(entry.delay_interest_accrued)
         paid = money(entry.principal_paid) + money(entry.interest_paid) + money(entry.delay_interest_paid) + money(entry.delay_interest_waived)
         if paid >= due - TOLERANCE: entry.status = "PAID"; entry.paid_amount = min(paid, due)
+    logger.info("loan_reconciliation_posted loan_id=%s waiver_requested=%s waiver_amount=%s historical_delay_interest_allocated=%s customer_credit_proposed=%s customer_credit_posted=%s reclassification_journal_id=%s waiver_journal_id=%s calculated_status=%s",
+                loan.id, bool(requested_waiver), requested_waiver, result["historical_delay_interest_allocated"], result["proposed_customer_credit"], persisted_credit, journal.id if journal else None, waiver_journal_id, serialize_loan_status(loan))
     log_audit("LEGACY_LOAN_SETTLEMENT_POSTED", "Loan", loan.id, user_id, {**result, "journal_id": journal.id if journal else None})
-    return {**result, **balances, "processed": True, "settlement_journal_id": journal.id if journal else None}
+    return {**result, **balances, "processed": True, "settlement_journal_id": journal.id if journal else None,
+            "reclassification_journal_id": journal.id if journal else None,
+            "waiver_journal_id": waiver_journal_id,
+            "customer_credit_created": persisted_credit, "customer_credit_balance": persisted_credit,
+            "delay_interest_waived_this_reconciliation": requested_waiver}
 
 
 def _apply_historical_payments_to_ledger(loan, amount, paid_date, delay_only=False):
     """Rebuild ledger balances from historical cash without posting new journals."""
     remaining = money(amount)
     for entry in sorted(loan.ledger_entries, key=lambda item: (item.due_date, item.installment_no)):
-        fields = (("delay_interest_accrued", "delay_interest_paid"),) if delay_only else (("principal_amount", "principal_paid"), ("interest_amount", "interest_paid"), ("delay_interest_accrued", "delay_interest_paid"))
+        # Ordinary historical receipts belong to contractual interest then
+        # principal.  Delay interest requires a separate explicit action.
+        fields = (("delay_interest_accrued", "delay_interest_paid"),) if delay_only else (("interest_amount", "interest_paid"), ("principal_amount", "principal_paid"))
         for due_field, paid_field in fields:
             if remaining <= 0:
                 break

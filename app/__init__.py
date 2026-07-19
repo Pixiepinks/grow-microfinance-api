@@ -157,6 +157,42 @@ def create_app():
         click.echo({"loans": [{**r, **{k: str(v) for k,v in r.items() if hasattr(v, "as_tuple")}} for r in results], "summary": summary})
         if preview_mode: db.session.rollback()
 
+    @app.cli.command("repair-reconciliation")
+    @click.option("--loan-number", required=True, help="Loan number to inspect or repair.")
+    @click.option("--preview", "preview_mode", is_flag=True, default=False)
+    @click.option("--apply", "apply_mode", is_flag=True, default=False)
+    def repair_reconciliation(loan_number, preview_mode, apply_mode):
+        """Repair one legacy reconciliation without reposting its cash receipt."""
+        if preview_mode == apply_mode:
+            raise click.ClickException("Specify exactly one of --preview or --apply")
+        from .models import Loan, CustomerCreditBalance, AccountingJournalEntry, LoanChargeWaiver
+        from .settlement_reconciliation import preview, finalize_loan_reconciliation
+        loan = Loan.query.filter_by(loan_number=loan_number).first()
+        if not loan:
+            raise click.ClickException("Loan not found")
+        before = preview(loan)
+        key = f"LOAN-RECONCILIATION:RECLASSIFICATION:{loan.id}"
+        report = {
+            "loan_id": loan.id, "loan_number": loan.loan_number,
+            "existing_reconciliation": loan.settlement_reason,
+            "existing_customer_credit": CustomerCreditBalance.query.filter_by(loan_id=loan.id).count(),
+            "existing_reclassification_journal": bool(AccountingJournalEntry.query.filter_by(idempotency_key=key).first()),
+            "existing_waiver": bool(LoanChargeWaiver.query.filter_by(loan_id=loan.id, waiver_type="DELAY_INTEREST", status="POSTED").first()),
+            "expected_customer_credit": str(before["proposed_customer_credit"]),
+            "proposed_reclassification": "Dr Delay Interest Receivable / Cr Customer Advances",
+            "proposed_status": before["proposed_status"],
+            "duplicate_risk": bool(before["customer_credit_exists"] or AccountingJournalEntry.query.filter_by(idempotency_key=key).first()),
+        }
+        if apply_mode:
+            loan, outcome = finalize_loan_reconciliation(loan.id)
+            report["applied"] = bool(outcome.get("processed"))
+            report["status"] = loan.status
+            report["reclassification_journal_id"] = outcome.get("reclassification_journal_id")
+            report["customer_credit_balance"] = str(outcome.get("customer_credit_balance", 0))
+        click.echo(report)
+        if preview_mode:
+            db.session.rollback()
+
     @app.cli.command("reconcile-loan-paid-totals")
     @click.option("--preview", "preview_mode", is_flag=True, default=False, help="Report proposed cash-paid cache corrections.")
     @click.option("--post", "post_mode", is_flag=True, default=False, help="Update only the loan cash-paid summary cache.")
