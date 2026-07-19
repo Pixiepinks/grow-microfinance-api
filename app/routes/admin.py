@@ -5,7 +5,7 @@ from sqlalchemy.exc import IntegrityError
 import logging
 import secrets
 from flask_jwt_extended import get_jwt_identity
-from sqlalchemy import String, case, cast, false, func, or_
+from sqlalchemy import String, case, cast, false, func, or_, and_
 from sqlalchemy.orm import joinedload
 
 from app.supabase_client import build_public_url
@@ -480,34 +480,195 @@ def create_loan():
 @admin_bp.route("/loans", methods=["GET"])
 @role_required(["admin"])
 def list_loans():
-    status = request.args.get("status")
-    customer_id = request.args.get("customer_id")
-    query = Loan.query.options(joinedload(Loan.customer))
+    """Return the admin loan list using database-side search and pagination."""
+    def value(name):
+        raw = request.args.get(name)
+        return raw.strip() if isinstance(raw, str) and raw.strip() else None
+
+    def invalid(message, error="invalid_parameter"):
+        return jsonify({"error": error, "message": message}), 422
+
+    def parse_date(name):
+        raw = value(name)
+        if raw is None:
+            return None, None
+        try:
+            return date.fromisoformat(raw), None
+        except ValueError:
+            return None, invalid(f"{name} must be a valid ISO date (YYYY-MM-DD).")
+
+    def parse_decimal(name):
+        raw = value(name)
+        if raw is None:
+            return None, None
+        try:
+            parsed = Decimal(raw)
+        except (InvalidOperation, ValueError):
+            return None, invalid(f"{name} must be a valid decimal amount.")
+        if not parsed.is_finite() or parsed < 0:
+            return None, invalid(f"{name} must be a non-negative decimal amount.")
+        return parsed, None
+
+    def parse_positive_int(name, default, maximum=None):
+        raw = value(name)
+        if raw is None:
+            return default, None
+        try:
+            parsed = int(raw)
+        except ValueError:
+            return None, invalid(f"{name} must be an integer.")
+        if parsed < 1 or (maximum is not None and parsed > maximum):
+            limit = f" between 1 and {maximum}" if maximum else " at least 1"
+            return None, invalid(f"{name} must be{limit}.")
+        return parsed, None
+
+    q = value("q")
+    status = value("status")
     if status:
-        query = query.filter_by(status=status)
+        status = status.upper()
+        if status == "ALL":
+            status = None
+        elif status not in {"ACTIVE", "OVERDUE", "SETTLED", "WRITTEN_OFF", "CANCELLED", "DISBURSED"}:
+            return invalid("status is not supported.")
+    balance_status = value("balance_status")
+    if balance_status:
+        balance_status = balance_status.upper()
+        if balance_status == "ALL":
+            balance_status = None
+        elif balance_status not in {"OUTSTANDING", "FULLY_PAID", "OVERPAID", "ZERO_BALANCE"}:
+            return invalid("balance_status is not supported.")
+    sort_by = (value("sort_by") or "disbursement_date").lower()
+    sort_direction = (value("sort_direction") or "desc").lower()
+    if sort_direction not in {"asc", "desc"}:
+        return invalid("sort_direction must be asc or desc.")
+
+    date_from, error = parse_date("date_from")
+    if error:
+        return error
+    date_to, error = parse_date("date_to")
+    if error:
+        return error
+    if date_from and date_to and date_from > date_to:
+        return invalid("Date From cannot be later than Date To.", "invalid_date_range")
+    principal_min, error = parse_decimal("principal_min")
+    if error:
+        return error
+    principal_max, error = parse_decimal("principal_max")
+    if error:
+        return error
+    if principal_min is not None and principal_max is not None and principal_min > principal_max:
+        return invalid("principal_min cannot be greater than principal_max.", "invalid_principal_range")
+    page, error = parse_positive_int("page", 1)
+    if error:
+        return error
+    page_size, error = parse_positive_int("page_size", 25, 100)
+    if error:
+        return error
+    customer_id_raw = value("customer_id")
+    customer_id = None
+    if customer_id_raw:
+        try:
+            customer_id = int(customer_id_raw)
+            if customer_id < 1:
+                raise ValueError
+        except ValueError:
+            return invalid("customer_id must be a positive integer.")
+
+    # These correlated aggregates preserve one row per loan while keeping balance
+    # filters, sorting, and pagination entirely in the database.
+    paid_amount = db.session.query(func.coalesce(func.sum(Payment.amount_collected), 0)).filter(
+        Payment.loan_id == Loan.id,
+        Payment.reversed_at.is_(None),
+        func.upper(func.trim(Payment.status)) != "REVERSED",
+    ).correlate(Loan).scalar_subquery()
+    raw_outstanding = (func.coalesce(Loan.total_payable, 0) - paid_amount).label("raw_outstanding")
+    outstanding_amount = case((raw_outstanding < 0, 0), else_=raw_outstanding).label("outstanding_amount")
+    application_id = db.session.query(func.min(LoanDisbursementDeduction.loan_application_id)).filter(
+        LoanDisbursementDeduction.loan_id == Loan.id
+    ).correlate(Loan).scalar_subquery()
+
+    sort_fields = {
+        "loan_number": Loan.loan_number,
+        "customer_name": Customer.full_name,
+        "principal_amount": Loan.principal_amount,
+        "total_payable": Loan.total_payable,
+        "total_paid": paid_amount,
+        "outstanding_amount": outstanding_amount,
+        "disbursement_date": Loan.start_date,
+        "settled_date": Loan.settled_date,
+        "status": func.upper(func.trim(Loan.status)),
+    }
+    if sort_by not in sort_fields:
+        return invalid("sort_by is not supported.")
+
+    query = db.session.query(Loan, paid_amount.label("total_paid"), raw_outstanding, outstanding_amount, application_id.label("application_id"), LoanApplication.application_number).options(joinedload(Loan.customer)).outerjoin(Customer, Loan.customer_id == Customer.id).outerjoin(LoanApplication, LoanApplication.id == application_id)
+    if q:
+        pattern = f"%{q}%"
+        search_terms = [
+            Loan.loan_number.ilike(pattern), Customer.full_name.ilike(pattern),
+            Customer.customer_code.ilike(pattern), Customer.nic_number.ilike(pattern),
+            Customer.mobile.ilike(pattern), LoanApplication.application_number.ilike(pattern),
+        ]
+        if q.isdigit():
+            search_terms.append(Loan.id == int(q))
+        query = query.filter(or_(*search_terms))
+    if status:
+        query = query.filter(func.upper(func.trim(Loan.status)) == status)
     if customer_id:
-        query = query.filter_by(customer_id=customer_id)
-    loans = query.all()
-    results = [
-        {
-            "id": l.id,
-            "loan_number": l.loan_number,
-            "customer_id": l.customer_id,
-            "customer": _loan_customer_to_dict(l.customer),
-            "status": l.status,
-            "currency": CURRENCY_CODE,
-            "principal_amount": float(l.principal_amount),
-            "principal_amount_formatted": format_currency(l.principal_amount),
-            "total_payable": float(l.total_payable),
-            "total_payable_formatted": format_currency(l.total_payable),
-            "total_paid": float(l.total_paid),
-            "total_paid_formatted": format_currency(l.total_paid),
-            "outstanding": float(l.outstanding),
-            "outstanding_formatted": format_currency(l.outstanding),
-        }
-        for l in loans
-    ]
-    return jsonify(results)
+        query = query.filter(Loan.customer_id == customer_id)
+    if date_from:
+        query = query.filter(Loan.start_date >= date_from)
+    if date_to:
+        query = query.filter(Loan.start_date <= date_to)
+    if principal_min is not None:
+        query = query.filter(Loan.principal_amount >= principal_min)
+    if principal_max is not None:
+        query = query.filter(Loan.principal_amount <= principal_max)
+    credit = func.coalesce(Loan.customer_credit_balance, 0)
+    if balance_status == "OUTSTANDING":
+        query = query.filter(outstanding_amount > Decimal("0.01"))
+    elif balance_status == "FULLY_PAID":
+        query = query.filter(and_(outstanding_amount <= Decimal("0.01"), credit <= Decimal("0.01"), raw_outstanding >= 0))
+    elif balance_status == "OVERPAID":
+        query = query.filter(or_(credit > Decimal("0.01"), raw_outstanding < 0))
+    elif balance_status == "ZERO_BALANCE":
+        query = query.filter(outstanding_amount <= Decimal("0.01"))
+
+    total_items = query.order_by(None).count()
+    sort_expression = sort_fields[sort_by]
+    ordering = sort_expression.asc() if sort_direction == "asc" else sort_expression.desc()
+    rows = query.order_by(ordering, Loan.id.asc()).offset((page - 1) * page_size).limit(page_size).all()
+    total_pages = (total_items + page_size - 1) // page_size
+    items = []
+    for loan, total_paid, raw_balance, displayed_balance, linked_application_id, application_number in rows:
+        customer = loan.customer
+        raw_balance = Decimal(raw_balance or 0)
+        displayed_balance = Decimal(displayed_balance or 0)
+        credit_balance = Decimal(loan.customer_credit_balance or 0)
+        reconciliation_required = (loan.status or "").strip().upper() != "SETTLED" and displayed_balance <= Decimal("0.01") and raw_balance >= 0
+        items.append({
+            "id": loan.id, "loan_id": loan.id, "loan_number": loan.loan_number,
+            "application_id": linked_application_id, "application_number": application_number,
+            "customer_id": loan.customer_id, "customer_number": customer.customer_code if customer else None,
+            "customer_name": customer.full_name if customer else None, "nic": customer.nic_number if customer else None,
+            "mobile": customer.mobile if customer else None, "customer": _loan_customer_to_dict(customer),
+            "currency": CURRENCY_CODE, "principal_amount": float(loan.principal_amount or 0),
+            "total_interest": float(loan.total_interest if loan.total_interest is not None else (loan.total_payable or 0) - (loan.principal_amount or 0)),
+            "total_payable": float(loan.total_payable or 0), "total_paid": float(total_paid or 0),
+            "outstanding_amount": float(displayed_balance), "outstanding": float(displayed_balance),
+            "customer_credit_balance": float(credit_balance), "disbursement_date": loan.start_date.isoformat() if loan.start_date else None,
+            "start_date": loan.start_date.isoformat() if loan.start_date else None,
+            "maturity_date": loan.maturity_date.isoformat() if loan.maturity_date else (loan.end_date.isoformat() if loan.end_date else None),
+            "settled_date": loan.settled_date.isoformat() if loan.settled_date else None, "status": loan.status,
+            "settlement_reconciliation_required": reconciliation_required,
+            "available_actions": [],
+            # Legacy list consumers use these keys; monetary values remain numeric.
+            "principal_amount_formatted": format_currency(loan.principal_amount or 0),
+            "total_payable_formatted": format_currency(loan.total_payable or 0),
+            "total_paid_formatted": format_currency(total_paid or 0),
+            "outstanding_formatted": format_currency(displayed_balance),
+        })
+    return jsonify({"items": items, "pagination": {"page": page, "page_size": page_size, "total_items": total_items, "total_pages": total_pages, "has_next": page < total_pages, "has_previous": page > 1}, "applied_filters": {"q": q, "status": status, "date_from": date_from.isoformat() if date_from else None, "date_to": date_to.isoformat() if date_to else None, "balance_status": balance_status, "principal_min": float(principal_min) if principal_min is not None else None, "principal_max": float(principal_max) if principal_max is not None else None, "customer_id": customer_id, "sort_by": sort_by, "sort_direction": sort_direction}})
 
 
 def _loan_customer_to_dict(customer: Customer | None) -> dict | None:
