@@ -113,10 +113,13 @@ def preview(loan, as_of_date=None):
     delay_accrued = money(sum((money(e.delay_interest_accrued) for e in loan.ledger_entries), Decimal()))
     delay_paid = money(sum((money(e.delay_interest_paid) for e in loan.ledger_entries), Decimal()))
     delay_waived = money(sum((money(e.delay_interest_waived) for e in loan.ledger_entries), Decimal()))
-    legitimate_loan_due = money(loan.total_payable + delay_accrued - delay_waived)
-    total_applied_to_loan = money(min(total_cash_received, legitimate_loan_due))
+    contractual_due = money(sum((money(e.principal_amount) + money(e.interest_amount) for e in loan.ledger_entries), Decimal()))
+    # Cash receipts are only applied to the contractual waterfall.  Penalty is
+    # intentionally excluded until an explicit reconciliation collection.
+    legitimate_loan_due = contractual_due + delay_accrued - delay_waived
+    total_applied_to_loan = money(min(total_cash_received, contractual_due))
     unapplied_excess = money(max(total_cash_received - total_applied_to_loan, Decimal("0.00")))
-    raw_balance = money(legitimate_loan_due - total_cash_received)
+    raw_balance = money(contractual_due - total_cash_received)
     remaining_balance = money(max(raw_balance, Decimal("0.00")))
     proposed_customer_credit = money(max(-raw_balance, Decimal("0.00")))
     warnings.extend(ledger_warnings)
@@ -154,9 +157,15 @@ def preview(loan, as_of_date=None):
             "cash_received": total_cash_received,
             "principal_collected": money(sum((money(e.principal_paid) for e in loan.ledger_entries), Decimal())),
             "normal_interest_collected": money(sum((money(e.interest_paid) for e in loan.ledger_entries), Decimal())),
+            "contractual_principal_due": money(sum((money(e.principal_amount) for e in loan.ledger_entries), Decimal())),
+            "contractual_principal_paid": money(sum((money(e.principal_paid) for e in loan.ledger_entries), Decimal())),
+            "contractual_principal_outstanding": (unpaid or {}).get("principal", Decimal("0.00")),
+            "contractual_interest_due": money(sum((money(e.interest_amount) for e in loan.ledger_entries), Decimal())),
+            "contractual_interest_paid": money(sum((money(e.interest_paid) for e in loan.ledger_entries), Decimal())),
+            "contractual_interest_outstanding": (unpaid or {}).get("interest", Decimal("0.00")),
             "delay_interest_accrued": delay_accrued, "delay_interest_collected": delay_paid,
             "delay_interest_outstanding": money(max(Decimal(), delay_accrued-delay_paid-delay_waived)),
-            "proposed_delay_interest_waiver": money(max(Decimal(), delay_accrued-delay_paid-delay_waived)),
+            "proposed_delay_interest_waiver": Decimal("0.00"),
             "delay_interest_waived": delay_waived,
             "remaining_balance_after_waiver": money(max(Decimal(), total_cash_received - total_cash_received)),
             "total_cash_received": total_cash_received, "total_applied_to_loan": total_applied_to_loan,
@@ -214,7 +223,11 @@ def post(loan, user_id=None, waive_delay_interest=False, delay_interest_waiver_a
         log_audit("LEGACY_LOAN_SETTLEMENT_SKIPPED", "Loan", loan.id, user_id, result)
         return {**result, "processed": False}
     if waive_delay_interest:
-        requested = money(delay_interest_waiver_amount if delay_interest_waiver_amount is not None else result["delay_interest_outstanding"])
+        if delay_interest_waiver_amount is None:
+            raise AccountingError("delay_interest_waiver_amount must be explicitly entered")
+        if not reason or not str(reason).strip():
+            raise AccountingError("reason is required for a delay interest waiver")
+        requested = money(delay_interest_waiver_amount)
         if requested <= 0 or requested > result["delay_interest_outstanding"] + TOLERANCE:
             raise AccountingError("delay interest waiver must not exceed unpaid delay interest")
         settlement_date = result["settled_date"] or datetime.utcnow().date()

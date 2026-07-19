@@ -415,6 +415,37 @@ def create_app():
         if summary.get("errors"):
             raise click.ClickException("Some accruals failed")
 
+    @app.cli.command("repair-loan-ledger")
+    @click.option("--loan-id", type=int, default=None)
+    @click.option("--all", "all_loans", is_flag=True, default=False)
+    @click.option("--preview", "preview_mode", is_flag=True, default=False)
+    @click.option("--apply", "apply_changes", is_flag=True, default=False)
+    def repair_loan_ledger_cli(loan_id, all_loans, preview_mode, apply_changes):
+        """Preview or explicitly apply contractual-ledger date/allocation repairs.
+
+        Applying changes only changes derived ledger state.  The report flags
+        cases whose immutable receipt/journal allocation requires a separately
+        approved accounting correction.
+        """
+        if preview_mode == apply_changes or (loan_id is None) == (not all_loans):
+            raise click.ClickException("Specify exactly one of --loan-id/--all and --preview/--apply")
+        from .models import Loan
+        from .loan_ledger import recalculate_loan_ledger
+        loans = [Loan.query.get(loan_id)] if loan_id else Loan.query.order_by(Loan.id).all()
+        reports = []
+        for loan in filter(None, loans):
+            report = recalculate_loan_ledger(loan.id)
+            report["accounting_impact"] = "CONTROLLED_ADJUSTMENT_REQUIRED" if any(
+                money(p.penalty_paid) > 0 for p in loan.payments if (p.status or "").upper() == "POSTED"
+            ) else "NONE"
+            report["journal_adjustment_required"] = report["accounting_impact"] != "NONE"
+            reports.append(report)
+        if apply_changes:
+            db.session.commit()
+        else:
+            db.session.rollback()
+        click.echo({"mode": "apply" if apply_changes else "preview", "loans": reports})
+
     return app
 
 

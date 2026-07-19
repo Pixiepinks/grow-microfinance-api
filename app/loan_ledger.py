@@ -233,3 +233,61 @@ def ledger_totals(loan: Loan) -> dict:
     total_paid = totals["cash_paid"]
     outstanding = totals["outstanding_amount"]
     return {"currency": CURRENCY_CODE,"total_principal": float(total_principal),"total_principal_formatted": format_currency(total_principal),"total_interest": float(total_interest),"total_interest_formatted": format_currency(total_interest),"total_payable": float(total_payable),"total_payable_formatted": format_currency(total_payable),"total_paid": float(total_paid),"total_paid_formatted": format_currency(total_paid),"cash_paid": float(total_paid),"settlement_adjustments": float(totals["settlement_adjustments"]),"gross_satisfied_amount": float(totals["gross_satisfied_amount"]),"outstanding": float(outstanding),"outstanding_formatted": format_currency(outstanding),"total_delay_interest": float(total_delay_interest),"total_delay_interest_formatted": format_currency(total_delay_interest)}
+
+
+def recalculate_loan_ledger(loan_id: int, as_of_date=None) -> dict:
+    """Rebuild contractual allocations from immutable posted receipts.
+
+    This deliberately does not edit payment receipts or posted journals.  It is
+    suitable for a preview/repair workflow; callers that apply it must create
+    controlled journal adjustments for any historical allocation difference.
+    """
+    from .models import Payment
+    loan = Loan.query.get(loan_id)
+    if not loan:
+        raise ValueError("Loan not found")
+    entries = _ordered_entries(loan)
+    old = {e.id: {"paid_date": e.paid_date, "delay_days": e.delay_days,
+                  "delay_interest": money(e.delay_interest_accrued or e.delay_interest or 0)} for e in entries}
+    for e in entries:
+        e.principal_paid = e.interest_paid = e.paid_amount = Decimal("0.00")
+        e.paid_date = e.last_payment_date = None
+        e.status = "PENDING"
+    payments = [p for p in loan.payments if (p.status or "").upper() == "POSTED" and not p.reversed_at
+                and (as_of_date is None or (p.collection_date or p.payment_date) <= as_of_date)]
+    payments.sort(key=lambda p: (p.collection_date or p.payment_date, p.created_at, p.id))
+    credits = Decimal("0.00")
+    allocation_rows = []
+    for payment in payments:
+        remaining = money(payment.amount_collected)
+        interest = principal = Decimal("0.00")
+        for e in entries:
+            if remaining <= 0: break
+            due = money(e.interest_amount) - money(e.interest_paid)
+            applied = min(remaining, due); e.interest_paid = money(e.interest_paid + applied); interest += applied; remaining -= applied
+            if applied: e.last_payment_date = payment.collection_date or payment.payment_date
+            due = money(e.principal_amount) - money(e.principal_paid)
+            applied = min(remaining, due); e.principal_paid = money(e.principal_paid + applied); principal += applied; remaining -= applied
+            if applied: e.last_payment_date = payment.collection_date or payment.payment_date
+            e.paid_amount = money(e.interest_paid + e.principal_paid)
+            if e.paid_amount > 0:
+                e.status = "PAID" if e.paid_amount >= money(e.interest_amount + e.principal_amount) else "PARTIAL"
+            if e.status == "PAID" and e.paid_date is None:
+                e.paid_date = payment.collection_date or payment.payment_date
+        credits += remaining
+        allocation_rows.append({"payment_id": payment.id, "payment_transaction_date": payment.collection_date or payment.payment_date,
+                                "contractual_interest": money(interest), "principal": money(principal), "delay_interest": Decimal("0.00"), "customer_credit": money(remaining)})
+    calculation_date = as_of_date or __import__('datetime').date.today()
+    for e in entries:
+        end = e.paid_date if e.status == "PAID" else calculation_date
+        e.delay_days = max((end - e.due_date).days, 0)
+        # Existing accrual/waiver/payment history is preserved.  Recalculation
+        # only fixes the display estimate where no posted accrual exists.
+        if not e.delay_interest_accrual_journal_id:
+            base = money(max(Decimal("0"), money(e.principal_amount)-money(e.principal_paid)+money(e.interest_amount)-money(e.interest_paid)))
+            e.delay_interest = money(base * daily_interest_rate(loan) * Decimal(e.delay_days))
+            e.delay_interest_accrued = e.delay_interest
+    return {"loan_id": loan.id, "allocations": allocation_rows, "customer_credit": money(credits),
+            "rows": [{"installment_no": e.installment_no, "old_paid_date": old[e.id]["paid_date"], "corrected_paid_date": e.paid_date,
+                      "old_delay_days": old[e.id]["delay_days"], "corrected_delay_days": e.delay_days,
+                      "old_delay_interest": old[e.id]["delay_interest"], "corrected_delay_interest": money(e.delay_interest_accrued)} for e in entries]}

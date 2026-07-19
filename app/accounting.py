@@ -1450,13 +1450,22 @@ def accrue_delay_interest(through_date, loan_id=None, preview=False, requested_b
     receivable, income = resolve_system_account("DELAY_INTEREST_RECEIVABLE"), resolve_system_account("DELAY_INTEREST_INCOME")
     for ledger in query.order_by(LoanLedger.due_date, LoanLedger.id):
         loan = ledger.loan
-        if str(loan.status).upper() in {"SETTLED", "CANCELLED", "WRITTEN_OFF"}:
+        if str(loan.status).upper() in {"CANCELLED", "WRITTEN_OFF"}:
             result["skipped"].append({"ledger_id": ledger.id, "reason": "loan_status"}); continue
+        # Contractual settlement stops this row's penalty clock, even when the
+        # loan still has an outstanding delay-interest reconciliation.
+        contractual_cleared = (money(ledger.principal_paid) >= money(ledger.principal_amount)
+                                and money(ledger.interest_paid) >= money(ledger.interest_amount))
+        if contractual_cleared:
+            result["skipped"].append({"ledger_id": ledger.id, "reason": "contractual_balance_settled"}); continue
         end = min(through_date, loan.settled_date) if loan.settled_date else through_date
         start = max(ledger.due_date, ledger.delay_interest_accrued_at.date() if ledger.delay_interest_accrued_at else ledger.due_date)
         if end <= start: continue
         days = Decimal((end - start).days)
-        amount = money(Decimal(ledger.opening_balance or 0) * (Decimal(loan.interest_rate or 0) / Decimal("100") / Decimal("30")) * days)
+        overdue_base = money(max(Decimal("0"),
+            money(ledger.principal_amount) - money(ledger.principal_paid) +
+            money(ledger.interest_amount) - money(ledger.interest_paid)))
+        amount = money(overdue_base * (Decimal(loan.interest_rate or 0) / Decimal("100") / Decimal("30")) * days)
         if amount <= 0: continue
         source_id = f"{loan.id}:{ledger.id}:{start.isoformat()}:{end.isoformat()}"
         existing = AccountingJournalEntry.query.filter_by(source_type="DELAY_INTEREST_ACCRUAL", source_id=source_id).first()
@@ -1477,24 +1486,31 @@ def accrue_delay_interest(through_date, loan_id=None, preview=False, requested_b
 def allocate_payment(loan, amount, paid_date):
     if str(getattr(loan, "interest_accounting_method", LOAN_ACCRUAL_METHOD)) == LOAN_ACCRUAL_METHOD:
         accrue_due_loan_interest(paid_date, loan.id, historical=True)
+    # Ordinary receipts never settle delay interest.  That receivable can only
+    # be collected by an explicit reconciliation action.
     remaining = money(amount); principal=interest=penalty=unapplied=Decimal("0.00")
     allocations=[]
     for e in sorted(loan.ledger_entries, key=lambda x: (x.due_date, x.installment_no)):
         if remaining <= 0: break
-        delay_due = money(Decimal(e.delay_interest_accrued or 0) - Decimal(e.delay_interest_paid or 0))
-        pay = min(remaining, delay_due); e.delay_interest_paid = money(Decimal(e.delay_interest_paid or 0)+pay); penalty += pay; remaining -= pay
-        if pay: allocations.append((e, "DELAY_INTEREST", pay))
-        interest_base = Decimal(e.interest_amount) if str(loan.interest_accounting_method) == CASH_BASIS_METHOD or e.interest_accrued else Decimal("0.00")
+        # Contractual schedule interest is due regardless of whether a
+        # background accrual journal has been posted; allocation is a customer
+        # waterfall, not an accounting-accrual decision.
+        interest_base = Decimal(e.interest_amount)
         interest_due = money(interest_base - Decimal(e.interest_paid or 0))
         pay = min(remaining, interest_due); e.interest_paid = money(Decimal(e.interest_paid or 0)+pay); interest += pay; remaining -= pay
         if pay: allocations.append((e, "INTEREST", pay))
         principal_due = money(Decimal(e.principal_amount) - Decimal(e.principal_paid or 0))
         pay = min(remaining, principal_due); e.principal_paid = money(Decimal(e.principal_paid or 0)+pay); principal += pay; remaining -= pay
         if pay: allocations.append((e, "PRINCIPAL", pay))
-        e.paid_amount = money(Decimal(e.principal_paid or 0)+Decimal(e.interest_paid or 0)+Decimal(e.delay_interest_paid or 0))
-        payable = money(Decimal(e.principal_amount)+Decimal(e.interest_amount)+Decimal(e.delay_interest_accrued or 0))
-        e.status = "PAID" if e.paid_amount >= payable else ("PARTIAL" if e.paid_amount > 0 else e.status)
-        if e.paid_amount > 0: e.paid_date = paid_date
+        e.paid_amount = money(Decimal(e.principal_paid or 0)+Decimal(e.interest_paid or 0))
+        contractual_paid = (money(e.principal_paid) >= money(e.principal_amount)
+                              and money(e.interest_paid) >= money(e.interest_amount))
+        e.status = "PAID" if contractual_paid else ("PARTIAL" if e.paid_amount > 0 else "PENDING")
+        if pay or any(a[0] is e for a in allocations):
+            e.last_payment_date = paid_date
+        # Never replace a historical settlement date with a later loan receipt.
+        if contractual_paid and e.paid_date is None:
+            e.paid_date = paid_date
     if remaining > 0: unapplied = remaining
     loan._pending_allocations = allocations + ([(None, "UNAPPLIED", unapplied)] if unapplied else [])
     return money(principal), money(interest), money(penalty), money(unapplied)
