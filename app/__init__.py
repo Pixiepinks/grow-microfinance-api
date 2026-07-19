@@ -155,6 +155,36 @@ def create_app():
         click.echo({"loans": [{**r, **{k: str(v) for k,v in r.items() if hasattr(v, "as_tuple")}} for r in results], "summary": summary})
         if preview_mode: db.session.rollback()
 
+    @app.cli.command("reconcile-loan-paid-totals")
+    @click.option("--preview", "preview_mode", is_flag=True, default=False, help="Report proposed cash-paid cache corrections.")
+    @click.option("--post", "post_mode", is_flag=True, default=False, help="Update only the loan cash-paid summary cache.")
+    def reconcile_loan_paid_totals(preview_mode, post_mode):
+        """Reconcile loan summary caches from valid posted payment receipts.
+
+        This deliberately never touches receipts, ledger allocations, or journals.
+        """
+        from .models import Loan
+        from .loan_totals import loan_totals, money
+        if preview_mode == post_mode:
+            raise click.ClickException("Specify exactly one of --preview or --post")
+        rows = []
+        for loan in Loan.query.order_by(Loan.id).all():
+            totals = loan_totals(loan)
+            current = money(loan.cash_paid_cache)
+            cash_paid = totals["cash_paid"]
+            difference = money(cash_paid - current)
+            row = {"loan_id": loan.id, "loan_number": loan.loan_number,
+                   "current_total_paid": str(current), "recalculated_cash_paid": str(cash_paid),
+                   "waiver_total": str(totals["settlement_adjustments"]), "difference": str(difference),
+                   "proposed_correction": "UPDATE_CASH_PAID_CACHE" if difference else "NO_CHANGE"}
+            rows.append(row)
+            if post_mode and difference:
+                loan.cash_paid_cache = cash_paid
+        if post_mode:
+            db.session.commit()
+        click.echo({"mode": "post" if post_mode else "preview", "loans": rows,
+                    "changed": sum(1 for row in rows if row["proposed_correction"] != "NO_CHANGE")})
+
     @app.cli.command("accrue-investor-interest")
     @click.option("--as-of-date", default=None, help="YYYY-MM-DD cutoff date.")
     @click.option("--agreement-id", type=int, default=None)

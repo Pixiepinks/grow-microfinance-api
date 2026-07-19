@@ -222,11 +222,14 @@ def generate_loan_ledger(loan: Loan):
 
 
 def ledger_totals(loan: Loan) -> dict:
+    from .loan_totals import loan_totals
     entries = list(loan.ledger_entries)
     total_principal = money(sum((Decimal(e.principal_amount) for e in entries), Decimal("0.00")))
     total_interest = money(sum((Decimal(e.interest_amount) for e in entries), Decimal("0.00")))
     total_delay_interest = money(sum((Decimal(e.delay_interest or 0) for e in entries), Decimal("0.00")))
     total_payable = money(total_principal + total_interest + total_delay_interest)
-    total_paid = money(sum((Decimal(e.paid_amount or 0) for e in entries), Decimal("0.00")))
-    outstanding = max(Decimal("0.00"), money(total_payable - total_paid))
-    return {"currency": CURRENCY_CODE,"total_principal": float(total_principal),"total_principal_formatted": format_currency(total_principal),"total_interest": float(total_interest),"total_interest_formatted": format_currency(total_interest),"total_payable": float(total_payable),"total_payable_formatted": format_currency(total_payable),"total_paid": float(total_paid),"total_paid_formatted": format_currency(total_paid),"outstanding": float(outstanding),"outstanding_formatted": format_currency(outstanding),"total_delay_interest": float(total_delay_interest),"total_delay_interest_formatted": format_currency(total_delay_interest)}
+    totals = loan_totals(loan)
+    # Ledger satisfaction can include waivers; the summary's paid value cannot.
+    total_paid = totals["cash_paid"]
+    outstanding = totals["outstanding_amount"]
+    return {"currency": CURRENCY_CODE,"total_principal": float(total_principal),"total_principal_formatted": format_currency(total_principal),"total_interest": float(total_interest),"total_interest_formatted": format_currency(total_interest),"total_payable": float(total_payable),"total_payable_formatted": format_currency(total_payable),"total_paid": float(total_paid),"total_paid_formatted": format_currency(total_paid),"cash_paid": float(total_paid),"settlement_adjustments": float(totals["settlement_adjustments"]),"gross_satisfied_amount": float(totals["gross_satisfied_amount"]),"outstanding": float(outstanding),"outstanding_formatted": format_currency(outstanding),"total_delay_interest": float(total_delay_interest),"total_delay_interest_formatted": format_currency(total_delay_interest)}

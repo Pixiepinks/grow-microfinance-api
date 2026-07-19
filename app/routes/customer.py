@@ -4,6 +4,7 @@ from flask_jwt_extended import get_jwt_identity
 
 from ..currency import CURRENCY_CODE, format_currency
 from ..models import Customer, Loan
+from ..loan_totals import loan_totals
 from .utils import role_required
 
 customer_bp = Blueprint("customer", __name__, url_prefix="/customer")
@@ -43,6 +44,7 @@ def my_loans():
     total_outstanding = Decimal("0")
     total_arrears = Decimal("0")
     for loan in loans:
+        totals = loan_totals(loan)
         arrears = loan.arrears()
         total_outstanding += loan.outstanding
         total_arrears += arrears
@@ -57,6 +59,9 @@ def my_loans():
                 "total_payable_formatted": format_currency(loan.total_payable),
                 "total_paid": float(loan.total_paid),
                 "total_paid_formatted": format_currency(loan.total_paid),
+                "cash_paid": float(totals["cash_paid"]),
+                "settlement_adjustments": float(totals["settlement_adjustments"]),
+                "gross_satisfied_amount": float(totals["gross_satisfied_amount"]),
                 "outstanding": float(loan.outstanding),
                 "outstanding_formatted": format_currency(loan.outstanding),
                 "expected_to_date": float(loan.expected_to_date()),
@@ -111,6 +116,7 @@ def loan_payments(loan_id):
         "total_payable_formatted": format_currency(loan.total_payable),
         "total_paid": float(loan.total_paid),
         "total_paid_formatted": format_currency(loan.total_paid),
+        **{key: float(value) for key, value in loan_totals(loan).items()},
         "outstanding": float(loan.outstanding),
         "outstanding_formatted": format_currency(loan.outstanding),
         "arrears": float(loan.arrears()),
