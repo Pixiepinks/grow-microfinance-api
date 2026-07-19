@@ -40,7 +40,7 @@ from .utils import role_required
 
 admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
 logger = logging.getLogger(__name__)
-from ..settlement_reconciliation import preview as settlement_preview, post as post_settlement_reconciliation, reconcile as reconcile_loan
+from ..settlement_reconciliation import preview as settlement_preview, post as post_settlement_reconciliation
 
 ACTIVE_LOAN_STATUSES = {"ACTIVE", "DISBURSED"}
 POSTED_PAYMENT_STATUSES = {"POSTED"}
@@ -516,51 +516,70 @@ def get_loan(loan_id):
 
 
 @admin_bp.route("/loans/<int:loan_id>/settlement-reconciliation/preview", methods=["POST"], strict_slashes=False)
+@admin_bp.route("/loans/<int:loan_id>/reconciliation/preview", methods=["POST"], strict_slashes=False)
 @role_required(["admin"])
 def settlement_reconciliation_preview(loan_id):
-    loan = Loan.query.get_or_404(loan_id)
-    result = settlement_preview(loan)
+    payload = request.get_json(silent=True) or {}
+    as_of_date = None
+    if payload.get("as_of_date"):
+        try:
+            as_of_date = date.fromisoformat(payload["as_of_date"])
+        except (TypeError, ValueError):
+            return jsonify({"error": "invalid_as_of_date", "message": "as_of_date must be YYYY-MM-DD."}), 422
+    loan = Loan.query.get(loan_id)
+    if loan is None:
+        return jsonify({"error": "loan_not_found", "message": "The selected loan was not found."}), 404
+    result = settlement_preview(loan, as_of_date=as_of_date)
     return jsonify({k: (float(v) if isinstance(v, Decimal) else (v.isoformat() if hasattr(v, "isoformat") else v)) for k, v in result.items()})
 
 
 @admin_bp.route("/loans/<int:loan_id>/settlement-reconciliation", methods=["POST"], strict_slashes=False)
+@admin_bp.route("/loans/<int:loan_id>/reconciliation", methods=["POST"], strict_slashes=False)
+@admin_bp.route("/loans/<int:loan_id>/reconcile", methods=["POST"], strict_slashes=False)
+@admin_bp.route("/loans/<int:loan_id>/reconcile-loan", methods=["POST"], strict_slashes=False)
 @role_required(["admin"])
 def settlement_reconciliation_post(loan_id):
     if not (request.get_json(silent=True) or {}).get("confirm"):
-        return jsonify({"error": "confirmation_required", "message": "Set confirm to true to reconcile this loan."}), 400
-    loan = Loan.query.get_or_404(loan_id)
+        return jsonify({"error": "confirmation_required", "message": "Confirm the settlement reconciliation before posting."}), 422
+    loan = Loan.query.get(loan_id)
+    if loan is None:
+        return jsonify({"error": "loan_not_found", "message": "The selected loan was not found."}), 404
+    previous_status = loan.status
     try:
         result = post_settlement_reconciliation(loan, get_jwt_identity())
+        if not result.get("processed"):
+            db.session.rollback()
+            return jsonify(_canonical_reconciliation_result(loan, previous_status, result))
         db.session.commit()
     except Exception as exc:
         db.session.rollback()
         return jsonify({"error": "settlement_reconciliation_failed", "message": str(exc)}), 422
-    return jsonify({k: (float(v) if isinstance(v, Decimal) else (v.isoformat() if hasattr(v, "isoformat") else v)) for k, v in result.items()})
+    return jsonify(_canonical_reconciliation_result(loan, previous_status, result))
 
 
-def _json_reconciliation_result(result):
-    return {key: (float(value) if isinstance(value, Decimal) else value) for key, value in result.items()}
-
-
-@admin_bp.route("/loans/<int:loan_id>/reconcile", methods=["POST"], strict_slashes=False)
-@admin_bp.route("/loans/<int:loan_id>/reconcile-loan", methods=["POST"], strict_slashes=False)
-@role_required(["admin"])
-def reconcile_legacy_loan(loan_id):
-    """JSON endpoint used by the Reconcile Loan action (no HTML 404/500 responses)."""
-    loan = Loan.query.get(loan_id)
-    if loan is None:
-        return jsonify({"success": False, "error": "loan_not_found", "message": "Loan not found."}), 404
-    try:
-        result = reconcile_loan(loan, get_jwt_identity())
-        db.session.commit()
-        return jsonify(_json_reconciliation_result(result))
-    except (ValueError, AccountingError) as exc:
-        db.session.rollback()
-        return jsonify({"success": False, "error": "loan_reconciliation_failed", "message": str(exc)}), 422
-    except Exception:
-        db.session.rollback()
-        logger.exception("Loan reconciliation failed for loan %s", loan_id)
-        return jsonify({"success": False, "error": "loan_reconciliation_failed", "message": "Unable to reconcile loan."}), 500
+def _canonical_reconciliation_result(loan, previous_status, result):
+    """Keep every reconciliation URL on the same stable JSON contract."""
+    number = lambda value: float(value) if isinstance(value, Decimal) else value
+    settled = result.get("settled_date") if result.get("processed") else None
+    return {
+        "success": bool(result.get("processed")),
+        "loan_id": loan.id,
+        "loan_number": loan.loan_number,
+        "previous_status": previous_status,
+        "new_status": loan.status if result.get("processed") else previous_status,
+        "settled_date": settled.isoformat() if hasattr(settled, "isoformat") else settled,
+        "total_payable": number(result["total_payable"]),
+        "total_paid": number(result["total_paid"]),
+        "outstanding": number(result["outstanding"]),
+        "overpayment": number(result["overpayment"]),
+        "customer_credit": number(result["overpayment"]) if result["overpayment"] > 0 else None,
+        "warnings": result["warnings"],
+        "message": (
+            "Loan reconciled and settled successfully."
+            if result.get("processed")
+            else "Loan was not settled; an outstanding balance or reconciliation issue remains."
+        ),
+    }
 
 
 def _preview_error_response(exc):

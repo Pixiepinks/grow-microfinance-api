@@ -34,11 +34,22 @@ def _balances(loan):
     return unpaid, warnings
 
 
-def preview(loan):
+def preview(loan, as_of_date=None):
     """Return a non-mutating proof/result.  A warning means it must not be posted."""
     warnings = []
+    # Early disbursements did not always retain display-only term metadata.  The
+    # repayment ledger and monetary totals remain the proof used below, so this
+    # must not prevent an otherwise provable historical settlement.
+    if not loan.term_type or loan.term_value is None:
+        warnings.append("Loan term metadata is missing.")
     current = (loan.status or "").strip().upper()
     payments = _valid_payments(loan)
+    if as_of_date is not None:
+        payments = [
+            payment for payment in payments
+            if (payment.collection_date or payment.payment_date) and
+            (payment.collection_date or payment.payment_date) <= as_of_date
+        ]
     paid = money(sum((money(p.amount_collected) for p in payments), Decimal()))
     due = money(loan.total_payable)
     unpaid, ledger_warnings = _balances(loan)
@@ -79,7 +90,10 @@ def preview(loan):
             "settled_date": (final_payment.collection_date or final_payment.payment_date) if final_payment else None,
             "proposed_status": "SETTLED" if eligible else loan.status,
             "customer_credit_exists": bool(credit), "accounting_adjustment_required": adjustment_required,
-            "warnings": warnings, "can_post": eligible and not warnings and not already}
+            "warnings": warnings,
+            "can_post": eligible and not already and not any(
+                warning != "Loan term metadata is missing." for warning in warnings
+            )}
 
 
 def candidates():
@@ -113,7 +127,18 @@ def post(loan, user_id=None):
     if "already reconciled" in result["warnings"]:
         log_audit("LEGACY_LOAN_SETTLEMENT_SKIPPED", "Loan", loan.id, user_id, result)
         return {**result, "processed": False}
-    blocking = [w for w in result["warnings"] if not w.startswith("accounting adjustment will")]
+    # Historical payments may predate ledger allocation.  Apply them only after
+    # proving that the loan is paid in full, then re-run the canonical proof.
+    # This changes no cash/accounting entries; overpayments still use the
+    # accounting adjustment below.
+    if result["total_paid"] >= result["total_payable"] - TOLERANCE and result["final_payment_id"]:
+        _apply_historical_payments_to_ledger(loan, result["total_paid"], result["settled_date"])
+        result = preview(loan)
+    blocking = [
+        warning for warning in result["warnings"]
+        if not warning.startswith("accounting adjustment will")
+        and warning != "Loan term metadata is missing."
+    ]
     if blocking:
         log_audit("LEGACY_LOAN_SETTLEMENT_SKIPPED", "Loan", loan.id, user_id, result)
         return {**result, "processed": False}
