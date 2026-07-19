@@ -40,6 +40,7 @@ from .utils import role_required
 
 admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
 logger = logging.getLogger(__name__)
+from ..settlement_reconciliation import preview as settlement_preview, post as post_settlement_reconciliation
 
 ACTIVE_LOAN_STATUSES = {"ACTIVE", "DISBURSED"}
 POSTED_PAYMENT_STATUSES = {"POSTED"}
@@ -508,8 +509,33 @@ def _loan_customer_to_dict(customer: Customer | None) -> dict | None:
 @role_required(["admin"])
 def get_loan(loan_id):
     loan = Loan.query.options(joinedload(Loan.customer)).get_or_404(loan_id)
-    return jsonify(_loan_to_dict(loan))
+    payload = _loan_to_dict(loan)
+    reconciliation = settlement_preview(loan)
+    payload["settlement_reconciliation_required"] = (loan.status or "").upper() != "SETTLED" and reconciliation["outstanding"] <= 0.01 and reconciliation["can_post"]
+    return jsonify(payload)
 
+
+@admin_bp.route("/loans/<int:loan_id>/settlement-reconciliation/preview", methods=["POST"], strict_slashes=False)
+@role_required(["admin"])
+def settlement_reconciliation_preview(loan_id):
+    loan = Loan.query.get_or_404(loan_id)
+    result = settlement_preview(loan)
+    return jsonify({k: (float(v) if isinstance(v, Decimal) else (v.isoformat() if hasattr(v, "isoformat") else v)) for k, v in result.items()})
+
+
+@admin_bp.route("/loans/<int:loan_id>/settlement-reconciliation", methods=["POST"], strict_slashes=False)
+@role_required(["admin"])
+def settlement_reconciliation_post(loan_id):
+    if not (request.get_json(silent=True) or {}).get("confirm"):
+        return jsonify({"error": "confirmation_required", "message": "Set confirm to true to reconcile this loan."}), 400
+    loan = Loan.query.get_or_404(loan_id)
+    try:
+        result = post_settlement_reconciliation(loan, get_jwt_identity())
+        db.session.commit()
+    except Exception as exc:
+        db.session.rollback()
+        return jsonify({"error": "settlement_reconciliation_failed", "message": str(exc)}), 422
+    return jsonify({k: (float(v) if isinstance(v, Decimal) else (v.isoformat() if hasattr(v, "isoformat") else v)) for k, v in result.items()})
 
 
 def _preview_error_response(exc):

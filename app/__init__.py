@@ -124,6 +124,37 @@ def create_app():
 
 
 
+    @app.cli.command("reconcile-loan-settlements")
+    @click.option("--preview", "preview_mode", is_flag=True, default=False, help="Report only; makes no database changes.")
+    @click.option("--post", "post_mode", is_flag=True, default=False, help="Apply eligible reconciliations.")
+    @click.option("--confirm", is_flag=True, default=False, help="Required with --post.")
+    @click.option("--loan-id", type=int, default=None)
+    def reconcile_loan_settlements(preview_mode, post_mode, confirm, loan_id):
+        """Safely backfill legacy fully-paid loans, one transaction at a time."""
+        from .models import Loan
+        from .settlement_reconciliation import candidates, preview, post
+        if post_mode == preview_mode:
+            raise click.ClickException("Specify exactly one of --preview or --post")
+        if post_mode and not confirm:
+            raise click.ClickException("--post requires --confirm")
+        results = [preview(Loan.query.get(loan_id))] if loan_id and Loan.query.get(loan_id) else candidates()
+        if post_mode:
+            results = []
+            loans = [Loan.query.get(loan_id)] if loan_id else Loan.query.all()
+            for loan in filter(None, loans):
+                if (loan.status or "").strip().upper() not in {"ACTIVE", "OVERDUE", "DISBURSED", "SETTLED"}: continue
+                try:
+                    with db.session.begin_nested(): results.append(post(loan))
+                    db.session.commit()
+                except Exception as exc:
+                    db.session.rollback(); results.append({"loan_id": loan.id, "processed": False, "warnings": [str(exc)]})
+        summary = {"total_candidates": len(results), "exact_paid_loans": sum(1 for r in results if r.get("overpayment", 0) <= 0.01),
+                   "overpaid_loans": sum(1 for r in results if r.get("overpayment", 0) > 0.01),
+                   "skipped_loans": sum(1 for r in results if not r.get("processed", r.get("can_post", False))),
+                   "total_proposed_customer_credits": str(sum((r.get("overpayment", 0) for r in results), 0))}
+        click.echo({"loans": [{**r, **{k: str(v) for k,v in r.items() if hasattr(v, "as_tuple")}} for r in results], "summary": summary})
+        if preview_mode: db.session.rollback()
+
     @app.cli.command("accrue-investor-interest")
     @click.option("--as-of-date", default=None, help="YYYY-MM-DD cutoff date.")
     @click.option("--agreement-id", type=int, default=None)
