@@ -404,6 +404,9 @@ class LoanLedger(db.Model):
     closing_balance = db.Column(Numeric(12, 2), nullable=False)
     paid_amount = db.Column(Numeric(12, 2), nullable=False, default=Decimal("0.00"))
     paid_date = db.Column(db.Date)
+    # This is intentionally distinct from paid_date: a partial receipt updates
+    # the former, while the latter is the date the contractual row was cleared.
+    last_payment_date = db.Column(db.Date)
     delay_days = db.Column(db.Integer, nullable=False, default=0)
     delay_interest = db.Column(Numeric(12, 2), nullable=False, default=Decimal("0.00"))
     interest_accrued = db.Column(db.Boolean, nullable=False, default=False)

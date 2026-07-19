@@ -697,6 +697,17 @@ def get_loan(loan_id):
 @role_required(["admin"])
 def settlement_reconciliation_preview(loan_id):
     payload = request.get_json(silent=True) or {}
+    if "delay_interest_waiver_amount" in payload:
+        try:
+            waiver_amount = Decimal(str(payload["delay_interest_waiver_amount"])).quantize(Decimal("0.01"))
+        except Exception:
+            return jsonify({"error": "invalid_delay_interest_waiver", "message": "delay_interest_waiver_amount must be a currency amount."}), 422
+        if waiver_amount < 0:
+            return jsonify({"error": "invalid_delay_interest_waiver", "message": "delay_interest_waiver_amount cannot be negative."}), 422
+        if waiver_amount > 0 and not str(payload.get("reason") or "").strip():
+            return jsonify({"error": "waiver_reason_required", "message": "reason is required for a delay interest waiver."}), 422
+        if waiver_amount > 0:
+            payload["waive_delay_interest"] = True
     as_of_date = None
     if payload.get("as_of_date"):
         try:
@@ -1006,6 +1017,7 @@ def _ledger_to_dict(entry: LoanLedger) -> dict:
         "paid_amount": float(entry.paid_amount or 0),
         "paid_amount_formatted": format_currency(entry.paid_amount or 0),
         "paid_date": entry.paid_date.isoformat() if entry.paid_date else None,
+        "last_payment_date": entry.last_payment_date.isoformat() if entry.last_payment_date else None,
         "delay_days": entry.delay_days or 0,
         "delay_interest": float(entry.delay_interest or 0),
         "delay_interest_formatted": format_currency(entry.delay_interest or 0),
@@ -1015,11 +1027,19 @@ def _ledger_to_dict(entry: LoanLedger) -> dict:
         "interest_accrual_journal_id": entry.interest_accrual_journal_id,
         "principal_paid": float(entry.principal_paid or 0),
         "interest_paid": float(entry.interest_paid or 0),
+        "contractual_interest_due": float(entry.interest_amount or 0),
+        "contractual_interest_outstanding": float(max(Decimal("0"), Decimal(entry.interest_amount or 0) - Decimal(entry.interest_paid or 0))),
+        "principal_due": float(entry.principal_amount or 0),
+        "principal_outstanding": float(max(Decimal("0"), Decimal(entry.principal_amount or 0) - Decimal(entry.principal_paid or 0))),
         "delay_interest_paid": float(entry.delay_interest_paid or 0),
         "waived_interest_amount": float(entry.waived_interest_amount or 0),
         "waived_delay_interest_amount": float(entry.waived_delay_interest_amount or 0),
         "waived_penalty_amount": float(entry.waived_penalty_amount or 0),
         "delay_interest_accrued": float(entry.delay_interest_accrued or 0),
+        "delay_interest_waived": float(entry.delay_interest_waived or 0),
+        "delay_interest_outstanding": float(max(Decimal("0"), Decimal(entry.delay_interest_accrued or 0) - Decimal(entry.delay_interest_paid or 0) - Decimal(entry.delay_interest_waived or 0))),
+        "contractual_status": "PAID" if Decimal(entry.principal_paid or 0) >= Decimal(entry.principal_amount or 0) and Decimal(entry.interest_paid or 0) >= Decimal(entry.interest_amount or 0) else entry.status,
+        "delay_interest_status": "OUTSTANDING" if Decimal(entry.delay_interest_accrued or 0) > Decimal(entry.delay_interest_paid or 0) + Decimal(entry.delay_interest_waived or 0) else "SETTLED",
         "unapplied_amount": float(entry.unapplied_amount or 0),
         "due_status": "OVERDUE" if entry.due_date and entry.due_date < date.today() and entry.status != "PAID" else entry.status,
     }
