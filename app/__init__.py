@@ -368,6 +368,20 @@ def create_app():
             app.logger.error("Loan interest accrual completed with errors: %s", summary)
         db.session.commit()
         click.echo({**summary, "total_interest_accrued": str(summary["total_interest_accrued"])})
+
+    @app.cli.command("accrue-delay-interest")
+    @click.option("--through-date", required=True, type=click.DateTime(formats=["%Y-%m-%d"]))
+    @click.option("--preview", "preview_mode", is_flag=True)
+    @click.option("--post", "post_mode", is_flag=True)
+    def accrue_delay_interest_cli(through_date, preview_mode, post_mode):
+        """Accrue overdue delay interest; suitable for a scheduled Railway job."""
+        if preview_mode == post_mode:
+            raise click.ClickException("Specify exactly one of --preview or --post")
+        from .accounting import accrue_delay_interest
+        summary = accrue_delay_interest(through_date.date(), preview=preview_mode)
+        if post_mode: db.session.commit()
+        else: db.session.rollback()
+        click.echo({**summary, "total_delay_interest_accrued": str(summary["total_delay_interest_accrued"])})
         if summary.get("errors"):
             raise click.ClickException("Some accruals failed")
 

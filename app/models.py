@@ -412,6 +412,9 @@ class LoanLedger(db.Model):
     principal_paid = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
     interest_paid = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
     delay_interest_paid = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    # Keep the three states of a penalty separate; `delay_interest` is retained
+    # only for backwards-compatible display of the calculated amount.
+    delay_interest_waived = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
     unapplied_amount = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
     status = db.Column(db.String(20), nullable=False, default="PENDING")
     waived_interest_amount = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
@@ -631,7 +634,7 @@ class Payment(db.Model):
     collection_account = relationship("AccountingAccount", foreign_keys=[collection_account_id])
 
 ACCOUNT_TYPES = ("ASSET", "LIABILITY", "EQUITY", "INCOME", "EXPENSE")
-ACCOUNT_SUBTYPES = ("CASH", "BANK", "COLLECTION_CLEARING", "COLLECTION_CLEARING_CONTROL", "LOAN_RECEIVABLE", "INTEREST_RECEIVABLE", "PENALTY_RECEIVABLE", "OTHER_CURRENT_ASSET", "FIXED_ASSET", "ACCOUNTS_PAYABLE", "BORROWING", "CUSTOMER_ADVANCE", "CAPITAL", "RETAINED_EARNINGS", "INTEREST_INCOME", "PENALTY_INCOME", "FEE_INCOME", "OPERATING_EXPENSE", "WRITE_OFF_EXPENSE", "SUSPENSE", "OTHER")
+ACCOUNT_SUBTYPES = ("CASH", "BANK", "COLLECTION_CLEARING", "COLLECTION_CLEARING_CONTROL", "LOAN_RECEIVABLE", "INTEREST_RECEIVABLE", "PENALTY_RECEIVABLE", "OTHER_CURRENT_ASSET", "FIXED_ASSET", "ACCOUNTS_PAYABLE", "BORROWING", "CUSTOMER_ADVANCE", "CAPITAL", "RETAINED_EARNINGS", "INTEREST_INCOME", "PENALTY_INCOME", "FEE_INCOME", "OPERATING_EXPENSE", "WRITE_OFF_EXPENSE", "DELAY_INTEREST_WAIVER", "SUSPENSE", "OTHER")
 NORMAL_BALANCES = ("DEBIT", "CREDIT")
 JOURNAL_STATUSES = ("DRAFT", "POSTED", "REVERSED")
 
@@ -641,7 +644,7 @@ class AccountingAccount(db.Model):
     __table_args__ = (
         db.CheckConstraint("account_type in ('ASSET','LIABILITY','EQUITY','INCOME','EXPENSE')", name="ck_accounting_accounts_type"),
         db.CheckConstraint("normal_balance in ('DEBIT','CREDIT')", name="ck_accounting_accounts_normal_balance"),
-        db.CheckConstraint("account_subtype in ('CASH','BANK','COLLECTION_CLEARING','COLLECTION_CLEARING_CONTROL','LOAN_RECEIVABLE','INTEREST_RECEIVABLE','PENALTY_RECEIVABLE','OTHER_CURRENT_ASSET','FIXED_ASSET','ACCOUNTS_PAYABLE','BORROWING','CUSTOMER_ADVANCE','CAPITAL','RETAINED_EARNINGS','INTEREST_INCOME','PENALTY_INCOME','FEE_INCOME','OPERATING_EXPENSE','WRITE_OFF_EXPENSE','SUSPENSE','OTHER')", name="ck_accounting_accounts_subtype"),
+        db.CheckConstraint("account_subtype in ('CASH','BANK','COLLECTION_CLEARING','COLLECTION_CLEARING_CONTROL','LOAN_RECEIVABLE','INTEREST_RECEIVABLE','PENALTY_RECEIVABLE','OTHER_CURRENT_ASSET','FIXED_ASSET','ACCOUNTS_PAYABLE','BORROWING','CUSTOMER_ADVANCE','CAPITAL','RETAINED_EARNINGS','INTEREST_INCOME','PENALTY_INCOME','FEE_INCOME','OPERATING_EXPENSE','WRITE_OFF_EXPENSE','DELAY_INTEREST_WAIVER','SUSPENSE','OTHER')", name="ck_accounting_accounts_subtype"),
     )
 
     id = db.Column(db.Integer, primary_key=True)
@@ -759,6 +762,8 @@ class CustomerCreditBalance(db.Model):
     reference = db.Column(db.String(120))
     remarks = db.Column(db.Text)
     journal_entry_id = db.Column(db.Integer, db.ForeignKey("accounting_journal_entries.id"))
+    applied_to_loan_id = db.Column(db.Integer, db.ForeignKey("loans.id"))
+    correcting_journal_id = db.Column(db.Integer, db.ForeignKey("accounting_journal_entries.id"))
     created_by_id = db.Column(db.Integer, db.ForeignKey("users.id"))
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
@@ -766,6 +771,29 @@ class CustomerCreditBalance(db.Model):
     customer = relationship("Customer")
     loan = relationship("Loan", foreign_keys=[loan_id])
     payment = relationship("Payment", foreign_keys=[payment_id])
+
+
+class LoanChargeWaiver(db.Model):
+    """An approved, posted charge waiver; never delete this audit record."""
+    __tablename__ = "loan_charge_waivers"
+    id = db.Column(db.Integer, primary_key=True)
+    waiver_number = db.Column(db.String(40), nullable=False, unique=True, index=True)
+    loan_id = db.Column(db.Integer, db.ForeignKey("loans.id"), nullable=False, index=True)
+    customer_id = db.Column(db.Integer, db.ForeignKey("customers.id"), nullable=False, index=True)
+    ledger_entry_id = db.Column(db.Integer, db.ForeignKey("loan_ledger.id"))
+    waiver_type = db.Column(db.String(30), nullable=False)
+    waiver_date = db.Column(db.Date, nullable=False)
+    amount = db.Column(Numeric(18, 2), nullable=False)
+    receivable_account_id = db.Column(db.Integer, db.ForeignKey("accounting_accounts.id"), nullable=False)
+    expense_account_id = db.Column(db.Integer, db.ForeignKey("accounting_accounts.id"), nullable=False)
+    journal_entry_id = db.Column(db.Integer, db.ForeignKey("accounting_journal_entries.id"))
+    approval_reference = db.Column(db.String(120)); reason = db.Column(db.Text)
+    status = db.Column(db.String(20), nullable=False, default="DRAFT")
+    approved_by = db.Column(db.Integer, db.ForeignKey("users.id")); approved_at = db.Column(db.DateTime)
+    reversed_by = db.Column(db.Integer, db.ForeignKey("users.id")); reversed_at = db.Column(db.DateTime)
+    reversal_journal_id = db.Column(db.Integer, db.ForeignKey("accounting_journal_entries.id"))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
 
 class AccountingPeriod(db.Model):

@@ -3,7 +3,7 @@ from datetime import datetime
 from decimal import Decimal
 import logging
 from .extensions import db
-from .models import Loan, Payment, CustomerCreditBalance, AccountingJournalEntry, AccountingJournalLine
+from .models import Loan, Payment, CustomerCreditBalance, AccountingJournalEntry, AccountingJournalLine, LoanChargeWaiver
 from .accounting import (money, customer_advance_account, account_subtype, create_draft_journal,
                          post_journal, require_open_accounting_period, log_audit, AccountingError)
 from .loan_repair import repair_legacy_loan_configuration
@@ -71,7 +71,7 @@ def _balances(loan):
         "principal": sum((money(e.principal_amount) - money(e.principal_paid) for e in entries), Decimal()),
         "interest": sum((money(e.interest_amount) - money(e.interest_paid) for e in entries), Decimal()),
         # Delay interest is the ledger's penalty receivable component.
-        "penalty": sum((money(e.delay_interest_accrued) - money(e.delay_interest_paid) for e in entries), Decimal()),
+        "penalty": sum((money(e.delay_interest_accrued) - money(e.delay_interest_paid) - money(e.delay_interest_waived) for e in entries), Decimal()),
     }
     warnings = []
     if any(value < -TOLERANCE for value in components.values()):
@@ -107,19 +107,24 @@ def preview(loan, as_of_date=None):
     total_cash_received = money(sum((money(payment.amount_collected) for payment in payments), Decimal("0.00")))
     # total_payable is the established contractual due.  Do not derive this from
     # clamped display balances or payment allocation fields.
-    legitimate_loan_due = money(loan.total_payable)
+    unpaid, ledger_warnings = _balances(loan)
+    # Delay interest is a legitimate receivable, not an overpayment merely
+    # because it is outside the original contractual total.
+    delay_accrued = money(sum((money(e.delay_interest_accrued) for e in loan.ledger_entries), Decimal()))
+    delay_paid = money(sum((money(e.delay_interest_paid) for e in loan.ledger_entries), Decimal()))
+    delay_waived = money(sum((money(e.delay_interest_waived) for e in loan.ledger_entries), Decimal()))
+    legitimate_loan_due = money(loan.total_payable + delay_accrued - delay_waived)
     total_applied_to_loan = money(min(total_cash_received, legitimate_loan_due))
     unapplied_excess = money(max(total_cash_received - total_applied_to_loan, Decimal("0.00")))
     raw_balance = money(legitimate_loan_due - total_cash_received)
     remaining_balance = money(max(raw_balance, Decimal("0.00")))
     proposed_customer_credit = money(max(-raw_balance, Decimal("0.00")))
-    unpaid, ledger_warnings = _balances(loan)
     warnings.extend(ledger_warnings)
     final_payment = next((payment for payment in reversed(payments)
                           if payment.collection_date or payment.payment_date), None)
     # ACTIVE is deliberately eligible: this endpoint is what transitions a paid
     # loan to SETTLED.  Compare normalized Decimal values, never truthy strings.
-    eligible = current in ELIGIBLE and remaining_balance <= TOLERANCE
+    eligible = current in ELIGIBLE and (remaining_balance <= TOLERANCE or (unpaid or {}).get("principal", Decimal()) <= TOLERANCE and (unpaid or {}).get("interest", Decimal()) <= TOLERANCE)
     if not eligible:
         warnings.append("loan is not an eligible legacy settlement candidate")
     # When historical allocations are incomplete, post() reconstructs them from
@@ -145,6 +150,15 @@ def preview(loan, as_of_date=None):
     return {"loan_id": loan.id, "loan_number": loan.loan_number, "customer_id": loan.customer_id,
             "customer_name": loan.customer.full_name if loan.customer else None, "current_status": loan.status,
             "total_payable": legitimate_loan_due, "total_paid": total_cash_received,
+            "principal": money(loan.principal_amount), "normal_interest": money(loan.total_payable - loan.principal_amount),
+            "cash_received": total_cash_received,
+            "principal_collected": money(sum((money(e.principal_paid) for e in loan.ledger_entries), Decimal())),
+            "normal_interest_collected": money(sum((money(e.interest_paid) for e in loan.ledger_entries), Decimal())),
+            "delay_interest_accrued": delay_accrued, "delay_interest_collected": delay_paid,
+            "delay_interest_outstanding": money(max(Decimal(), delay_accrued-delay_paid-delay_waived)),
+            "proposed_delay_interest_waiver": money(max(Decimal(), delay_accrued-delay_paid-delay_waived)),
+            "delay_interest_waived": delay_waived,
+            "remaining_balance_after_waiver": money(max(Decimal(), total_cash_received - total_cash_received)),
             "total_cash_received": total_cash_received, "total_applied_to_loan": total_applied_to_loan,
             "unapplied_excess": unapplied_excess, "raw_balance": raw_balance,
             "raw_outstanding": raw_balance, "remaining_balance": remaining_balance,
@@ -194,11 +208,27 @@ def _adjustment(loan, result, user_id):
     return post_journal(entry, user_id)
 
 
-def post(loan, user_id=None):
+def post(loan, user_id=None, waive_delay_interest=False, delay_interest_waiver_amount=None, approval_reference=None, reason=None):
     result = preview(loan)
     if "already reconciled" in result["warnings"]:
         log_audit("LEGACY_LOAN_SETTLEMENT_SKIPPED", "Loan", loan.id, user_id, result)
         return {**result, "processed": False}
+    if waive_delay_interest:
+        requested = money(delay_interest_waiver_amount if delay_interest_waiver_amount is not None else result["delay_interest_outstanding"])
+        if requested <= 0 or requested > result["delay_interest_outstanding"] + TOLERANCE:
+            raise AccountingError("delay interest waiver must not exceed unpaid delay interest")
+        settlement_date = result["settled_date"] or datetime.utcnow().date()
+        require_open_accounting_period(settlement_date)
+        receivable = __import__("app.accounting", fromlist=["resolve_system_account"]).resolve_system_account("DELAY_INTEREST_RECEIVABLE")
+        expense = __import__("app.accounting", fromlist=["resolve_system_account"]).resolve_system_account("DELAY_INTEREST_WAIVER_EXPENSE")
+        waiver = LoanChargeWaiver(waiver_number=f"GROW-DIW-{loan.id:08d}-{LoanChargeWaiver.query.count()+1:04d}", loan_id=loan.id, customer_id=loan.customer_id, waiver_type="DELAY_INTEREST", waiver_date=settlement_date, amount=requested, receivable_account_id=receivable.id, expense_account_id=expense.id, approval_reference=approval_reference, reason=reason, status="APPROVED", approved_by=user_id, approved_at=datetime.utcnow())
+        db.session.add(waiver); db.session.flush()
+        journal = create_draft_journal(settlement_date, "Delay interest waiver", [{"account_id": expense.id, "debit": requested, "loan_id": loan.id, "customer_id": loan.customer_id}, {"account_id": receivable.id, "credit": requested, "loan_id": loan.id, "customer_id": loan.customer_id}], "DELAY_INTEREST_WAIVER", waiver.id, "LOANS", user_id, f"DELAY_INTEREST_WAIVER:{waiver.id}")
+        journal.loan_id=loan.id; journal.customer_id=loan.customer_id; post_journal(journal, user_id); waiver.status="POSTED"; waiver.journal_entry_id=journal.id
+        remaining = requested
+        for entry in sorted(loan.ledger_entries, key=lambda x: (x.due_date, x.installment_no)):
+            applied=min(remaining, money(entry.delay_interest_accrued)-money(entry.delay_interest_paid)-money(entry.delay_interest_waived)); entry.delay_interest_waived=money(entry.delay_interest_waived+applied); remaining=money(remaining-applied)
+        result = preview(loan)
     # Historical payments may predate ledger allocation.  Apply them only after
     # proving that the loan is paid in full, then re-run the canonical proof.
     # This changes no cash/accounting entries; overpayments still use the
@@ -208,6 +238,21 @@ def post(loan, user_id=None):
     if not has_remaining_balance and result["final_payment_id"]:
         _apply_historical_payments_to_ledger(loan, result["total_paid"], result["settled_date"])
         result = preview(loan)
+    # Correct a legacy advance only to the extent that it represents an unpaid
+    # accrued penalty.  This never touches cash: it debits the existing advance
+    # liability and credits the already-accrued receivable.
+    for credit in CustomerCreditBalance.query.filter_by(loan_id=loan.id).filter(CustomerCreditBalance.available_amount > 0).all():
+        # The ledger allocation proves how much of historic cash belongs to
+        # delay interest; it may already be paid, so outstanding is not the
+        # right cap for correcting a legacy advance classification.
+        amount = min(money(credit.available_amount), result.get("delay_interest_collected", Decimal("0.00")))
+        if amount <= TOLERANCE: continue
+        settlement_date = result["settled_date"] or datetime.utcnow().date(); require_open_accounting_period(settlement_date)
+        advance = customer_advance_account(); receivable = __import__("app.accounting", fromlist=["resolve_system_account"]).resolve_system_account("DELAY_INTEREST_RECEIVABLE")
+        journal = create_draft_journal(settlement_date, "Customer advance reclassified to delay interest", [{"account_id": advance.id, "debit": amount, "loan_id":loan.id,"customer_id":loan.customer_id},{"account_id": receivable.id,"credit":amount,"loan_id":loan.id,"customer_id":loan.customer_id}], "DELAY_INTEREST_RECLASSIFICATION", credit.id, "LOANS", user_id, f"DELAY_INTEREST_RECLASSIFICATION:{credit.id}")
+        journal.loan_id=loan.id; journal.customer_id=loan.customer_id; post_journal(journal, user_id)
+        credit.available_amount=money(credit.available_amount-amount); credit.applied_amount=money(credit.applied_amount+amount); credit.status="RECLASSIFIED" if not credit.available_amount else "PARTIALLY_APPLIED"; credit.applied_to_loan_id=loan.id; credit.source_type="DELAY_INTEREST_RECLASSIFICATION"; credit.correcting_journal_id=journal.id
+        result=preview(loan)
     if not _is_settlement_eligible(result):
         log_audit("LEGACY_LOAN_SETTLEMENT_SKIPPED", "Loan", loan.id, user_id, result)
         return {**result, "processed": False}
@@ -242,19 +287,18 @@ def post(loan, user_id=None):
     loan.settlement_journal_id = journal.id if journal else loan.settlement_journal_id; loan.settlement_reason = "LEGACY_FULLY_REPAID"
     for entry in loan.ledger_entries:
         due = money(entry.principal_amount) + money(entry.interest_amount) + money(entry.delay_interest_accrued)
-        paid = money(entry.principal_paid) + money(entry.interest_paid) + money(entry.delay_interest_paid)
+        paid = money(entry.principal_paid) + money(entry.interest_paid) + money(entry.delay_interest_paid) + money(entry.delay_interest_waived)
         if paid >= due - TOLERANCE: entry.status = "PAID"; entry.paid_amount = min(paid, due)
     log_audit("LEGACY_LOAN_SETTLEMENT_POSTED", "Loan", loan.id, user_id, {**result, "journal_id": journal.id if journal else None})
     return {**result, "processed": True, "settlement_journal_id": journal.id if journal else None}
 
 
-def _apply_historical_payments_to_ledger(loan, amount, paid_date):
+def _apply_historical_payments_to_ledger(loan, amount, paid_date, delay_only=False):
     """Rebuild ledger balances from historical cash without posting new journals."""
     remaining = money(amount)
     for entry in sorted(loan.ledger_entries, key=lambda item: (item.due_date, item.installment_no)):
-        for due_field, paid_field in (("delay_interest_accrued", "delay_interest_paid"),
-                                      ("interest_amount", "interest_paid"),
-                                      ("principal_amount", "principal_paid")):
+        fields = (("delay_interest_accrued", "delay_interest_paid"),) if delay_only else (("principal_amount", "principal_paid"), ("interest_amount", "interest_paid"), ("delay_interest_accrued", "delay_interest_paid"))
+        for due_field, paid_field in fields:
             if remaining <= 0:
                 break
             due = money(getattr(entry, due_field) or 0)
@@ -265,6 +309,7 @@ def _apply_historical_payments_to_ledger(loan, amount, paid_date):
                 remaining = money(remaining - applied)
         paid = money((entry.principal_paid or 0) + (entry.interest_paid or 0) + (entry.delay_interest_paid or 0))
         due = money((entry.principal_amount or 0) + (entry.interest_amount or 0) + (entry.delay_interest_accrued or 0))
+        paid = money(paid + (entry.delay_interest_waived or 0))
         entry.paid_amount = min(paid, due)
         entry.paid_date = paid_date if entry.paid_amount else entry.paid_date
         entry.status = "PAID" if entry.paid_amount >= due - TOLERANCE else ("PARTIAL" if entry.paid_amount else "PENDING")
