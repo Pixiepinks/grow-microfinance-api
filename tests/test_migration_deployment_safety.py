@@ -59,15 +59,28 @@ def test_alembic_revision_ids_fit_production_version_column():
 
 def test_alembic_chain_has_one_head_and_valid_down_revisions():
     script = _script_directory()
-    revisions = {rev.revision for rev in script.walk_revisions()}
-    assert len(script.get_heads()) == 1
-    for rev in script.walk_revisions():
+    migrations = list(script.walk_revisions())
+    revisions = [rev.revision for rev in migrations]
+    revision_set = set(revisions)
+
+    assert len(revisions) == len(revision_set), "Alembic revision IDs must be unique"
+    assert script.get_heads() == ["0041_cash_paid_loan_totals"]
+
+    children = {revision: [] for revision in revisions}
+    for rev in migrations:
         downs = rev._normalized_down_revisions
         for down_revision in downs:
-            assert down_revision in revisions
+            assert down_revision in revision_set, (
+                f"{rev.revision} references missing parent {down_revision}"
+            )
+            children[down_revision].append(rev.revision)
+
+    assert all(
+        len(child_revisions) <= 1 for child_revisions in children.values()
+    ), "Alembic migration graph must not contain branches"
 
 
-def test_migration_from_0038_to_head_succeeds(tmp_path):
+def test_migration_from_0040_to_head_succeeds(tmp_path):
     database_url = os.getenv("TEST_DATABASE_URL")
     if not database_url:
         import pytest
@@ -80,7 +93,7 @@ def test_migration_from_0038_to_head_succeeds(tmp_path):
         JWT_SECRET_KEY="x" * 32,
     )
     subprocess.run(
-        [sys.executable, "-m", "flask", "--app", "app:create_app", "db", "upgrade", "0038_inv_accr_cal_days"],
+        [sys.executable, "-m", "flask", "--app", "app:create_app", "db", "upgrade", "0040_early_loan_settlement"],
         cwd=ROOT,
         env=env,
         check=True,
@@ -99,7 +112,15 @@ def test_migration_from_0038_to_head_succeeds(tmp_path):
         text=True,
         capture_output=True,
     )
-    assert "0039_loan_settlement" in current.stdout
+    assert "0041_cash_paid_loan_totals" in current.stdout
+
+    # Re-running an upgrade at the head must not make additional schema changes.
+    subprocess.run(
+        [sys.executable, "-m", "flask", "--app", "app:create_app", "db", "upgrade", "head"],
+        cwd=ROOT,
+        env=env,
+        check=True,
+    )
 
 
 def test_loan_model_columns_exist_after_schema_creation(app):
