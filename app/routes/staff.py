@@ -2,6 +2,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from flask import Blueprint, request, jsonify, current_app
 from flask_jwt_extended import get_jwt_identity
+from sqlalchemy import func
 
 from ..currency import CURRENCY_CODE, format_currency
 from ..extensions import db
@@ -168,7 +169,7 @@ def today_collections():
 def active_loans():
     logger = current_app.logger
     try:
-        loans = Loan.query.filter(Loan.status.in_(["Active", "ACTIVE"])).all()
+        loans = Loan.query.filter(func.upper(func.trim(Loan.status)).in_(["ACTIVE", "OVERDUE"])).all()
         results = []
 
         for loan in loans:

@@ -7,13 +7,69 @@ from .models import Loan, Payment, CustomerCreditBalance, AccountingJournalEntry
 from .accounting import (money, customer_advance_account, account_subtype, create_draft_journal,
                          post_journal, require_open_accounting_period, log_audit, AccountingError)
 from .loan_repair import repair_legacy_loan_configuration
-from .loan_status import update_loan_settlement_status
+from .loan_status import (AUTHORITATIVE_STATUS_FIELD, contractual_balances,
+                          serialize_loan_status, update_loan_settlement_status)
 
 TOLERANCE = Decimal("0.01")
 logger = logging.getLogger(__name__)
 ELIGIBLE = {"ACTIVE", "OVERDUE", "DISBURSED"}
 SOURCE_TYPE = "LEGACY_LOAN_RECONCILIATION"
 RECONCILIATION_SOURCE_TYPE = "LOAN_RECONCILIATION"
+
+
+class SettlementPersistenceError(RuntimeError):
+    """Raised when a committed settlement status is not what was calculated."""
+
+
+def _status_debug(phase, loan, balances, **extra):
+    """Log only reconciliation state; never log customer or receipt details."""
+    logger.info(
+        "RECONCILIATION_STATUS_DEBUG phase=%s loan_id=%s status_field=%s "
+        "status=%s principal_outstanding=%s contractual_interest_outstanding=%s %s",
+        phase, loan.id, AUTHORITATIVE_STATUS_FIELD, serialize_loan_status(loan),
+        balances["principal_outstanding"], balances["contractual_interest_outstanding"],
+        " ".join(f"{key}={value}" for key, value in extra.items()),
+    )
+
+
+def finalize_loan_reconciliation(loan_id, reconciliation_date=None, user_id=None,
+                                 waiver_amount=None, reason=None,
+                                 approval_reference=None, waive_delay_interest=False):
+    """Atomically finalize reconciliation and verify the committed Loan.status."""
+    loan = Loan.query.filter_by(id=loan_id).with_for_update().one()
+    before = contractual_balances(loan)
+    _status_debug("before", loan, before, before_status=serialize_loan_status(loan))
+    result = post(
+        loan, user_id, waive_delay_interest=waive_delay_interest,
+        delay_interest_waiver_amount=waiver_amount,
+        approval_reference=approval_reference, reason=reason,
+    )
+    if not result.get("processed"):
+        db.session.rollback()
+        return loan, result
+
+    # Recalculate from canonical contractual components immediately before the
+    # one transaction is committed.  Delay interest is intentionally excluded.
+    loan, balances = update_loan_settlement_status(
+        loan.id, reconciliation_date or result.get("settled_date"), user_id, loan=loan
+    )
+    calculated_status = serialize_loan_status(loan)
+    db.session.flush()
+    _status_debug("before_commit", loan, balances,
+                  assigned_status=calculated_status, settled_at=loan.settled_at,
+                  dirty=loan in db.session.dirty)
+    db.session.commit()
+    db.session.expire_all()
+    persisted_loan = db.session.get(Loan, loan_id)
+    persisted_balances = contractual_balances(persisted_loan)
+    persisted_status = serialize_loan_status(persisted_loan)
+    _status_debug("after_commit", persisted_loan, persisted_balances,
+                  persisted_status=persisted_status, settled_at=persisted_loan.settled_at)
+    if calculated_status == "SETTLED" and persisted_status != "SETTLED":
+        raise SettlementPersistenceError(
+            f"Loan {loan_id} calculated SETTLED but persisted {persisted_status!r}"
+        )
+    return persisted_loan, result
 
 
 def _valid_payments(loan):

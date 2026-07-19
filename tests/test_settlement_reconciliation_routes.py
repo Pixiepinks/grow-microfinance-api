@@ -7,9 +7,9 @@ from app.extensions import db
 from app.models import Customer, Loan, LoanLedger, Payment, User
 
 
-def _headers(app, user):
+def _headers(app, user, role="admin"):
     with app.app_context():
-        token = create_access_token(identity=str(user.id), additional_claims={"role": "admin"})
+        token = create_access_token(identity=str(user.id), additional_claims={"role": role})
     return {"Authorization": f"Bearer {token}"}
 
 
@@ -205,6 +205,14 @@ def test_reconciliation_settles_contractual_loan_with_delay_interest_outstanding
     assert body["delay_interest_outstanding"] == 125.0
     db.session.expire_all()
     assert Loan.query.get(loan.id).status == "SETTLED"
+    # Every API surface serializes the committed authoritative Loan.status,
+    # rather than recomputing ACTIVE from total payable or delay interest.
+    assert client.get(f"/admin/loans/{loan.id}", headers=_headers(app, admin)).get_json()["status"] == "SETTLED"
+    assert next(item for item in client.get("/admin/loans", headers=_headers(app, admin)).get_json()["items"] if item["id"] == loan.id)["status"] == "SETTLED"
+    customer_user = User.query.get(loan.customer.user_id)
+    assert client.get("/customer/loans", headers=_headers(app, customer_user, "customer")).get_json()["loans"][0]["status"] == "SETTLED"
+    active = client.get("/staff/active-loans", headers=_headers(app, admin)).get_json()
+    assert loan.id not in {item["loan_id"] for item in active}
 
 
 def test_reconciliation_rejects_two_cent_remaining_balance(app, client):

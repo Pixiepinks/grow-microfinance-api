@@ -5,6 +5,7 @@ from flask_jwt_extended import get_jwt_identity
 from ..currency import CURRENCY_CODE, format_currency
 from ..models import Customer, Loan
 from ..loan_totals import loan_totals
+from ..loan_status import serialize_loan_status
 from .utils import role_required
 
 customer_bp = Blueprint("customer", __name__, url_prefix="/customer")
@@ -70,12 +71,12 @@ def my_loans():
                 "arrears_formatted": format_currency(arrears),
                 "start_date": loan.start_date.isoformat(),
                 "end_date": loan.end_date.isoformat(),
-                "status": loan.status,
+                "status": serialize_loan_status(loan),
             }
         )
 
     summary = {
-        "total_active_loans": len(loans),
+        "total_active_loans": sum(serialize_loan_status(loan) in {"ACTIVE", "OVERDUE"} for loan in loans),
         "currency": CURRENCY_CODE,
         "total_outstanding": float(total_outstanding),
         "total_outstanding_formatted": format_currency(total_outstanding),

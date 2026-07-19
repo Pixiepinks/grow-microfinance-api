@@ -1,6 +1,8 @@
 import os
 import time
 import click
+from decimal import Decimal
+from datetime import date
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
@@ -479,6 +481,56 @@ def create_app():
         else:
             db.session.rollback()
         click.echo({"mode": "apply" if apply_changes else "preview", "loans": reports})
+
+    @app.cli.command("repair-loan-status")
+    @click.option("--loan-number", required=True)
+    @click.option("--preview", "preview_mode", is_flag=True, default=False)
+    @click.option("--apply", "apply_changes", is_flag=True, default=False)
+    def repair_loan_status_cli(loan_number, preview_mode, apply_changes):
+        """Repair one persisted Loan.status without changing receipts or ledgers."""
+        if preview_mode == apply_changes:
+            raise click.ClickException("Specify exactly one of --preview or --apply")
+        from .models import Loan
+        from .loan_status import (AUTHORITATIVE_STATUS_FIELD, contractual_balances,
+                                  serialize_loan_status, update_loan_settlement_status)
+        loan = Loan.query.filter_by(loan_number=loan_number).first()
+        if loan is None:
+            raise click.ClickException("Loan not found")
+        balances = contractual_balances(loan)
+        proposed = ("SETTLED" if balances["principal_outstanding"] <= Decimal("0.01")
+                    and balances["contractual_interest_outstanding"] <= Decimal("0.01")
+                    else "ACTIVE")
+        report = {"loan_number": loan.loan_number, "authoritative_status_column": AUTHORITATIVE_STATUS_FIELD,
+                  "current_database_status": serialize_loan_status(loan), "proposed_database_status": proposed,
+                  **{key: f"{value:.2f}" for key, value in balances.items()},
+                  "settled_at": loan.settled_at.isoformat() if loan.settled_at else None,
+                  "reason": "contractual principal and interest are within 0.01 tolerance" if proposed == "SETTLED" else "contractual balance remains"}
+        if apply_changes:
+            update_loan_settlement_status(loan.id, loan.settled_date or date.today(), loan.settled_by_id, loan=loan)
+            db.session.commit()
+            db.session.expire_all()
+            report["persisted_database_status"] = serialize_loan_status(db.session.get(Loan, loan.id))
+        else:
+            db.session.rollback()
+        click.echo(report)
+
+    @app.cli.command("inspect-loan-status")
+    @click.option("--loan-number", required=True)
+    def inspect_loan_status_cli(loan_number):
+        """Show raw and serialized authoritative status values for one loan."""
+        from .models import Loan
+        from .loan_status import AUTHORITATIVE_STATUS_FIELD, contractual_balances, serialize_loan_status
+        loan = Loan.query.filter_by(loan_number=loan_number).first()
+        if loan is None:
+            raise click.ClickException("Loan not found")
+        balances = contractual_balances(loan)
+        status = serialize_loan_status(loan)
+        click.echo({"loan_table": Loan.__tablename__, "loan_primary_key": loan.id,
+                    "authoritative_status_field": AUTHORITATIVE_STATUS_FIELD,
+                    "raw_stored_status": loan.status, "serialized_status": status,
+                    "list_endpoint_status": status, "detail_endpoint_status": status,
+                    **{key: f"{value:.2f}" for key, value in balances.items()},
+                    "settled_at": loan.settled_at.isoformat() if loan.settled_at else None})
 
     return app
 
