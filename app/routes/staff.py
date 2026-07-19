@@ -5,7 +5,7 @@ from flask_jwt_extended import get_jwt_identity
 
 from ..currency import CURRENCY_CODE, format_currency
 from ..extensions import db
-from ..models import Loan, LoanApplication, Payment, Customer, AccountingAccount
+from ..models import Loan, LoanApplication, Payment, Customer, AccountingAccount, CustomerCreditBalance
 from ..loan_ledger import generate_loan_ledger
 from ..accounting import AccountingError, allocate_payment, money, post_loan_payment, validate_collection_account
 from .loan_applications import (
@@ -82,7 +82,7 @@ def record_payment():
     if not loan:
         return jsonify({"message": "Loan not found"}), 404
 
-    if str(loan.status).lower() != "active":
+    if str(loan.status or "").strip().upper() not in {"ACTIVE", "OVERDUE"}:
         return (
             jsonify({"message": "Payments can only be recorded for active loans"}),
             400,
@@ -132,12 +132,14 @@ def record_payment():
         db.session.commit()
     except AccountingError as exc:
         db.session.rollback()
+        current_app.logger.exception("Loan payment posting failed")
         status = 422 if payment_method == "CASH_COLLECTOR" else 400
         return jsonify({"error": "Collector setup incomplete", "message": str(exc)}), status
 
     acct = payment.collection_account
     allocation = {"delay_interest": f"{money(payment.penalty_paid):.2f}", "interest": f"{money(payment.interest_paid):.2f}", "principal": f"{money(payment.principal_paid):.2f}", "unapplied": f"{money(payment.other_fee_paid):.2f}"}
-    return jsonify({"message": "Payment recorded", "payment_id": payment.id, "receipt_number": payment.receipt_number, "journal_entry_id": payment.journal_id, "journal_number": journal.journal_no, "collection_account": {"id": acct.id, "code": acct.account_code, "name": acct.account_name} if acct else None, "allocation": allocation, "deposit_status": payment.deposit_status})
+    credit = CustomerCreditBalance.query.filter_by(payment_id=payment.id).first()
+    return jsonify({"message": "Payment recorded", "payment_id": payment.id, "receipt_number": payment.receipt_number, "journal_entry_id": payment.journal_id, "journal_number": journal.journal_no, "loan_status": loan.status, "settled_date": loan.settled_date.isoformat() if loan.settled_date else None, "total_applied_to_loan": float(money(amount - payment.other_fee_paid)), "overpayment": float(money(payment.other_fee_paid)), "outstanding_amount": float(loan.outstanding), "customer_credit": {"id": credit.id, "credit_number": credit.credit_number, "available_amount": float(credit.available_amount), "status": credit.status} if credit else None, "collection_account": {"id": acct.id, "code": acct.account_code, "name": acct.account_name} if acct else None, "allocation": allocation, "deposit_status": payment.deposit_status})
 
 
 @staff_bp.route("/today-collections", methods=["GET"])
