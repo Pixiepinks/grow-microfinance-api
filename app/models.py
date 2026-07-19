@@ -119,7 +119,7 @@ class Customer(db.Model):
     guarantor_mobile = db.Column(db.String(30), nullable=True)
     consent_data_processing = db.Column(db.Boolean, nullable=True, default=False)
     consent_credit_checks = db.Column(db.Boolean, nullable=True, default=False)
-    status = db.Column(db.String(50), default="Active")
+    status = db.Column(db.String(50), default="ACTIVE")
     lead_status = db.Column(db.String(32), nullable=False, default="NEW")
     kyc_status = db.Column(db.String(32), nullable=False, default="PENDING")
     eligibility_status = db.Column(db.String(32), nullable=False, default="UNKNOWN")
@@ -292,7 +292,7 @@ class Loan(db.Model):
     end_date = db.Column(db.Date, nullable=False)
     maturity_date = db.Column(db.Date)
     final_installment_due_date = db.Column(db.Date)
-    status = db.Column(db.String(50), default="Active")
+    status = db.Column(db.String(50), default="ACTIVE")
     created_by_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     interest_accounting_method = db.Column(db.String(32), nullable=False, default="ACCRUAL_BY_INSTALLMENT")
@@ -306,12 +306,19 @@ class Loan(db.Model):
     disbursement_deductions_posted = db.Column(db.Boolean, nullable=False, default=False)
     reversed_at = db.Column(db.DateTime)
     reversal_journal_id = db.Column(db.Integer, db.ForeignKey("accounting_journal_entries.id"))
+    settled_at = db.Column(db.DateTime)
+    settled_date = db.Column(db.Date)
+    settled_by_id = db.Column(db.Integer, db.ForeignKey("users.id"))
+    settlement_payment_id = db.Column(db.Integer, db.ForeignKey("payments.id"))
+    settlement_journal_id = db.Column(db.Integer, db.ForeignKey("accounting_journal_entries.id"))
+    settlement_reason = db.Column(db.String(50))
+    customer_credit_balance = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
 
     customer = relationship("Customer", back_populates="loans")
     created_by = relationship(
         "User", back_populates="created_loans", foreign_keys=[created_by_id]
     )
-    payments = relationship("Payment", back_populates="loan")
+    payments = relationship("Payment", back_populates="loan", foreign_keys="Payment.loan_id")
     ledger_entries = relationship(
         "LoanLedger",
         back_populates="loan",
@@ -322,12 +329,12 @@ class Loan(db.Model):
     @property
     def total_paid(self) -> Decimal:
         return sum(
-            (payment.amount_collected for payment in self.payments), Decimal("0")
+            (payment.amount_collected for payment in self.payments if not payment.reversed_at and payment.status != "REVERSED"), Decimal("0")
         )
 
     @property
     def outstanding(self) -> Decimal:
-        return Decimal(self.total_payable) - self.total_paid
+        return max(Decimal("0.00"), Decimal(self.total_payable or 0) - self.total_paid)
 
     def expected_to_date(self) -> Decimal:
         today = date.today()
@@ -581,7 +588,7 @@ class Payment(db.Model):
     def undeposited_amount(self):
         return Decimal(self.amount_collected or 0) - Decimal(self.deposited_amount or 0)
 
-    loan = relationship("Loan", back_populates="payments")
+    loan = relationship("Loan", back_populates="payments", foreign_keys=[loan_id])
     collected_by = relationship(
         "User", back_populates="collected_payments", foreign_keys=[collected_by_id]
     )
@@ -589,7 +596,7 @@ class Payment(db.Model):
     collection_account = relationship("AccountingAccount", foreign_keys=[collection_account_id])
 
 ACCOUNT_TYPES = ("ASSET", "LIABILITY", "EQUITY", "INCOME", "EXPENSE")
-ACCOUNT_SUBTYPES = ("CASH", "BANK", "COLLECTION_CLEARING", "COLLECTION_CLEARING_CONTROL", "LOAN_RECEIVABLE", "INTEREST_RECEIVABLE", "PENALTY_RECEIVABLE", "OTHER_CURRENT_ASSET", "FIXED_ASSET", "ACCOUNTS_PAYABLE", "BORROWING", "CAPITAL", "RETAINED_EARNINGS", "INTEREST_INCOME", "PENALTY_INCOME", "FEE_INCOME", "OPERATING_EXPENSE", "WRITE_OFF_EXPENSE", "SUSPENSE", "OTHER")
+ACCOUNT_SUBTYPES = ("CASH", "BANK", "COLLECTION_CLEARING", "COLLECTION_CLEARING_CONTROL", "LOAN_RECEIVABLE", "INTEREST_RECEIVABLE", "PENALTY_RECEIVABLE", "OTHER_CURRENT_ASSET", "FIXED_ASSET", "ACCOUNTS_PAYABLE", "BORROWING", "CUSTOMER_ADVANCE", "CAPITAL", "RETAINED_EARNINGS", "INTEREST_INCOME", "PENALTY_INCOME", "FEE_INCOME", "OPERATING_EXPENSE", "WRITE_OFF_EXPENSE", "SUSPENSE", "OTHER")
 NORMAL_BALANCES = ("DEBIT", "CREDIT")
 JOURNAL_STATUSES = ("DRAFT", "POSTED", "REVERSED")
 
@@ -695,6 +702,35 @@ class PaymentAllocation(db.Model):
     payment = relationship("Payment", backref="allocations")
     loan = relationship("Loan")
     ledger = relationship("LoanLedger")
+
+
+class CustomerCreditBalance(db.Model):
+    __tablename__ = "customer_credit_balances"
+    __table_args__ = (db.UniqueConstraint("source_type", "source_id", name="uq_customer_credit_source"),)
+
+    id = db.Column(db.Integer, primary_key=True)
+    customer_id = db.Column(db.Integer, db.ForeignKey("customers.id"), nullable=False, index=True)
+    loan_id = db.Column(db.Integer, db.ForeignKey("loans.id"), index=True)
+    payment_id = db.Column(db.Integer, db.ForeignKey("payments.id"), unique=True, index=True)
+    credit_number = db.Column(db.String(40), nullable=False, unique=True, index=True)
+    credit_date = db.Column(db.Date, nullable=False)
+    source_type = db.Column(db.String(50), nullable=False)
+    source_id = db.Column(db.String(64), nullable=False)
+    original_amount = db.Column(Numeric(18, 2), nullable=False)
+    available_amount = db.Column(Numeric(18, 2), nullable=False)
+    applied_amount = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    refunded_amount = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    status = db.Column(db.String(30), nullable=False, default="AVAILABLE")
+    reference = db.Column(db.String(120))
+    remarks = db.Column(db.Text)
+    journal_entry_id = db.Column(db.Integer, db.ForeignKey("accounting_journal_entries.id"))
+    created_by_id = db.Column(db.Integer, db.ForeignKey("users.id"))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    customer = relationship("Customer")
+    loan = relationship("Loan", foreign_keys=[loan_id])
+    payment = relationship("Payment", foreign_keys=[payment_id])
 
 
 class AccountingPeriod(db.Model):

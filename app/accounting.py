@@ -20,6 +20,7 @@ from .models import (
     LoanLedger,
     Payment,
     PaymentAllocation,
+    CustomerCreditBalance,
     CollectionDepositAllocation,
     AccountingPeriod,
     LoanApplication,
@@ -31,7 +32,7 @@ from .models import (
 CENT = Decimal("0.01")
 ACCOUNT_TYPES = {"ASSET", "LIABILITY", "EQUITY", "INCOME", "EXPENSE"}
 NORMAL_BALANCES = {"DEBIT", "CREDIT"}
-ACCOUNT_SUBTYPES = {"CASH", "BANK", "COLLECTION_CLEARING", "COLLECTION_CLEARING_CONTROL", "LOAN_RECEIVABLE", "INTEREST_RECEIVABLE", "PENALTY_RECEIVABLE", "OTHER_CURRENT_ASSET", "FIXED_ASSET", "ACCOUNTS_PAYABLE", "BORROWING", "CAPITAL", "RETAINED_EARNINGS", "INTEREST_INCOME", "PENALTY_INCOME", "FEE_INCOME", "OPERATING_EXPENSE", "WRITE_OFF_EXPENSE", "SUSPENSE", "OTHER"}
+ACCOUNT_SUBTYPES = {"CASH", "BANK", "COLLECTION_CLEARING", "COLLECTION_CLEARING_CONTROL", "LOAN_RECEIVABLE", "INTEREST_RECEIVABLE", "PENALTY_RECEIVABLE", "OTHER_CURRENT_ASSET", "FIXED_ASSET", "ACCOUNTS_PAYABLE", "BORROWING", "CUSTOMER_ADVANCE", "CAPITAL", "RETAINED_EARNINGS", "INTEREST_INCOME", "PENALTY_INCOME", "FEE_INCOME", "OPERATING_EXPENSE", "WRITE_OFF_EXPENSE", "SUSPENSE", "OTHER"}
 SYSTEM_MAPPINGS = {
     "DEFAULT_DISBURSEMENT_ACCOUNT": "1010",
     "DEFAULT_CASH_COLLECTION_ACCOUNT": "1000",
@@ -1449,6 +1450,70 @@ def allocate_payment(loan, amount, paid_date):
     loan._pending_allocations = allocations + ([(None, "UNAPPLIED", unapplied)] if unapplied else [])
     return money(principal), money(interest), money(penalty), money(unapplied)
 
+
+SETTLEMENT_TOLERANCE = Decimal("0.01")
+
+def customer_advance_account():
+    """Return the configured posting-enabled customer advance liability account."""
+    configured = get_setting("customer_advance_liability_account_id")
+    account = AccountingAccount.query.get(int(configured)) if configured and str(configured).isdigit() else None
+    if not account:
+        account = AccountingAccount.query.filter_by(account_code="2250").first()
+    if not account or account_type(account) != "LIABILITY" or account_subtype(account) != "CUSTOMER_ADVANCE" or not is_active_account(account) or not is_posting_account(account):
+        raise AccountingError({"error": "customer_advance_account_missing", "message": "Configure the Customer Advances liability account before recording an overpayment."})
+    return account
+
+
+def _credit_number(payment_id):
+    return f"GROW-CR-{payment_id:08d}"
+
+
+def recalculate_and_settle_loan(loan_id, effective_date, triggering_payment_id=None, user_id=None):
+    """Idempotently clamp loan balances and mark a contract SETTLED only when every due is cleared."""
+    loan = Loan.query.get(loan_id)
+    if not loan:
+        raise AccountingError("Loan not found")
+    if isinstance(effective_date, str):
+        effective_date = date.fromisoformat(effective_date)
+    entries = list(loan.ledger_entries)
+    principal = money(sum((Decimal(e.principal_amount or 0) - Decimal(e.principal_paid or 0) for e in entries), Decimal("0")))
+    interest = money(sum((Decimal(e.interest_amount or 0) - Decimal(e.interest_paid or 0) for e in entries), Decimal("0")))
+    penalty = money(sum((Decimal(e.delay_interest_accrued or 0) - Decimal(e.delay_interest_paid or 0) for e in entries), Decimal("0")))
+    # Never expose negative components, including legacy rows that were over-applied.
+    principal, interest, penalty = max(principal, Decimal("0")), max(interest, Decimal("0")), max(penalty, Decimal("0"))
+    # Ledger schedules can be incomplete on legacy loans; never settle before the
+    # contractual total payable has also been covered by posted payments.
+    total = max(money(principal + interest + penalty), money(Decimal(loan.total_payable or 0) - loan.total_paid))
+    payment = Payment.query.get(triggering_payment_id) if triggering_payment_id else None
+    overpayment = money(payment.other_fee_paid) if payment and money(loan.total_paid - Decimal(loan.total_payable or 0)) > 0 else Decimal("0.00")
+    credit = CustomerCreditBalance.query.filter_by(payment_id=triggering_payment_id).first() if triggering_payment_id else None
+    if overpayment > 0 and not credit:
+        # This is called after the payment journal is posted; the liability line is in that same journal.
+        credit = CustomerCreditBalance(customer_id=loan.customer_id, loan_id=loan.id, payment_id=payment.id,
+            credit_number=_credit_number(payment.id), credit_date=effective_date, source_type="LOAN_PAYMENT",
+            source_id=str(payment.id), original_amount=overpayment, available_amount=overpayment,
+            status="AVAILABLE", reference=payment.transaction_reference, remarks=payment.remarks,
+            journal_entry_id=payment.journal_id, created_by_id=user_id)
+        db.session.add(credit)
+        db.session.flush()
+    loan.customer_credit_balance = money(sum((Decimal(c.available_amount or 0) for c in CustomerCreditBalance.query.filter_by(loan_id=loan.id).filter(CustomerCreditBalance.status.in_(("AVAILABLE", "PARTIALLY_APPLIED"))).all()), Decimal("0")))
+    previous = (loan.status or "").strip().upper()
+    if total <= SETTLEMENT_TOLERANCE:
+        loan.status = "SETTLED"
+        loan.settled_date = effective_date
+        loan.settled_at = datetime.utcnow()
+        loan.settled_by_id = user_id
+        loan.settlement_payment_id = triggering_payment_id
+        loan.settlement_journal_id = payment.journal_id if payment else loan.settlement_journal_id
+        loan.settlement_reason = "FULLY_REPAID"
+    elif previous == "SETTLED":
+        loan.status = "OVERDUE" if loan.end_date and effective_date > loan.end_date else "ACTIVE"
+        loan.settled_date = loan.settled_at = loan.settled_by_id = loan.settlement_payment_id = loan.settlement_journal_id = loan.settlement_reason = None
+    return {"loan_id": loan.id, "previous_status": previous, "new_status": loan.status, "principal_outstanding": principal,
+            "interest_outstanding": interest, "penalty_outstanding": penalty, "delay_interest_outstanding": penalty,
+            "fee_outstanding": Decimal("0.00"), "total_outstanding": total, "overpayment": overpayment,
+            "customer_credit_id": credit.id if credit else None}
+
 def post_loan_payment(payment, user_id=None, receipt_account=None):
     existing = AccountingJournalEntry.query.filter_by(idempotency_key=f"LOAN_PAYMENT:{payment.id}").first()
     if existing: return existing
@@ -1878,8 +1943,13 @@ def post_loan_payment(payment, user_id=None, receipt_account=None):
     receipt_account = validate_collection_account(receipt_account or payment.collection_account or resolve_system_account("DEFAULT_CASH_COLLECTION_ACCOUNT" if method == "CASH_OFFICE" else "DEFAULT_BANK_COLLECTION_ACCOUNT"), method, payment.collector_id)
     lines=[{"account_id": receipt_account.id, "debit": total, "customer_id": loan.customer_id, "loan_id": loan.id, "payment_id": payment.id}]
     acct_method = getattr(loan, "interest_accounting_method", LOAN_ACCRUAL_METHOD)
-    for key, amt in [("DELAY_INTEREST_RECEIVABLE" if acct_method == LOAN_ACCRUAL_METHOD else "DELAY_INTEREST_INCOME", penalty), ("INTEREST_RECEIVABLE" if acct_method == LOAN_ACCRUAL_METHOD else "LOAN_INTEREST_INCOME", interest), ("LOAN_PRINCIPAL_RECEIVABLE", principal), ("UNAPPLIED_CUSTOMER_FUNDS", other)]:
+    # Validate before the journal is created, so an unconfigured overpayment cannot partly post.
+    is_overpayment = other > 0 and money(loan.total_paid - total) > 0
+    advance_account = customer_advance_account() if is_overpayment else None
+    for key, amt in [("DELAY_INTEREST_RECEIVABLE" if acct_method == LOAN_ACCRUAL_METHOD else "DELAY_INTEREST_INCOME", penalty), ("INTEREST_RECEIVABLE" if acct_method == LOAN_ACCRUAL_METHOD else "LOAN_INTEREST_INCOME", interest), ("LOAN_PRINCIPAL_RECEIVABLE", principal)]:
         if amt > 0: lines.append({"account_id": resolve_system_account(key).id, "credit": amt, "customer_id": loan.customer_id, "loan_id": loan.id, "payment_id": payment.id})
+    if other > 0:
+        lines.append({"account_id": advance_account.id if is_overpayment else resolve_system_account("UNAPPLIED_CUSTOMER_FUNDS").id, "credit": other, "customer_id": loan.customer_id, "loan_id": loan.id, "payment_id": payment.id})
     customer_name = loan.customer.full_name if loan.customer else "Customer"
     entry = create_draft_journal(pay_date, f"Loan payment – {loan.loan_number} – {customer_name}", lines, "LOAN_PAYMENT", payment.id, "PAYMENTS", user_id, f"LOAN_PAYMENT:{payment.id}")
     entry.loan_id = loan.id; entry.customer_id = loan.customer_id; entry.accounting_date = pay_date
@@ -1892,6 +1962,7 @@ def post_loan_payment(payment, user_id=None, receipt_account=None):
     payment.deposit_status = "UNDEPOSITED" if method == "CASH_COLLECTOR" else "NOT_APPLICABLE"
     for ledger, typ, amt in getattr(loan, "_pending_allocations", []):
         db.session.add(PaymentAllocation(payment_id=payment.id, loan_id=loan.id, ledger_id=ledger.id if ledger else None, allocation_type=typ, amount=money(amt)))
+    recalculate_and_settle_loan(loan.id, pay_date, payment.id, user_id)
     return posted
 
 
@@ -2142,4 +2213,9 @@ def reverse_payment(payment, reversal_date, reason, user_id=None):
         raise AccountingError("Cannot reverse a payment already included in a posted deposit batch; reverse the deposit first")
     rev = _old_reverse_payment_impl(payment, reversal_date, reason, user_id)
     payment.status = "REVERSED"; payment.deposit_status = "REVERSED"; payment.reversed_by = user_id
+    credit = CustomerCreditBalance.query.filter_by(payment_id=payment.id).first()
+    if credit:
+        credit.status = "REVERSED"
+        credit.available_amount = Decimal("0.00")
+    recalculate_and_settle_loan(payment.loan_id, reversal_date, None, user_id)
     return rev

@@ -26,6 +26,7 @@ from ..models import (
     LoanDisbursementDeduction,
     DisbursementChargeType,
     AccountingSetting,
+    CustomerCreditBalance,
 )
 from ..accounting import log_audit, post_loan_disbursement, AccountingError, accrue_due_loan_interest, reverse_payment, reverse_loan_disbursement, money as acct_money, preview_collection_deposit, create_collection_deposit, reverse_collection_deposit, collector_cash_position, account_subtype, allocate_payment, post_loan_payment, validate_collection_account, repair_unposted_payment, require_open_accounting_period, ValidationError, preview_loan_disbursement, preview_loan_application_disbursement, CALCULATION_METHODS, is_funding_account, is_active_account, is_posting_account
 from ..loan_ledger import (
@@ -618,6 +619,9 @@ def _loan_to_dict(loan: Loan) -> dict:
             else None
         ),
         "status": loan.status,
+        "outstanding_amount": float(loan.outstanding),
+        "customer_credit_balance": float(loan.customer_credit_balance or 0),
+        "settled_date": loan.settled_date.isoformat() if loan.settled_date else None,
         "interest_accounting_method": loan.interest_accounting_method,
         "historical_accrual_mode": loan.historical_accrual_mode,
         "accrual_processed_through": loan.accrual_processed_through.isoformat() if loan.accrual_processed_through else None,
@@ -792,9 +796,14 @@ def _payment_success_payload(payment, journal):
         key = {"DELAY_INTEREST": "delay_interest", "INTEREST": "interest", "PRINCIPAL": "principal", "UNAPPLIED": "unapplied"}.get(a.allocation_type)
         if key:
             alloc[key] = acct_money(alloc[key] + Decimal(a.amount))
+    credit = CustomerCreditBalance.query.filter_by(payment_id=payment.id).first()
     return {"message": "Payment recorded", "payment_id": payment.id, "receipt_number": payment.receipt_number,
             "journal_entry_id": payment.journal_id, "journal_number": journal.journal_no,
             "paid_amount": float(acct_money(payment.amount_collected)),
+            "loan_status": payment.loan.status, "settled_date": payment.loan.settled_date.isoformat() if payment.loan.settled_date else None,
+            "total_applied_to_loan": float(acct_money(payment.amount_collected) - acct_money(payment.other_fee_paid)),
+            "overpayment": float(acct_money(payment.other_fee_paid)), "outstanding_amount": float(payment.loan.outstanding),
+            "customer_credit": {"id": credit.id, "credit_number": credit.credit_number, "available_amount": float(credit.available_amount), "status": credit.status} if credit else None,
             "allocation": {key: float(value) for key, value in alloc.items()},
             "collection_account": {"id": acct.id, "code": acct.account_code, "name": acct.account_name} if acct else None,
             "deposit_status": payment.deposit_status}
