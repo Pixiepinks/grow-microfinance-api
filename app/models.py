@@ -606,7 +606,7 @@ class AccountingAccount(db.Model):
     __table_args__ = (
         db.CheckConstraint("account_type in ('ASSET','LIABILITY','EQUITY','INCOME','EXPENSE')", name="ck_accounting_accounts_type"),
         db.CheckConstraint("normal_balance in ('DEBIT','CREDIT')", name="ck_accounting_accounts_normal_balance"),
-        db.CheckConstraint("account_subtype in ('CASH','BANK','COLLECTION_CLEARING','COLLECTION_CLEARING_CONTROL','LOAN_RECEIVABLE','INTEREST_RECEIVABLE','PENALTY_RECEIVABLE','OTHER_CURRENT_ASSET','FIXED_ASSET','ACCOUNTS_PAYABLE','BORROWING','CAPITAL','RETAINED_EARNINGS','INTEREST_INCOME','PENALTY_INCOME','FEE_INCOME','OPERATING_EXPENSE','WRITE_OFF_EXPENSE','SUSPENSE','OTHER')", name="ck_accounting_accounts_subtype"),
+        db.CheckConstraint("account_subtype in ('CASH','BANK','COLLECTION_CLEARING','COLLECTION_CLEARING_CONTROL','LOAN_RECEIVABLE','INTEREST_RECEIVABLE','PENALTY_RECEIVABLE','OTHER_CURRENT_ASSET','FIXED_ASSET','ACCOUNTS_PAYABLE','BORROWING','CUSTOMER_ADVANCE','CAPITAL','RETAINED_EARNINGS','INTEREST_INCOME','PENALTY_INCOME','FEE_INCOME','OPERATING_EXPENSE','WRITE_OFF_EXPENSE','SUSPENSE','OTHER')", name="ck_accounting_accounts_subtype"),
     )
 
     id = db.Column(db.Integer, primary_key=True)
