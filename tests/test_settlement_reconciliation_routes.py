@@ -176,10 +176,35 @@ def test_reconciliation_normalizes_zero_string_and_settles_overpayment_once(app,
     assert body["message"] == "Loan settled and customer credit created successfully."
     assert CustomerCreditBalance.query.filter_by(loan_id=loan.id).count() == 1
 
+    db.session.expire_all()
+    assert Loan.query.get(loan.id).status == "SETTLED"
+
     repeated = client.post(f"/admin/loans/{loan.id}/settlement-reconciliation", headers=headers, json={"confirm": True})
     assert repeated.status_code == 200
     assert repeated.get_json()["success"] is False
     assert CustomerCreditBalance.query.filter_by(loan_id=loan.id).count() == 1
+
+
+def test_reconciliation_settles_contractual_loan_with_delay_interest_outstanding(app, client):
+    """Delay interest is separate and cannot keep a paid contract ACTIVE."""
+    admin = User(email="delay-status-admin@example.com", name="Admin", role="admin")
+    admin.set_password("password")
+    db.session.add(admin)
+    db.session.commit()
+    loan = _legacy_loan(admin, amount_paid="18900.00", number="SETTLE-DELAY-OUTSTANDING")
+    loan.ledger_entries[0].delay_interest_accrued = Decimal("125.00")
+    db.session.commit()
+
+    response = client.post(f"/admin/loans/{loan.id}/reconciliation", headers=_headers(app, admin), json={"confirm": True})
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["status"] == "SETTLED"
+    assert body["new_status"] == "SETTLED"
+    assert body["principal_outstanding"] == 0.0
+    assert body["contractual_interest_outstanding"] == 0.0
+    assert body["delay_interest_outstanding"] == 125.0
+    db.session.expire_all()
+    assert Loan.query.get(loan.id).status == "SETTLED"
 
 
 def test_reconciliation_rejects_two_cent_remaining_balance(app, client):

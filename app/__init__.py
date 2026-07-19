@@ -446,6 +446,40 @@ def create_app():
             db.session.rollback()
         click.echo({"mode": "apply" if apply_changes else "preview", "loans": reports})
 
+    @app.cli.command("repair-loan-statuses")
+    @click.option("--loan-id", type=int, default=None)
+    @click.option("--all", "all_loans", is_flag=True, default=False)
+    @click.option("--preview", "preview_mode", is_flag=True, default=False)
+    @click.option("--apply", "apply_changes", is_flag=True, default=False)
+    def repair_loan_statuses_cli(loan_id, all_loans, preview_mode, apply_changes):
+        """Preview or explicitly repair loan statuses from contractual balances."""
+        if preview_mode == apply_changes or (loan_id is None) == (not all_loans):
+            raise click.ClickException("Specify exactly one of --loan-id/--all and --preview/--apply")
+        from .models import Loan
+        from .loan_status import contractual_balances, update_loan_settlement_status
+        loans = [Loan.query.get(loan_id)] if loan_id else Loan.query.order_by(Loan.id).all()
+        reports = []
+        for loan in filter(None, loans):
+            current = loan.status
+            balances = contractual_balances(loan)
+            if (current or "").strip().upper() in {"WRITTEN_OFF", "CANCELLED"}:
+                proposed = current
+                reason = "status is protected from automatic settlement repair"
+            else:
+                proposed = "SETTLED" if (balances["principal_outstanding"] <= Decimal("0.01") and balances["contractual_interest_outstanding"] <= Decimal("0.01")) else "ACTIVE"
+                reason = "contractual principal and interest are within 0.01 tolerance" if proposed == "SETTLED" else "contractual balance remains"
+            reports.append({"loan_id": loan.id, "current_status": current, "proposed_status": proposed,
+                            **{key: str(value.quantize(Decimal("0.01"))) for key, value in balances.items()},
+                            "settlement_date_source": "existing settled_date" if loan.settled_date else "not changed by status repair",
+                            "reason": reason})
+            if apply_changes:
+                update_loan_settlement_status(loan.id, loan.settled_date, loan.settled_by_id, loan=loan)
+        if apply_changes:
+            db.session.commit()
+        else:
+            db.session.rollback()
+        click.echo({"mode": "apply" if apply_changes else "preview", "loans": reports})
+
     return app
 
 

@@ -729,7 +729,9 @@ def settlement_reconciliation_preview(loan_id):
 def settlement_reconciliation_post(loan_id):
     if not (request.get_json(silent=True) or {}).get("confirm"):
         return jsonify({"error": "confirmation_required", "message": "Confirm the settlement reconciliation before posting."}), 422
-    loan = Loan.query.get(loan_id)
+    # Lock the authoritative Loan row so status and reconciliation entries are
+    # persisted together rather than serializing a stale ACTIVE instance.
+    loan = Loan.query.filter_by(id=loan_id).with_for_update().first()
     if loan is None:
         return jsonify({"error": "loan_not_found", "message": "The selected loan was not found."}), 404
     payload = request.get_json(silent=True) or {}
@@ -754,6 +756,7 @@ def settlement_reconciliation_post(loan_id):
             db.session.rollback()
             return jsonify(_canonical_reconciliation_result(loan, previous_status, result))
         db.session.commit()
+        db.session.refresh(loan)
     except Exception as exc:
         db.session.rollback()
         return jsonify({"error": "settlement_reconciliation_failed", "message": str(exc)}), 422
@@ -822,7 +825,10 @@ def _canonical_reconciliation_result(loan, previous_status, result):
         "loan_number": loan.loan_number,
         "previous_status": previous_status,
         "new_status": loan.status if result.get("processed") else previous_status,
+        "status": loan.status if result.get("processed") else previous_status,
         "settled_date": settled.isoformat() if hasattr(settled, "isoformat") else settled,
+        "settled_at": loan.settled_at.isoformat() if result.get("processed") and loan.settled_at else None,
+        "reconciliation_id": result.get("settlement_journal_id"),
         "total_payable": number(result["total_payable"]),
         "total_paid": number(result["total_paid"]),
         "total_cash_received": number(result["total_cash_received"]),
@@ -830,6 +836,9 @@ def _canonical_reconciliation_result(loan, previous_status, result):
         "unapplied_excess": number(result["unapplied_excess"]),
         "remaining_balance": number(result["remaining_balance"]),
         "outstanding": number(result["outstanding"]),
+        "principal_outstanding": number(result.get("principal_outstanding", result.get("contractual_principal_outstanding"))),
+        "contractual_interest_outstanding": number(result.get("contractual_interest_outstanding")),
+        "delay_interest_outstanding": number(result.get("delay_interest_outstanding")),
         "overpayment": number(result["overpayment"]),
         "proposed_customer_credit": number(result["proposed_customer_credit"]),
         "customer_credit": (
