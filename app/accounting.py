@@ -1541,14 +1541,13 @@ def recalculate_and_settle_loan(loan_id, effective_date, triggering_payment_id=N
     if isinstance(effective_date, str):
         effective_date = date.fromisoformat(effective_date)
     entries = list(loan.ledger_entries)
+    from .loan_status import update_loan_settlement_status
     principal = money(sum((Decimal(e.principal_amount or 0) - Decimal(e.principal_paid or 0) for e in entries), Decimal("0")))
-    interest = money(sum((Decimal(e.interest_amount or 0) - Decimal(e.interest_paid or 0) for e in entries), Decimal("0")))
+    interest = money(sum((Decimal(e.interest_amount or 0) - Decimal(e.interest_paid or 0) - Decimal(e.waived_interest_amount or 0) for e in entries), Decimal("0")))
     penalty = money(sum((Decimal(e.delay_interest_accrued or 0) - Decimal(e.delay_interest_paid or 0) for e in entries), Decimal("0")))
     # Never expose negative components, including legacy rows that were over-applied.
     principal, interest, penalty = max(principal, Decimal("0")), max(interest, Decimal("0")), max(penalty, Decimal("0"))
-    # Ledger schedules can be incomplete on legacy loans; never settle before the
-    # contractual total payable has also been covered by posted payments.
-    total = max(money(principal + interest + penalty), money(Decimal(loan.total_payable or 0) - loan.total_paid))
+    total = money(principal + interest)
     payment = Payment.query.get(triggering_payment_id) if triggering_payment_id else None
     overpayment = money(payment.other_fee_paid) if payment and money(loan.total_paid - Decimal(loan.total_payable or 0)) > 0 else Decimal("0.00")
     credit = CustomerCreditBalance.query.filter_by(payment_id=triggering_payment_id).first() if triggering_payment_id else None
@@ -1563,16 +1562,12 @@ def recalculate_and_settle_loan(loan_id, effective_date, triggering_payment_id=N
         db.session.flush()
     loan.customer_credit_balance = money(sum((Decimal(c.available_amount or 0) for c in CustomerCreditBalance.query.filter_by(loan_id=loan.id).filter(CustomerCreditBalance.status.in_(("AVAILABLE", "PARTIALLY_APPLIED"))).all()), Decimal("0")))
     previous = (loan.status or "").strip().upper()
-    if total <= SETTLEMENT_TOLERANCE:
-        loan.status = "SETTLED"
-        loan.settled_date = effective_date
-        loan.settled_at = datetime.utcnow()
-        loan.settled_by_id = user_id
+    loan, status_balances = update_loan_settlement_status(loan.id, effective_date, user_id, loan=loan)
+    if status_balances["is_contractually_settled"]:
         loan.settlement_payment_id = triggering_payment_id
         loan.settlement_journal_id = payment.journal_id if payment else loan.settlement_journal_id
         loan.settlement_reason = "FULLY_REPAID"
     elif previous == "SETTLED":
-        loan.status = "OVERDUE" if loan.end_date and effective_date > loan.end_date else "ACTIVE"
         loan.settled_date = loan.settled_at = loan.settled_by_id = loan.settlement_payment_id = loan.settlement_journal_id = loan.settlement_reason = None
     return {"loan_id": loan.id, "previous_status": previous, "new_status": loan.status, "principal_outstanding": principal,
             "interest_outstanding": interest, "penalty_outstanding": penalty, "delay_interest_outstanding": penalty,

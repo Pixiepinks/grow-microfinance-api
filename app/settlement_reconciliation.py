@@ -7,6 +7,7 @@ from .models import Loan, Payment, CustomerCreditBalance, AccountingJournalEntry
 from .accounting import (money, customer_advance_account, account_subtype, create_draft_journal,
                          post_journal, require_open_accounting_period, log_audit, AccountingError)
 from .loan_repair import repair_legacy_loan_configuration
+from .loan_status import update_loan_settlement_status
 
 TOLERANCE = Decimal("0.01")
 logger = logging.getLogger(__name__)
@@ -90,7 +91,10 @@ def _is_settlement_eligible(result):
     component_balances = result.get("component_balances") or {}
     return (
         remaining_balance <= TOLERANCE
-        and all(Decimal(str(balance or "0")) <= TOLERANCE for balance in component_balances.values())
+        # Penalty/delay interest is deliberately not contractual settlement.
+        # It remains visible and collectible as a separate receivable.
+        and Decimal(str(component_balances.get("principal", "0"))) <= TOLERANCE
+        and Decimal(str(component_balances.get("interest", "0"))) <= TOLERANCE
     )
 
 
@@ -294,16 +298,18 @@ def post(loan, user_id=None, waive_delay_interest=False, delay_interest_waiver_a
           original_amount=result["proposed_customer_credit"], available_amount=result["proposed_customer_credit"], applied_amount=Decimal(), refunded_amount=Decimal(),
           status="AVAILABLE", reference=key, remarks="Legacy loan settlement reconciliation", journal_entry_id=journal.id if journal else None, created_by_id=user_id)
         db.session.add(credit)
-    loan.status = "SETTLED"; loan.customer_credit_balance = result["proposed_customer_credit"]
-    loan.settled_date = result["settled_date"]; loan.settled_at = datetime.combine(result["settled_date"], datetime.min.time())
-    loan.settled_by_id = user_id; loan.settlement_payment_id = result["final_payment_id"]
+    # Status is based only on contractual principal and normal interest.  This
+    # is the missing persistence step behind previews that proposed SETTLED.
+    loan, balances = update_loan_settlement_status(loan.id, result["settled_date"], user_id, loan=loan)
+    loan.customer_credit_balance = result["proposed_customer_credit"]
+    loan.settlement_payment_id = result["final_payment_id"]
     loan.settlement_journal_id = journal.id if journal else loan.settlement_journal_id; loan.settlement_reason = "LEGACY_FULLY_REPAID"
     for entry in loan.ledger_entries:
         due = money(entry.principal_amount) + money(entry.interest_amount) + money(entry.delay_interest_accrued)
         paid = money(entry.principal_paid) + money(entry.interest_paid) + money(entry.delay_interest_paid) + money(entry.delay_interest_waived)
         if paid >= due - TOLERANCE: entry.status = "PAID"; entry.paid_amount = min(paid, due)
     log_audit("LEGACY_LOAN_SETTLEMENT_POSTED", "Loan", loan.id, user_id, {**result, "journal_id": journal.id if journal else None})
-    return {**result, "processed": True, "settlement_journal_id": journal.id if journal else None}
+    return {**result, **balances, "processed": True, "settlement_journal_id": journal.id if journal else None}
 
 
 def _apply_historical_payments_to_ledger(loan, amount, paid_date, delay_only=False):
