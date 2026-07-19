@@ -589,10 +589,15 @@ def _canonical_reconciliation_result(loan, previous_status, result):
         "outstanding": number(result["outstanding"]),
         "overpayment": number(result["overpayment"]),
         "proposed_customer_credit": number(result["proposed_customer_credit"]),
-        "customer_credit": number(result["proposed_customer_credit"]) if result["proposed_customer_credit"] > 0 else None,
+        "customer_credit": (
+            {"available_amount": number(result["proposed_customer_credit"]), "status": "AVAILABLE"}
+            if result.get("processed") and result["proposed_customer_credit"] > Decimal("0.00") else None
+        ),
         "warnings": result["warnings"],
         "message": (
-            "Loan reconciled and settled successfully."
+            "Loan settled and customer credit created successfully."
+            if result.get("processed") and result["proposed_customer_credit"] > Decimal("0.00")
+            else "Loan reconciled and settled successfully."
             if result.get("processed")
             else "Loan was not settled; an outstanding balance or reconciliation issue remains."
         ),

@@ -149,3 +149,47 @@ def test_preview_excludes_reversed_receipts_and_post_rejects_stale_manual_credit
                         json={"confirm": True, "customer_credit": 600})
     assert stale.status_code == 409
     assert stale.get_json()["proposed_customer_credit"] == 0.0
+
+
+def test_reconciliation_normalizes_zero_string_and_settles_overpayment_once(app, client):
+    """A fully paid ACTIVE loan may be settled even when the preview serializes zero."""
+    from app.settlement_reconciliation import _normalized_remaining_balance
+    from app.models import CustomerCreditBalance
+
+    assert _normalized_remaining_balance("0.00") == Decimal("0.00")
+    admin = User(email="overpayment-post-admin@example.com", name="Admin", role="admin")
+    admin.set_password("password")
+    db.session.add(admin)
+    db.session.commit()
+    loan = _legacy_loan(admin, amount_paid="19500.00", number="SETTLE-POST-OVERPAYMENT")
+    headers = _headers(app, admin)
+
+    response = client.post(f"/admin/loans/{loan.id}/settlement-reconciliation", headers=headers, json={"confirm": True})
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["success"] is True
+    assert body["previous_status"] == "ACTIVE"
+    assert body["new_status"] == "SETTLED"
+    assert body["outstanding"] == 0.0
+    assert body["overpayment"] == 600.0
+    assert body["customer_credit"] == {"available_amount": 600.0, "status": "AVAILABLE"}
+    assert body["message"] == "Loan settled and customer credit created successfully."
+    assert CustomerCreditBalance.query.filter_by(loan_id=loan.id).count() == 1
+
+    repeated = client.post(f"/admin/loans/{loan.id}/settlement-reconciliation", headers=headers, json={"confirm": True})
+    assert repeated.status_code == 200
+    assert repeated.get_json()["success"] is False
+    assert CustomerCreditBalance.query.filter_by(loan_id=loan.id).count() == 1
+
+
+def test_reconciliation_rejects_two_cent_remaining_balance(app, client):
+    admin = User(email="two-cent-admin@example.com", name="Admin", role="admin")
+    admin.set_password("password")
+    db.session.add(admin)
+    db.session.commit()
+    loan = _legacy_loan(admin, amount_paid="18899.98", number="SETTLE-TWO-CENTS")
+
+    response = client.post(f"/admin/loans/{loan.id}/settlement-reconciliation", headers=_headers(app, admin), json={"confirm": True})
+    assert response.status_code == 200
+    assert response.get_json()["success"] is False
+    assert response.get_json()["remaining_balance"] == 0.02
