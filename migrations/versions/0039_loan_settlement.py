@@ -1,12 +1,12 @@
 """add automatic loan settlement and customer overpayment credits
 
-Revision ID: 0039_loan_settlement_customer_credits
+Revision ID: 0039_loan_settlement
 Revises: 0038_inv_accr_cal_days
 """
 from alembic import op
 import sqlalchemy as sa
 
-revision = "0039_loan_settlement_customer_credits"
+revision = "0039_loan_settlement"
 down_revision = "0038_inv_accr_cal_days"
 branch_labels = None
 depends_on = None
