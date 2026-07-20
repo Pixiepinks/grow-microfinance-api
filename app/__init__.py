@@ -126,6 +126,37 @@ def create_app():
 
 
 
+    def _customer_backfill_command(customer_id, all_customers, confirm, apply):
+        from .models import Customer
+        from .customer_master import apply_backfill, backfill_customer
+        if not customer_id and not all_customers:
+            raise click.ClickException("Specify --customer-id or --all")
+        if all_customers and not confirm:
+            raise click.ClickException("--all requires --confirm")
+        customers = [db.session.get(Customer, customer_id)] if customer_id else Customer.query.order_by(Customer.id).all()
+        if customer_id and not customers[0]: raise click.ClickException("Customer not found")
+        reports = []
+        for customer in customers:
+            reports.append(apply_backfill(customer) if apply else backfill_customer(customer))
+        if apply: db.session.commit()
+        click.echo({"mode": "apply" if apply else "preview", "customers": reports})
+
+    @app.cli.command("preview-customer-profile-backfill")
+    @click.option("--customer-id", type=int)
+    @click.option("--all", "all_customers", is_flag=True)
+    @click.option("--confirm", is_flag=True, help="Required with --all.")
+    def preview_customer_profile_backfill(customer_id, all_customers, confirm):
+        """Preview missing-only customer master backfill; makes no changes."""
+        _customer_backfill_command(customer_id, all_customers, confirm, False)
+
+    @app.cli.command("apply-customer-profile-backfill")
+    @click.option("--customer-id", type=int)
+    @click.option("--all", "all_customers", is_flag=True)
+    @click.option("--confirm", is_flag=True, help="Required with --all.")
+    def apply_customer_profile_backfill(customer_id, all_customers, confirm):
+        """Apply missing-only customer master backfill."""
+        _customer_backfill_command(customer_id, all_customers, confirm, True)
+
     @app.cli.command("reconcile-loan-settlements")
     @click.option("--preview", "preview_mode", is_flag=True, default=False, help="Report only; makes no database changes.")
     @click.option("--post", "post_mode", is_flag=True, default=False, help="Apply eligible reconciliations.")

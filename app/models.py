@@ -88,7 +88,8 @@ class Customer(db.Model):
     full_name = db.Column(db.String(150), nullable=False)
     nic_number = db.Column(db.String(50))
     mobile = db.Column(db.String(20))
-    address = db.Column(db.String(255))
+    email = db.Column(db.String(120), nullable=True)
+    address = db.Column(db.String(255))  # Deprecated legacy single-line fallback.
     business_type = db.Column(db.String(120))
     date_of_birth = db.Column(db.Date, nullable=True)
     civil_status = db.Column(db.String(20), nullable=True)
@@ -112,6 +113,8 @@ class Customer(db.Model):
     employer_address = db.Column(db.String(255), nullable=True)
     occupation = db.Column(db.String(100), nullable=True)
     monthly_income = db.Column(db.Numeric(12, 2), nullable=True)
+    monthly_expenses = db.Column(db.Numeric(12, 2), nullable=True)
+    address_backfill_review_required = db.Column(db.Boolean, nullable=False, default=False)
     business_name = db.Column(db.String(255), nullable=True)
     business_address = db.Column(db.String(255), nullable=True)
     guarantor_name = db.Column(db.String(255), nullable=True)
@@ -212,8 +215,12 @@ class CustomerKYCProfile(db.Model):
 
     id = db.Column(db.Integer, primary_key=True)
     customer_id = db.Column(
-        db.Integer, db.ForeignKey("customers.id"), unique=True, nullable=False
+        db.Integer, db.ForeignKey("customers.id"), nullable=False, index=True
     )
+    full_name = db.Column(db.String(150), nullable=True)
+    nic_number = db.Column(db.String(50), nullable=True)
+    mobile = db.Column(db.String(20), nullable=True)
+    email = db.Column(db.String(120), nullable=True)
     date_of_birth = db.Column(db.Date, nullable=True)
     civil_status = db.Column(db.String(50), nullable=True)
     permanent_address_line1 = db.Column(db.String(255), nullable=True)
@@ -236,6 +243,7 @@ class CustomerKYCProfile(db.Model):
     employer_address = db.Column(db.String(255), nullable=True)
     occupation = db.Column(db.String(100), nullable=True)
     monthly_income = db.Column(db.Numeric(12, 2), nullable=True)
+    monthly_expenses = db.Column(db.Numeric(12, 2), nullable=True)
     business_name = db.Column(db.String(255), nullable=True)
     business_address = db.Column(db.String(255), nullable=True)
     guarantor_name = db.Column(db.String(255), nullable=True)
@@ -244,6 +252,8 @@ class CustomerKYCProfile(db.Model):
     consent_data_processing = db.Column(db.Boolean, nullable=True)
     consent_credit_checks = db.Column(db.Boolean, nullable=True)
 
+    review_status = db.Column(db.String(32), nullable=True)
+    reviewed_at = db.Column(db.DateTime, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
 
     customer = relationship("Customer", back_populates="kyc_profile")
