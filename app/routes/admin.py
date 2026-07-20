@@ -1222,6 +1222,7 @@ def dashboard():
     normalized_payment_status = func.upper(func.trim(Payment.status))
 
     total_customers = int(Customer.query.count() or 0)
+    total_loans = int(db.session.query(func.count(Loan.id)).scalar() or 0)
     active_loans_query = Loan.query.filter(normalized_loan_status.in_(ACTIVE_LOAN_STATUSES))
     active_loans = active_loans_query.all()
     active_loans_count = int(
@@ -1263,6 +1264,7 @@ def dashboard():
     response = {
         "total_customers": total_customers,
         "totalCustomers": total_customers,
+        "total_loans": total_loans,
         "active_loans": active_loans_count,
         "activeLoans": active_loans_count,
         "total_active_loans": active_loans_count,
@@ -1281,8 +1283,9 @@ def dashboard():
         sorted(ACTIVE_LOAN_STATUSES),
     )
     current_app.logger.info(
-        "Dashboard metrics total_customers=%s active_loans=%s payments_today=%s response_keys=%s",
+        "Dashboard metrics total_customers=%s total_loans=%s active_loans=%s payments_today=%s response_keys=%s",
         total_customers,
+        total_loans,
         active_loans_count,
         payments_today,
         sorted(response.keys()),
