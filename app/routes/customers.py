@@ -544,7 +544,8 @@ def admin_customer_kyc_profile(customer_id: int):
         return jsonify({"message": "Customer not found"}), 404
 
     if request.method == "GET":
-        profile = customer.kyc_profile
+        from ..customer_master import latest_approved_kyc
+        profile = latest_approved_kyc(customer)
         if not profile:
             return jsonify({"customer_id": customer_id, "kyc_profile": None}), 200
 
@@ -862,3 +863,17 @@ def public_kyc_upload(customer_code: str):
         return jsonify(
             {"success": False, "message": "Failed to submit KYC", "detail": str(exc)}
         ), 400
+
+@admin_api_customers_bp.route("/<int:customer_id>/profile-normalized", methods=["GET"])
+@role_required(["admin", "staff"])
+def normalized_customer_profile(customer_id: int):
+    """Return the current master profile; never mutates application snapshots."""
+    from ..customer_master import build_customer_master_profile
+    try:
+        profile = build_customer_master_profile(customer_id)
+    except LookupError:
+        return jsonify({"message": "Customer not found"}), 404
+    response = {key: value for key, value in profile.items() if key != "fields"}
+    response.update({field: details["value"] for field, details in profile["fields"].items()})
+    response["field_sources"] = {field: details["source"] for field, details in profile["fields"].items()}
+    return jsonify(response), 200
