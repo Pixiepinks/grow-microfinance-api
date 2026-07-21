@@ -20,7 +20,7 @@ from datetime import datetime
 from decimal import Decimal
 from sqlalchemy import or_
 from .extensions import db
-from .models import Customer, CustomerKYCProfile, LoanApplication
+from .models import Customer, CustomerKYCProfile, Loan, LoanApplication
 
 PROFILE_FIELDS = ("full_name", "nic_number", "mobile", "email", "date_of_birth", "civil_status",
  "current_address_line1", "current_address_line2", "current_city", "current_district", "current_province", "current_postal_code",
@@ -70,10 +70,23 @@ def build_customer_master_profile(customer_id):
         fields["current_address_line1"] = {"value": customer.address, "source": "customers.address_legacy"}
     missing = [field for field, item in fields.items() if not present(item["value"])]
     conflicts = customer_profile_conflicts(customer, kyc)
+    active_loans = (
+        Loan.query.filter(
+            Loan.customer_id == customer.id,
+            Loan.status.in_(("ACTIVE", "DISBURSED")),
+        )
+        .order_by(Loan.id.desc())
+        .all()
+    )
+    existing_loans = [
+        {"loan_id": loan.id, "loan_number": loan.loan_number, "status": loan.status}
+        for loan in active_loans
+    ]
     return {"customer_id": customer.id, "customer_code": customer.customer_code, "fields": fields,
             "kyc_status": customer.kyc_status, "eligibility_status": customer.eligibility_status,
             "profile_complete": not missing and not any(c["requires_manual_review"] for c in conflicts),
             "missing_fields": missing, "conflicts": conflicts,
+            "has_existing_loans": bool(existing_loans), "existing_loans": existing_loans,
             "review_warnings": (["legacy_address_requires_review"] if fields["current_address_line1"]["source"] == "customers.address_legacy" else []) + (["identity_conflict_requires_review"] if any(c["requires_manual_review"] for c in conflicts) else [])}
 
 def backfill_customer(customer):
