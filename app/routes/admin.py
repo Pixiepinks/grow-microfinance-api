@@ -43,6 +43,7 @@ logger = logging.getLogger(__name__)
 from ..settlement_reconciliation import preview as settlement_preview, finalize_loan_reconciliation
 from ..loan_status import serialize_loan_status
 from ..early_settlement import preview_early_loan_settlement, post_early_loan_settlement, reverse_early_loan_settlement, EarlySettlementError
+from ..customer_master import build_customer_master_profile
 
 ACTIVE_LOAN_STATUSES = {"ACTIVE", "DISBURSED"}
 POSTED_PAYMENT_STATUSES = {"POSTED"}
@@ -400,6 +401,25 @@ def search_customers():
     except Exception as exc:  # pragma: no cover - defensive logging
         current_app.logger.exception("Customer search failed: %s", exc)
         return jsonify({"message": "Failed to search customers"}), 500
+
+
+@admin_bp.route("/customers/<int:customer_id>/profile-normalized", methods=["GET"])
+@role_required(["admin"])
+def get_normalized_customer_profile(customer_id: int):
+    """Return the authoritative consolidated profile for an admin customer lookup."""
+    try:
+        profile = build_customer_master_profile(customer_id)
+    except LookupError:
+        return jsonify({"error": "customer_not_found", "message": "Customer not found."}), 404
+
+    profile = {
+        **{key: value for key, value in profile.items() if key != "fields"},
+        **{field: details["value"] for field, details in profile["fields"].items()},
+        "field_sources": {
+            field: details["source"] for field, details in profile["fields"].items()
+        },
+    }
+    return jsonify({"profile": profile}), 200
 
 
 @admin_bp.route("/customers", methods=["GET"])
