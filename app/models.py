@@ -928,6 +928,87 @@ class CollectionDepositBatch(db.Model):
     allocations = relationship("CollectionDepositAllocation", back_populates="deposit_batch", cascade="all, delete-orphan")
 
 
+class CollectionSheet(db.Model):
+    __tablename__ = "collection_sheets"
+    __table_args__ = (
+        Index("ix_collection_sheets_date_collector", "collection_date", "collector_id"),
+        Index("ix_collection_sheets_status", "status"),
+    )
+
+    id = db.Column(db.Integer, primary_key=True)
+    sheet_number = db.Column(db.String(40), nullable=False, unique=True, index=True)
+    collector_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+    collection_date = db.Column(db.Date, nullable=False)
+    gross_collection = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    total_expenses = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    expected_deposit = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    actual_deposit = db.Column(Numeric(18, 2))
+    difference = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    bank_account_id = db.Column(db.Integer, db.ForeignKey("accounting_accounts.id"))
+    bank_journal_id = db.Column(db.Integer, db.ForeignKey("accounting_journal_entries.id"))
+    deposit_date = db.Column(db.Date)
+    deposit_reference = db.Column(db.String(120))
+    status = db.Column(db.String(30), nullable=False, default="DRAFT")
+    notes = db.Column(db.Text)
+    posting_key = db.Column(db.String(160), unique=True)
+    posting_result = db.Column(db.JSON)
+    created_by_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+    submitted_by_id = db.Column(db.Integer, db.ForeignKey("users.id"))
+    approved_by_id = db.Column(db.Integer, db.ForeignKey("users.id"))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    submitted_at = db.Column(db.DateTime)
+    approved_at = db.Column(db.DateTime)
+    posted_at = db.Column(db.DateTime)
+    reconciled_at = db.Column(db.DateTime)
+    reversal_of_id = db.Column(db.Integer, db.ForeignKey("collection_sheets.id"))
+    reversed_at = db.Column(db.DateTime)
+    reversed_by_id = db.Column(db.Integer, db.ForeignKey("users.id"))
+    reversal_reason = db.Column(db.Text)
+
+    collector = relationship("User", foreign_keys=[collector_id])
+    bank_account = relationship("AccountingAccount", foreign_keys=[bank_account_id])
+    created_by = relationship("User", foreign_keys=[created_by_id])
+    submitted_by = relationship("User", foreign_keys=[submitted_by_id])
+    approved_by = relationship("User", foreign_keys=[approved_by_id])
+    items = relationship("CollectionSheetItem", back_populates="sheet", cascade="all, delete-orphan")
+    expenses = relationship("CollectionSheetExpense", back_populates="sheet", cascade="all, delete-orphan")
+
+
+class CollectionSheetItem(db.Model):
+    __tablename__ = "collection_sheet_items"
+    __table_args__ = (db.UniqueConstraint("collection_sheet_id", "loan_id", name="uq_collection_sheet_loan"),)
+    id = db.Column(db.Integer, primary_key=True)
+    collection_sheet_id = db.Column(db.Integer, db.ForeignKey("collection_sheets.id", ondelete="CASCADE"), nullable=False, index=True)
+    customer_id = db.Column(db.Integer, db.ForeignKey("customers.id"), nullable=False)
+    loan_id = db.Column(db.Integer, db.ForeignKey("loans.id"), nullable=False, index=True)
+    amount = db.Column(Numeric(18, 2), nullable=False)
+    payment_id = db.Column(db.Integer, db.ForeignKey("payments.id"), unique=True)
+    posting_status = db.Column(db.String(20), nullable=False, default="PENDING")
+    posting_error = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    sheet = relationship("CollectionSheet", back_populates="items")
+    customer = relationship("Customer")
+    loan = relationship("Loan")
+    payment = relationship("Payment")
+
+
+class CollectionSheetExpense(db.Model):
+    __tablename__ = "collection_sheet_expenses"
+    id = db.Column(db.Integer, primary_key=True)
+    collection_sheet_id = db.Column(db.Integer, db.ForeignKey("collection_sheets.id", ondelete="CASCADE"), nullable=False, index=True)
+    expense_account_id = db.Column(db.Integer, db.ForeignKey("accounting_accounts.id"), nullable=False)
+    amount = db.Column(Numeric(18, 2), nullable=False)
+    description = db.Column(db.String(255), nullable=False)
+    reference = db.Column(db.String(120))
+    journal_entry_id = db.Column(db.Integer, db.ForeignKey("accounting_journal_entries.id"), unique=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    sheet = relationship("CollectionSheet", back_populates="expenses")
+    expense_account = relationship("AccountingAccount")
+
+
 class CollectionDepositAllocation(db.Model):
     __tablename__ = "collection_deposit_allocations"
 

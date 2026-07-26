@@ -19,6 +19,7 @@ from .routes.loan_applications import admin_api_bp, loan_app_bp
 from .routes.leads import leads_bp
 from .routes.accounting import accounting_bp
 from .routes.investors import investors_bp
+from .routes.collection_sheets import collection_sheets_bp
 from .schema_fix import ensure_customers_lead_status_column
 
 def create_app():
@@ -108,6 +109,7 @@ def create_app():
     app.register_blueprint(leads_bp)
     app.register_blueprint(accounting_bp)
     app.register_blueprint(investors_bp)
+    app.register_blueprint(collection_sheets_bp)
 
     with app.app_context():
         ensure_customers_lead_status_column()

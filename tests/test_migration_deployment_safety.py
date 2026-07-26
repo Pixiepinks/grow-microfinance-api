@@ -64,7 +64,7 @@ def test_alembic_chain_has_one_head_and_valid_down_revisions():
     revision_set = set(revisions)
 
     assert len(revisions) == len(revision_set), "Alembic revision IDs must be unique"
-    assert script.get_heads() == ["0045_post_settlement_payments"]
+    assert script.get_heads() == ["0046_collection_sheets"]
 
     for rev in migrations:
         downs = rev._normalized_down_revisions
