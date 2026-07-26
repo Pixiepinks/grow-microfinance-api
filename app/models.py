@@ -638,6 +638,9 @@ class Payment(db.Model):
     reversed_by = db.Column(db.Integer, db.ForeignKey("users.id"))
     deposited_amount = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
     deposit_status = db.Column(db.String(30), nullable=False, default="NOT_APPLICABLE")
+    collection_clearance_status = db.Column(db.String(30), nullable=False, default="UNDEPOSITED", index=True)
+    collection_sheet_id = db.Column(db.Integer, db.ForeignKey("collection_sheets.id"), index=True)
+    collection_sheet_deposit_journal_id = db.Column(db.Integer, db.ForeignKey("accounting_journal_entries.id"))
     transaction_type = db.Column(db.String(40), nullable=False, default="LOAN_PAYMENT", index=True)
     idempotency_key = db.Column(db.String(160), unique=True, index=True)
 
@@ -651,6 +654,8 @@ class Payment(db.Model):
     )
     collector = relationship("User", foreign_keys=[collector_id])
     collection_account = relationship("AccountingAccount", foreign_keys=[collection_account_id])
+    collection_sheet = relationship("CollectionSheet", foreign_keys=[collection_sheet_id])
+    collection_sheet_deposit_journal = relationship("AccountingJournalEntry", foreign_keys=[collection_sheet_deposit_journal_id])
 
 ACCOUNT_TYPES = ("ASSET", "LIABILITY", "EQUITY", "INCOME", "EXPENSE")
 ACCOUNT_SUBTYPES = ("CASH", "BANK", "COLLECTION_CLEARING", "COLLECTION_CLEARING_CONTROL", "LOAN_RECEIVABLE", "INTEREST_RECEIVABLE", "PENALTY_RECEIVABLE", "OTHER_CURRENT_ASSET", "FIXED_ASSET", "ACCOUNTS_PAYABLE", "BORROWING", "CUSTOMER_ADVANCE", "CAPITAL", "RETAINED_EARNINGS", "INTEREST_INCOME", "PENALTY_INCOME", "FEE_INCOME", "OPERATING_EXPENSE", "WRITE_OFF_EXPENSE", "DELAY_INTEREST_WAIVER", "SUSPENSE", "OTHER")

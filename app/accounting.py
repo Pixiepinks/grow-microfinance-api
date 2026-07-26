@@ -2067,8 +2067,8 @@ def _payment_deposit_status(payment):
 def collector_cash_position(collector_id, as_of_date=None):
     q = Payment.query.filter(Payment.collector_id == collector_id, Payment.reversed_at.is_(None), Payment.deposit_status != "NOT_APPLICABLE")
     if as_of_date: q = q.filter(Payment.collection_date <= as_of_date)
-    payments = q.all(); collections=sum((money(p.amount_collected) for p in payments), Decimal("0.00")); deposits=sum((money(p.deposited_amount) for p in payments), Decimal("0.00"))
-    return {"collections": money(collections), "deposits": money(deposits), "adjustments": Decimal("0.00"), "closing_balance": money(collections-deposits), "undeposited_payments": [p for p in payments if money(p.undeposited_amount) > 0]}
+    payments = q.all(); collections=sum((money(p.amount_collected) for p in payments), Decimal("0.00")); deposits=sum((money(p.amount_collected) if p.collection_clearance_status == "CLEARED" else money(p.deposited_amount) for p in payments), Decimal("0.00"))
+    return {"collections": money(collections), "deposits": money(deposits), "adjustments": Decimal("0.00"), "closing_balance": money(collections-deposits), "undeposited_payments": [p for p in payments if p.collection_clearance_status != "CLEARED" and money(p.undeposited_amount) > Decimal("0.01")]}
 
 
 def _validation_payload(exc):
@@ -2192,6 +2192,8 @@ def validate_collection_deposit_payload(data):
             raise ValidationError("Payment must be posted with a journal before deposit", payment_id=payment_id)
         if payment.reversed_at or payment.deposit_status in ("NOT_APPLICABLE", "REVERSED"):
             raise ValidationError("Payment is not depositable", payment_id=payment_id)
+        if payment.collection_clearance_status == "CLEARED" or money(payment.undeposited_amount) <= Decimal("0.01"):
+            raise ValidationError("Payment collection is already cleared", payment_id=payment_id)
         if payment_date and payment_date > deposit_date:
             raise ValidationError("Deposit date cannot be earlier than any selected payment date", payment_id=payment_id)
         if amt > money(payment.undeposited_amount):
