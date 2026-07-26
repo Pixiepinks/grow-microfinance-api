@@ -3,10 +3,11 @@ from decimal import Decimal
 from uuid import uuid4
 
 from flask_jwt_extended import create_access_token
+from sqlalchemy import event
 
 from app.accounting import seed_default_accounts
 from app.extensions import db
-from app.models import AccountingAccount, Customer, Loan, User
+from app.models import AccountingAccount, Customer, Loan, Payment, User
 
 
 def _user(role="admin", name=None, email=None):
@@ -186,6 +187,90 @@ def _deposit_payload(collector, account_id, bank_id, payment_id, **overrides):
     }
     payload.update(overrides)
     return payload
+
+
+def test_undeposited_collections_returns_scalar_customer_and_collector_fields(app, client):
+    admin, collector, account_id, _bank_id, payment_id = _deposit_setup(app, client)
+    payment = db.session.get(Payment, payment_id)
+    customer = payment.loan.customer
+
+    response = client.get("/admin/collections/undeposited", headers=_headers(app, admin))
+
+    assert response.status_code == 200
+    row = next(item for item in response.get_json()["items"] if item["id"] == payment_id)
+    assert row["customer_id"] == customer.id
+    assert row["customer_name"] == customer.full_name
+    assert row["customer_code"] == customer.customer_code
+    assert row["collector_id"] == collector.id
+    assert row["collector_name"] == collector.name
+    assert row["collector_code"] == collector.collector_code
+    assert row["loan_number"] == payment.loan.loan_number
+    # Existing names remain available alongside normalized response names.
+    assert row["payment_id"] == row["id"]
+    assert row["customer"] == row["customer_name"]
+    assert row["amount_already_deposited"] == row["amount_deposited"] == "0.00"
+    assert row["deposit_status"] == row["status"] == "UNDEPOSITED"
+    assert row["collection_account_id"] == account_id
+
+
+def test_undeposited_collections_resolves_account_collector_and_keeps_unknown_legacy_null(app, client):
+    admin, collector, _account_id, _bank_id, payment_id = _deposit_setup(app, client)
+    account_payment = db.session.get(Payment, payment_id)
+    account_payment.collector_id = None
+    legacy = Payment(
+        loan_id=account_payment.loan_id,
+        collection_date=date.today(),
+        amount_collected=Decimal("25.00"),
+        collected_by_id=admin.id,
+        collection_method="CASH_COLLECTOR",
+        receipt_number=f"LEGACY-{uuid4().hex}",
+        journal_id=account_payment.journal_id,
+        status="POSTED",
+        deposit_status="UNDEPOSITED",
+    )
+    db.session.add(legacy)
+    db.session.commit()
+
+    response = client.get("/admin/collections/undeposited", headers=_headers(app, admin))
+
+    rows = {item["id"]: item for item in response.get_json()["items"]}
+    assert rows[payment_id]["collector_id"] == collector.id
+    assert rows[payment_id]["collector_name"] == collector.name
+    assert rows[legacy.id]["customer_name"] == account_payment.loan.customer.full_name
+    assert rows[legacy.id]["collector_id"] is None
+    assert rows[legacy.id]["collector_name"] is None
+    assert rows[legacy.id]["collector_code"] is None
+
+
+def test_undeposited_collections_eager_loads_display_relationships(app, client):
+    admin, collector, account_id, _bank_id, payment_id = _deposit_setup(app, client)
+    original = db.session.get(Payment, payment_id)
+    for index in range(3):
+        db.session.add(Payment(
+            loan_id=original.loan_id, collection_date=date.today(),
+            amount_collected=Decimal("10.00"), collected_by_id=admin.id,
+            collection_method="CASH_COLLECTOR", collector_id=collector.id,
+            collection_account_id=account_id, receipt_number=f"QUERY-COUNT-{index}-{uuid4().hex}",
+            journal_id=original.journal_id, status="POSTED", deposit_status="UNDEPOSITED",
+        ))
+    db.session.commit()
+    statements = []
+
+    def record_statement(_conn, _cursor, statement, _parameters, _context, _executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            statements.append(statement)
+
+    event.listen(db.engine, "before_cursor_execute", record_statement)
+    try:
+        response = client.get("/admin/collections/undeposited", headers=_headers(app, admin))
+    finally:
+        event.remove(db.engine, "before_cursor_execute", record_statement)
+
+    assert response.status_code == 200
+    assert len(response.get_json()["items"]) == 4
+    # Authentication may issue its own fixed queries, but all payment display
+    # relationships must be served by the endpoint's single joined query.
+    assert sum("FROM payments" in statement for statement in statements) == 1
 
 
 def test_collection_deposit_preview_missing_account_returns_422(app, client):

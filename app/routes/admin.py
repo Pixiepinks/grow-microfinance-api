@@ -1689,17 +1689,30 @@ def admin_reverse_disbursement(loan_id):
 
 def _payment_summary(p):
     loan = p.loan
+    customer = loan.customer if loan else None
+    # New payments record the collector directly.  Older cash-collector payments
+    # can still be attributed authoritatively through their clearing account.
+    collector = p.collector or (p.collection_account.collector if p.collection_account else None)
     return {
+        "id": p.id,
         "payment_id": p.id,
         "receipt_number": p.receipt_number,
-        "customer": loan.customer.full_name if loan and loan.customer else None,
-        "customer_id": loan.customer_id if loan else None,
+        "customer": customer.full_name if customer else None,
+        "customer_id": customer.id if customer else None,
+        "customer_name": customer.full_name if customer else None,
+        "customer_code": customer.customer_code if customer else None,
+        "nic_number": customer.nic_number if customer else None,
+        "collector_id": collector.id if collector else None,
+        "collector_name": collector.name if collector else None,
+        "collector_code": collector.collector_code if collector else None,
         "loan_id": p.loan_id,
         "loan_number": loan.loan_number if loan else None,
         "payment_date": (p.payment_date or p.collection_date).isoformat() if (p.payment_date or p.collection_date) else None,
         "amount_collected": f"{acct_money(p.amount_collected):.2f}",
+        "amount_deposited": f"{acct_money(p.deposited_amount):.2f}",
         "amount_already_deposited": f"{acct_money(p.deposited_amount):.2f}",
         "undeposited_amount": f"{acct_money(p.undeposited_amount):.2f}",
+        "status": p.deposit_status,
         "deposit_status": p.deposit_status,
         "collection_account": p.collection_account.account_name if p.collection_account else None,
         "collection_account_id": p.collection_account_id,
@@ -1709,7 +1722,11 @@ def _payment_summary(p):
 @admin_bp.route("/collections/undeposited", methods=["GET"], strict_slashes=False)
 @role_required(["admin"])
 def undeposited_collections():
-    q = Payment.query.options(joinedload(Payment.loan).joinedload(Loan.customer)).filter(
+    q = Payment.query.options(
+        joinedload(Payment.loan).joinedload(Loan.customer),
+        joinedload(Payment.collector),
+        joinedload(Payment.collection_account).joinedload(AccountingAccount.collector),
+    ).filter(
         Payment.reversed_at.is_(None),
         Payment.collection_method == "CASH_COLLECTOR",
         Payment.status == "POSTED",
