@@ -19,6 +19,7 @@ from ..models import (
     LoanApplicationDocument,
     LoanLedger,
     Payment,
+    PaymentAllocation,
     User,
     AccountingAccount,
     AccountingJournalLine,
@@ -28,7 +29,7 @@ from ..models import (
     AccountingSetting,
     CustomerCreditBalance,
 )
-from ..accounting import log_audit, post_loan_disbursement, AccountingError, accrue_due_loan_interest, reverse_payment, reverse_loan_disbursement, money as acct_money, preview_collection_deposit, create_collection_deposit, reverse_collection_deposit, collector_cash_position, account_subtype, allocate_payment, post_loan_payment, validate_collection_account, repair_unposted_payment, require_open_accounting_period, ValidationError, preview_loan_disbursement, preview_loan_application_disbursement, CALCULATION_METHODS, is_funding_account, is_active_account, is_posting_account
+from ..accounting import log_audit, post_loan_disbursement, AccountingError, accrue_due_loan_interest, reverse_payment, reverse_loan_disbursement, money as acct_money, preview_collection_deposit, create_collection_deposit, reverse_collection_deposit, collector_cash_position, account_subtype, allocate_payment, post_loan_payment, validate_collection_account, repair_unposted_payment, require_open_accounting_period, ValidationError, preview_loan_disbursement, preview_loan_application_disbursement, CALCULATION_METHODS, is_funding_account, is_active_account, is_posting_account, create_draft_journal, post_journal, resolve_system_account, customer_advance_account, generate_receipt_number
 from ..loan_ledger import (
     daily_interest_rate,
     generate_loan_ledger,
@@ -713,6 +714,116 @@ def get_loan(loan_id):
     return jsonify(payload)
 
 
+def _post_settlement_response(payment):
+    loan = payment.loan
+    outstanding = acct_money(sum((max(Decimal("0.00"), acct_money(e.delay_interest_accrued) - acct_money(e.delay_interest_paid) - acct_money(e.delay_interest_waived)) for e in loan.ledger_entries), Decimal("0.00")))
+    credit = CustomerCreditBalance.query.filter_by(payment_id=payment.id).first()
+    balance = acct_money(sum((acct_money(c.available_amount) for c in CustomerCreditBalance.query.filter_by(customer_id=loan.customer_id).filter(CustomerCreditBalance.status.in_(("AVAILABLE", "PARTIALLY_APPLIED"))).all()), Decimal("0.00")))
+    return {
+        "success": True, "loan_status": serialize_loan_status(loan),
+        "payment_amount": f"{acct_money(payment.amount_collected):.2f}",
+        "delay_interest_paid": f"{acct_money(payment.penalty_paid):.2f}",
+        "delay_interest_outstanding": f"{outstanding:.2f}",
+        "customer_credit_created": f"{acct_money(payment.other_fee_paid):.2f}",
+        "customer_credit_balance": f"{balance:.2f}",
+        "journal_entry_id": payment.journal_id, "payment_id": payment.id,
+        "idempotency_key": payment.idempotency_key,
+        "customer_credit_id": credit.id if credit else None,
+    }
+
+
+@admin_bp.route("/loans/<int:loan_id>/post-settlement-payment", methods=["POST"], strict_slashes=False)
+@role_required(["admin"])
+def record_post_settlement_payment(loan_id):
+    """Collect delay interest and customer advances without reopening a settled loan."""
+    data = request.get_json(silent=True) or {}
+    loan = Loan.query.options(joinedload(Loan.ledger_entries)).get(loan_id)
+    if not loan:
+        return jsonify({"error": "loan_not_found", "message": "Loan not found"}), 404
+    if str(loan.status or "").strip().upper() != "SETTLED":
+        return jsonify({"error": "loan_not_settled", "message": "Use normal Record Payment while the loan is active or has a contractual balance."}), 409
+    try:
+        amount = acct_money(Decimal(str(data.get("amount", data.get("amount_collected", "0")))))
+    except Exception:
+        return jsonify({"error": "invalid_amount", "message": "amount must be a valid currency amount"}), 400
+    if amount <= 0:
+        return jsonify({"error": "invalid_amount", "message": "amount must be greater than zero"}), 400
+
+    principal_outstanding = acct_money(sum((max(Decimal("0.00"), acct_money(e.principal_amount) - acct_money(e.principal_paid)) for e in loan.ledger_entries), Decimal()))
+    interest_outstanding = acct_money(sum((max(Decimal("0.00"), acct_money(e.interest_amount) - acct_money(e.interest_paid) - acct_money(e.waived_interest_amount)) for e in loan.ledger_entries), Decimal()))
+    if principal_outstanding > Decimal("0.01") or interest_outstanding > Decimal("0.01"):
+        return jsonify({"error": "contractual_balance_outstanding", "message": "Use normal Record Payment because contractual principal or interest remains outstanding."}), 409
+
+    reference = str(data.get("reference_number") or data.get("transaction_reference") or "").strip() or None
+    request_key = str(request.headers.get("Idempotency-Key") or data.get("idempotency_key") or reference or "").strip()
+    if not request_key:
+        return jsonify({"error": "idempotency_key_required", "message": "Idempotency-Key or reference_number is required"}), 400
+    idempotency_key = f"POST_SETTLEMENT_PAYMENT:{loan.id}:{request_key}"
+    existing = Payment.query.filter_by(idempotency_key=idempotency_key).first()
+    if existing:
+        return jsonify(_post_settlement_response(existing)), 200
+
+    method = str(data.get("collection_method") or data.get("payment_method") or "CASH_OFFICE").upper()
+    method = "CASH_OFFICE" if method == "CASH" else "BANK_TRANSFER" if method == "BANK" else method
+    collector_id = data.get("collector_id")
+    account_id = data.get("receiving_account_id") or data.get("collection_account_id") or data.get("receipt_account_id")
+    try:
+        payment_date = date.fromisoformat(data.get("payment_date") or data.get("collection_date")) if (data.get("payment_date") or data.get("collection_date")) else date.today()
+        require_open_accounting_period(payment_date)
+        account = AccountingAccount.query.get(int(account_id)) if account_id is not None else resolve_system_account("DEFAULT_CASH_COLLECTION_ACCOUNT" if method == "CASH_OFFICE" else "DEFAULT_BANK_COLLECTION_ACCOUNT")
+        account = validate_collection_account(account, method, collector_id)
+
+        delay_outstanding = acct_money(sum((max(Decimal("0.00"), acct_money(e.delay_interest_accrued) - acct_money(e.delay_interest_paid) - acct_money(e.delay_interest_waived)) for e in loan.ledger_entries), Decimal()))
+        delay_payment = min(amount, delay_outstanding)
+        credit_amount = acct_money(amount - delay_payment)
+        user_id = int(get_jwt_identity())
+        payment = Payment(loan_id=loan.id, collection_date=payment_date, payment_date=payment_date, accounting_date=payment_date,
+            amount_collected=amount, principal_paid=Decimal("0.00"), interest_paid=Decimal("0.00"), penalty_paid=delay_payment,
+            other_fee_paid=credit_amount, collected_by_id=user_id, collector_id=int(collector_id) if collector_id else None,
+            payment_method=method, collection_method=method, transaction_reference=reference, bank_reference=reference,
+            remarks=data.get("notes") or data.get("remarks"), receipt_account_id=account.id, collection_account_id=account.id,
+            transaction_type="POST_SETTLEMENT_PAYMENT", idempotency_key=idempotency_key,
+            deposit_status="UNDEPOSITED" if method == "CASH_COLLECTOR" else "NOT_APPLICABLE")
+        db.session.add(payment); db.session.flush()
+        payment.receipt_number = generate_receipt_number(payment_date)
+
+        remaining = delay_payment
+        for ledger in loan.ledger_entries:
+            available = max(Decimal("0.00"), acct_money(ledger.delay_interest_accrued) - acct_money(ledger.delay_interest_paid) - acct_money(ledger.delay_interest_waived))
+            applied = min(remaining, available)
+            if applied > 0:
+                ledger.delay_interest_paid = acct_money(ledger.delay_interest_paid + applied)
+                db.session.add(PaymentAllocation(payment_id=payment.id, loan_id=loan.id, ledger_id=ledger.id, allocation_type="DELAY_INTEREST", amount=applied))
+                remaining = acct_money(remaining - applied)
+
+        lines = [{"account_id": account.id, "debit": amount, "customer_id": loan.customer_id, "loan_id": loan.id, "payment_id": payment.id}]
+        if delay_payment:
+            lines.append({"account_id": resolve_system_account("DELAY_INTEREST_RECEIVABLE").id, "credit": delay_payment, "customer_id": loan.customer_id, "loan_id": loan.id, "payment_id": payment.id})
+        if credit_amount:
+            lines.append({"account_id": customer_advance_account().id, "credit": credit_amount, "customer_id": loan.customer_id, "loan_id": loan.id, "payment_id": payment.id})
+        journal = post_journal(create_draft_journal(payment_date, f"Post-settlement payment – {loan.loan_number}", lines, "POST_SETTLEMENT_PAYMENT", payment.id, "PAYMENTS", user_id, f"POST_SETTLEMENT_PAYMENT:{payment.id}"), user_id)
+        payment.journal_id = journal.id
+        if credit_amount:
+            db.session.add(CustomerCreditBalance(customer_id=loan.customer_id, loan_id=loan.id, payment_id=payment.id,
+                credit_number=f"GROW-CR-{payment.id:08d}", credit_date=payment_date, source_type="POST_SETTLEMENT_PAYMENT", source_id=str(payment.id),
+                original_amount=credit_amount, available_amount=credit_amount, applied_amount=Decimal("0.00"), refunded_amount=Decimal("0.00"),
+                status="AVAILABLE", reference=reference, remarks=payment.remarks, journal_entry_id=journal.id, created_by_id=user_id))
+        db.session.flush()
+        loan.customer_credit_balance = acct_money(sum((acct_money(c.available_amount) for c in CustomerCreditBalance.query.filter_by(loan_id=loan.id).filter(CustomerCreditBalance.status.in_(("AVAILABLE", "PARTIALLY_APPLIED"))).all()), Decimal()))
+        log_audit("POST_SETTLEMENT_PAYMENT", "Payment", payment.id, user_id, {"loan_id": loan.id, "delay_interest": str(delay_payment), "customer_credit": str(credit_amount)})
+        db.session.commit()
+    except (AccountingError, ValueError, TypeError) as exc:
+        db.session.rollback()
+        return jsonify({"error": "post_settlement_payment_failed", "message": str(exc)}), 422
+    except IntegrityError:
+        db.session.rollback()
+        existing = Payment.query.filter_by(idempotency_key=idempotency_key).first()
+        if existing:
+            return jsonify(_post_settlement_response(existing)), 200
+        raise
+    return jsonify(_post_settlement_response(payment)), 201
+
+
 @admin_bp.route("/loans/<int:loan_id>/settlement-reconciliation/preview", methods=["POST"], strict_slashes=False)
 @admin_bp.route("/loans/<int:loan_id>/reconciliation/preview", methods=["POST"], strict_slashes=False)
 @role_required(["admin"])
@@ -999,8 +1110,12 @@ def _loan_to_dict(loan: Loan) -> dict:
             else None
         ),
         "status": serialize_loan_status(loan),
-        "total_paid": float(totals["cash_paid"]),
+        "total_paid": float(totals["contractual_cash_paid"]),
         "cash_paid": float(totals["cash_paid"]),
+        "contractual_cash_paid": float(totals["contractual_cash_paid"]),
+        "post_settlement_cash_received": float(totals["post_settlement_cash_received"]),
+        "total_cash_received": float(totals["total_cash_received"]),
+        "customer_credit_created": float(totals["customer_credit_created"]),
         "principal_paid": float(totals["principal_paid"]),
         "normal_interest_paid": float(totals["normal_interest_paid"]),
         "delay_interest_paid": float(totals["delay_interest_paid"]),
@@ -1031,7 +1146,7 @@ def _loan_to_dict(loan: Loan) -> dict:
         "unaccrued_due_interest": float(sum((acct_money(e.interest_amount) for e in loan.ledger_entries if (not e.interest_accrued and e.due_date and e.due_date <= date.today())), Decimal("0.00"))),
         "future_interest": float(sum((acct_money(e.interest_amount) for e in loan.ledger_entries if e.due_date and e.due_date > date.today()), Decimal("0.00"))),
         "interest_receivable_balance": float(sum((acct_money(e.interest_amount) - acct_money(e.interest_paid) for e in loan.ledger_entries if e.interest_accrued), Decimal("0.00"))),
-        "delay_interest_receivable_balance": float(sum((acct_money(e.delay_interest_accrued) - acct_money(e.delay_interest_paid) for e in loan.ledger_entries), Decimal("0.00"))),
+        "delay_interest_receivable_balance": float(sum((max(Decimal("0.00"), acct_money(e.delay_interest_accrued) - acct_money(e.delay_interest_paid) - acct_money(e.delay_interest_waived)) for e in loan.ledger_entries), Decimal("0.00"))),
         "principal_receivable_balance": float(sum((acct_money(e.principal_amount) - acct_money(e.principal_paid) for e in loan.ledger_entries), Decimal("0.00"))),
     }
 
@@ -1097,6 +1212,18 @@ def get_loan_ledger(loan_id):
     if not loan.ledger_entries:
         generate_loan_ledger(loan)
         db.session.commit()
+    post_settlement_transactions = []
+    for payment in Payment.query.filter_by(loan_id=loan.id, transaction_type="POST_SETTLEMENT_PAYMENT").filter(Payment.reversed_at.is_(None)).order_by(Payment.collection_date, Payment.id).all():
+        post_settlement_transactions.append({
+            "payment_id": payment.id,
+            "date": (payment.payment_date or payment.collection_date).isoformat(),
+            "amount": f"{acct_money(payment.amount_collected):.2f}",
+            "delay_interest_paid": f"{acct_money(payment.penalty_paid):.2f}",
+            "customer_credit": f"{acct_money(payment.other_fee_paid):.2f}",
+            "payment_method": payment.collection_method or payment.payment_method,
+            "reference": payment.transaction_reference,
+            "journal_entry_id": payment.journal_id,
+        })
     return jsonify(
         {
             "loan": _loan_to_dict(loan),
@@ -1104,6 +1231,7 @@ def get_loan_ledger(loan_id):
             "ledger": [_ledger_to_dict(entry) for entry in loan.ledger_entries],
             "items": [_ledger_to_dict(entry) for entry in loan.ledger_entries],
             "totals": ledger_totals(loan),
+            "post_settlement_transactions": post_settlement_transactions,
         }
     )
 
