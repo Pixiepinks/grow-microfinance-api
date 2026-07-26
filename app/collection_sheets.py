@@ -5,9 +5,9 @@ from decimal import Decimal, InvalidOperation
 from sqlalchemy import func, or_, text
 
 from .extensions import db
-from .models import (AccountingAccount, AccountingJournalEntry, CollectionSheet,
+from .models import (AccountingAccount, AccountingJournalEntry, AccountingJournalLine, CollectionSheet,
                      CollectionSheetExpense, CollectionSheetItem, Customer, Loan,
-                     Payment, User)
+                     Payment, User, CollectionDepositAllocation)
 from .accounting import (AccountingError, account_subtype, allocate_payment,
                          create_draft_journal, is_active_account, is_posting_account,
                          log_audit, money, post_journal, post_loan_payment,
@@ -219,28 +219,143 @@ def clear_reconciled_payments(sheet):
 
 
 def clearance_repair_report(sheet, apply=False):
-    """Preview or idempotently repair metadata only for an existing reconciled sheet."""
-    if sheet.status != "RECONCILED":
-        raise SheetError("Only RECONCILED collection sheets can be repaired", 409, sheet_status=sheet.status)
+    """Preview or idempotently repair one known legacy sheet's metadata only."""
+    expected = {
+        "CS-20260313-0001": {
+            "gross": Decimal("12600.00"), "expenses": Decimal("0.00"),
+            "actual": Decimal("12600.00"), "difference": Decimal("0.00"),
+            "amounts": [Decimal("2100.00")] * 4 + [Decimal("4200.00")],
+        }
+    }.get(sheet.sheet_number)
+    if not expected:
+        raise SheetError("This command is restricted to an explicitly approved historical sheet", 409)
+
+    # These are deliberately redundant production guardrails.  In particular, do
+    # not derive the expected values from the row that is about to be repaired.
+    errors = []
+    recalculate(sheet)
+    if sheet.status != "RECONCILED": errors.append("status is not RECONCILED")
+    if money(sheet.gross_collection) != expected["gross"]: errors.append("gross collection is not 12600.00")
+    if money(sheet.total_expenses) != expected["expenses"]: errors.append("expenses are not 0.00")
+    if money(sheet.actual_deposit or 0) != expected["actual"]: errors.append("actual deposit is not 12600.00")
+    if money(sheet.difference) != expected["difference"]: errors.append("difference is not 0.00")
+    if money(sheet.expected_deposit) != expected["gross"]: errors.append("expected deposit is not 12600.00")
+    item_amounts = sorted(money(item.amount) for item in sheet.items)
+    if item_amounts != expected["amounts"]: errors.append("sheet items do not match 4200.00 + four 2100.00 receipts")
+    if len(sheet.items) != 5: errors.append("sheet does not contain exactly five items")
+    journal = db.session.get(AccountingJournalEntry, sheet.bank_journal_id) if sheet.bank_journal_id else None
+    if not journal: errors.append("existing bank deposit journal is missing")
+    elif (journal.status != "POSTED" or journal.source_type != "COLLECTION_SHEET_DEPOSIT"
+          or journal.source_id != sheet.id or money(journal.total_debit) != expected["actual"]
+          or money(journal.total_credit) != expected["actual"]):
+        errors.append("existing bank deposit journal is not the posted 12600.00 journal for this sheet")
+    elif (sum((money(line.debit) for line in journal.lines if line.account_id == sheet.bank_account_id), Decimal("0")) != expected["actual"]
+          or sum((money(line.credit) for line in journal.lines
+                  if line.account_id == sheet.collector.default_collection_account_id), Decimal("0")) != expected["actual"]):
+        errors.append("existing deposit journal does not debit the sheet bank and credit collector clearing by 12600.00")
+
     rows = []
+    payment_total = Decimal("0.00")
     for item in sorted(sheet.items, key=lambda row: row.id):
         payment = item.payment
         if not payment:
-            rows.append({"payment_id": None, "receipt_number": None, "error": "generated payment is missing"})
+            errors.append(f"item {item.id} generated payment is missing")
             continue
+        payment_total += money(payment.amount_collected)
+        if money(payment.amount_collected) != money(item.amount): errors.append(f"payment {payment.id} amount does not match its item")
+        if payment.loan_id != item.loan_id: errors.append(f"payment {payment.id} loan does not match its item")
+        if payment.collector_id != sheet.collector_id: errors.append(f"payment {payment.id} collector does not match the sheet")
+        if payment.collection_method != "CASH_COLLECTOR" or payment.status != "POSTED" or not payment.journal_id or payment.reversed_at:
+            errors.append(f"payment {payment.id} is not an unreversed posted collector payment")
+        allocations = CollectionDepositAllocation.query.filter_by(payment_id=payment.id).all()
         rows.append({
             "payment_id": payment.id, "receipt_number": payment.receipt_number,
+            "customer": item.customer.full_name if item.customer else None,
+            "loan_number": item.loan.loan_number if item.loan else None,
             "collected_amount": f"{money(payment.amount_collected):.2f}",
             "current_amount_deposited": f"{money(payment.deposited_amount):.2f}",
+            "current_amount_undeposited": f"{money(payment.undeposited_amount):.2f}",
+            "current_deposit_status": payment.deposit_status,
             "current_clearance_status": payment.collection_clearance_status,
-            "linked_deposit": payment.collection_sheet_deposit_journal_id,
+            "linked_collection_sheet": payment.collection_sheet.sheet_number if payment.collection_sheet else None,
+            "linked_deposit_journal": payment.collection_sheet_deposit_journal_id,
+            "linked_deposit_batches": [a.deposit_batch_id for a in allocations],
             "proposed_clearance_status": "CLEARED",
-            "proposed_linked_deposit": sheet.bank_journal_id,
+            "proposed_deposit_status": "DEPOSITED",
+            "proposed_amount_deposited": f"{money(payment.amount_collected):.2f}",
+            "proposed_amount_undeposited": "0.00",
+            "proposed_linked_deposit_journal": sheet.bank_journal_id,
         })
+    if payment_total != expected["gross"]: errors.append("source payment total is not 12600.00")
+    if len(rows) != 5: errors.append("exactly five source payments were not identified")
+    if errors:
+        raise SheetError("Collection sheet clearance repair validation failed", 409, errors=errors)
+
+    already_cleared = all(
+        row["current_clearance_status"] == "CLEARED"
+        and row["current_amount_deposited"] == row["collected_amount"]
+        and row["linked_collection_sheet"] == sheet.sheet_number
+        and row["linked_deposit_journal"] == sheet.bank_journal_id
+        for row in rows
+    )
     if apply:
         clear_reconciled_payments(sheet)
     return {"mode": "apply" if apply else "preview", "sheet_number": sheet.sheet_number,
-            "sheet_status": sheet.status, "payments": rows, "accounting_changes": "NONE"}
+            "sheet_status": sheet.status, "bank_journal_id": sheet.bank_journal_id,
+            "bank_journal_number": journal.journal_no, "already_cleared": already_cleared,
+            "message": "No repair required. Collection Sheet receipts are already cleared." if already_cleared else None,
+            "payments": rows, "totals": {"receipt_count": len(rows), "collected": f"{payment_total:.2f}",
+                "currently_deposited": f"{sum((Decimal(r['current_amount_deposited']) for r in rows), Decimal('0')):.2f}",
+                "currently_undeposited": f"{sum((Decimal(r['current_amount_undeposited']) for r in rows), Decimal('0')):.2f}",
+                "proposed_cleared": f"{payment_total:.2f}"},
+            "accounting_journal_changes": "NONE", "customer_payment_changes": "NONE",
+            "loan_allocation_changes": "NONE", "bank_cash_movement": "NONE"}
+
+
+def clearance_safety_snapshot(sheet):
+    """Return immutable financial state used to prove a metadata repair is isolated."""
+    payment_ids = [item.payment_id for item in sheet.items if item.payment_id]
+    loan_ids = [item.loan_id for item in sheet.items]
+    payments = Payment.query.filter(Payment.id.in_(payment_ids)).order_by(Payment.id).all()
+    accounts = [sheet.bank_account_id]
+    if sheet.collector and sheet.collector.default_collection_account_id:
+        accounts.append(sheet.collector.default_collection_account_id)
+    account_balances = {}
+    for account_id in filter(None, accounts):
+        debit, credit = db.session.query(
+            func.coalesce(func.sum(AccountingJournalLine.debit), 0),
+            func.coalesce(func.sum(AccountingJournalLine.credit), 0),
+        ).join(AccountingJournalEntry).filter(
+            AccountingJournalLine.account_id == account_id,
+            AccountingJournalEntry.status == "POSTED",
+        ).one()
+        account_balances[str(account_id)] = f"{money(Decimal(debit) - Decimal(credit)):.2f}"
+    receivable_balances = {}
+    receivable_rows = db.session.query(
+        AccountingJournalLine.loan_id, AccountingAccount.account_subtype,
+        func.coalesce(func.sum(AccountingJournalLine.debit), 0),
+        func.coalesce(func.sum(AccountingJournalLine.credit), 0),
+    ).join(AccountingJournalEntry).join(AccountingAccount).filter(
+        AccountingJournalLine.loan_id.in_(loan_ids), AccountingJournalEntry.status == "POSTED",
+        AccountingAccount.account_subtype.in_(["LOAN_RECEIVABLE", "INTEREST_RECEIVABLE"]),
+    ).group_by(AccountingJournalLine.loan_id, AccountingAccount.account_subtype).all()
+    for loan_id, subtype, debit, credit in receivable_rows:
+        receivable_balances[f"{loan_id}:{subtype}"] = f"{money(Decimal(debit) - Decimal(credit)):.2f}"
+    return {
+        "journal_count": AccountingJournalEntry.query.count(),
+        "journal_line_count": AccountingJournalLine.query.count(),
+        "account_balances": account_balances,
+        "loan_receivable_balances": receivable_balances,
+        "payment_financials": [{"id": p.id, "amount": str(p.amount_collected), "principal": str(p.principal_paid),
+            "interest": str(p.interest_paid), "penalty": str(p.penalty_paid), "other_fee": str(p.other_fee_paid),
+            "journal_id": p.journal_id} for p in payments],
+        "loan_financials": [{"id": loan.id, "principal": str(loan.principal_amount),
+            "total_payable": str(loan.total_payable), "cash_paid_cache": str(loan.cash_paid_cache),
+            "outstanding_amount": str(loan.outstanding_amount)}
+            for loan in Loan.query.filter(Loan.id.in_(loan_ids)).order_by(Loan.id).all()],
+        "sheet": {"gross": str(sheet.gross_collection), "actual": str(sheet.actual_deposit),
+            "difference": str(sheet.difference), "status": sheet.status},
+    }
 
 
 def reverse(sheet, user_id, reason, reversal_date=None):

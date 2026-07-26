@@ -1,6 +1,7 @@
 import os
 import time
 import click
+import json
 from decimal import Decimal
 from datetime import date
 from flask import Flask, jsonify, request
@@ -228,29 +229,52 @@ def create_app():
 
     @app.cli.command("repair-collection-sheet-clearance")
     @click.option("--sheet-number", required=True)
-    @click.option("--preview", "preview_mode", is_flag=True, default=False)
+    @click.option("--preview", "preview_mode", is_flag=True, default=False, help="Preview only (the default).")
     @click.option("--apply", "apply_mode", is_flag=True, default=False)
     def repair_collection_sheet_clearance(sheet_number, preview_mode, apply_mode):
         """Repair receipt/deposit metadata without changing any accounting journal."""
-        if preview_mode == apply_mode:
-            raise click.ClickException("Specify exactly one of --preview or --apply")
-        from .collection_sheets import SheetError, clearance_repair_report
+        if preview_mode and apply_mode:
+            raise click.ClickException("Specify only one of --preview or --apply")
+        from sqlalchemy.engine import make_url
+        from .collection_sheets import (SheetError, clearance_repair_report,
+                                        clearance_safety_snapshot, clear_reconciled_payments)
         from .models import CollectionSheet
-        sheet = CollectionSheet.query.filter_by(sheet_number=sheet_number).first()
+        url = make_url(app.config["SQLALCHEMY_DATABASE_URI"])
+        click.echo(json.dumps({"database": {"host": url.host or "local",
+            "name": url.database or "memory", "environment": os.getenv("RAILWAY_ENVIRONMENT_NAME")
+            or os.getenv("FLASK_ENV", "development")}}, indent=2))
+        query = CollectionSheet.query.filter_by(sheet_number=sheet_number)
+        sheet = query.with_for_update().first() if apply_mode else query.first()
         if not sheet:
             raise click.ClickException("Collection sheet not found")
         try:
-            report = clearance_repair_report(sheet, apply=apply_mode)
+            report = clearance_repair_report(sheet, apply=False)
         except SheetError as exc:
-            raise click.ClickException(str(exc)) from exc
+            details = "; ".join(exc.details.get("errors", []))
+            raise click.ClickException(f"{exc}{': ' + details if details else ''}") from exc
         if apply_mode:
+            before = clearance_safety_snapshot(sheet)
+            if not report["already_cleared"]:
+                clear_reconciled_payments(sheet)
+            # clear_reconciled_payments changed only ORM metadata; flush before the
+            # invariant check, but do not commit unless every financial value holds.
+            db.session.flush()
+            after = clearance_safety_snapshot(sheet)
+            if before != after:
+                db.session.rollback()
+                raise click.ClickException("Financial safety verification failed; all changes were rolled back")
             db.session.commit()
             # Re-read fields so output accurately confirms the final idempotent state.
             report = clearance_repair_report(sheet, apply=False)
             report["mode"] = "apply"
+            report["financial_state_unchanged"] = True
         else:
             db.session.rollback()
-        click.echo(report)
+        click.echo(json.dumps(report, indent=2, sort_keys=True))
+        click.echo("ACCOUNTING JOURNAL CHANGES: NONE")
+        click.echo("CUSTOMER PAYMENT CHANGES: NONE")
+        click.echo("LOAN ALLOCATION CHANGES: NONE")
+        click.echo("BANK CASH MOVEMENT: NONE")
 
     @app.cli.command("reconcile-loan-paid-totals")
     @click.option("--preview", "preview_mode", is_flag=True, default=False, help="Report proposed cash-paid cache corrections.")
