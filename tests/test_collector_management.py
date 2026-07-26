@@ -336,3 +336,19 @@ def test_collection_deposit_posts_full_deposit_and_rolls_back_on_failure(app, cl
     assert failed.status_code == 422
     rolled_back_payment = db.session.get(__import__("app.models", fromlist=["Payment"]).Payment, payment2)
     assert rolled_back_payment.deposit_status == "UNDEPOSITED"
+
+
+def test_cleared_sheet_payment_is_hidden_and_cannot_be_deposited_again(app, client):
+    admin, collector, account_id, bank_id, payment_id = _deposit_setup(app, client)
+    payment = db.session.get(__import__("app.models", fromlist=["Payment"]).Payment, payment_id)
+    payment.collection_clearance_status = "CLEARED"
+    db.session.commit()
+
+    listing = client.get("/admin/collections/undeposited", headers=_headers(app, admin))
+    assert listing.status_code == 200
+    assert payment_id not in [row["payment_id"] for row in listing.get_json()["items"]]
+
+    rejected = client.post("/admin/collection-deposits", headers=_headers(app, admin),
+                           json=_deposit_payload(collector, account_id, bank_id, payment_id))
+    assert rejected.status_code == 422
+    assert "already cleared" in rejected.get_json()["message"]

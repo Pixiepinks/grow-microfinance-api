@@ -159,7 +159,8 @@ def approve_and_post(sheet_id, user_id):
                               collector_id=sheet.collector_id, payment_method="CASH_COLLECTOR", collection_method="CASH_COLLECTOR",
                               collection_account_id=clearing.id, receipt_account_id=clearing.id,
                               transaction_reference=sheet.sheet_number, remarks=f"Collection sheet {sheet.sheet_number}",
-                              idempotency_key=f"COLLECTION_SHEET:{sheet.id}:ITEM:{item.id}")
+                              idempotency_key=f"COLLECTION_SHEET:{sheet.id}:ITEM:{item.id}",
+                              collection_sheet_id=sheet.id, collection_clearance_status="UNDEPOSITED")
             db.session.add(payment); db.session.flush(); post_loan_payment(payment, user_id, clearing)
             item.payment_id = payment.id; item.posting_status = "POSTED"; item.posting_error = None
         for expense in sheet.expenses:
@@ -178,7 +179,9 @@ def approve_and_post(sheet_id, user_id):
             sheet.bank_journal_id = post_journal(entry, user_id).id
         now = datetime.utcnow(); sheet.approved_by_id = user_id; sheet.approved_at = now; sheet.posted_at = now
         sheet.status = "RECONCILED" if sheet.difference == 0 else "POSTED"
-        if sheet.status == "RECONCILED": sheet.reconciled_at = now
+        if sheet.status == "RECONCILED":
+            sheet.reconciled_at = now
+            clear_reconciled_payments(sheet)
         sheet.posting_key = f"COLLECTION_SHEET:{sheet.id}:POST"
         result = serialize(sheet, True); result["collector_clearing_impact"] = f"{money(sheet.expected_deposit - Decimal(sheet.actual_deposit or 0)):.2f}"
         sheet.posting_result = result
@@ -189,6 +192,57 @@ def approve_and_post(sheet_id, user_id):
         raise SheetError("Collection sheet posting failed", row=getattr(locals().get("item"), "id", None), reason=str(exc))
 
 
+def clear_reconciled_payments(sheet):
+    """Attach receipt metadata to the existing sheet bank journal; never post accounting."""
+    if sheet.status != "RECONCILED":
+        return
+    payments = [db.session.get(Payment, item.payment_id) for item in sorted(sheet.items, key=lambda row: row.id) if item.payment_id]
+    remaining = money(sheet.actual_deposit or 0)
+    remaining_gross = sum((money(p.amount_collected) for p in payments), Decimal("0.00"))
+    for index, payment in enumerate(payments):
+        amount = money(payment.amount_collected)
+        # Allocate only real bank cash.  Expense-funded clearance is represented by
+        # collection_clearance_status rather than inflating deposited_amount.
+        if remaining <= 0:
+            bank_share = Decimal("0.00")
+        elif index == len(payments) - 1 or remaining_gross == amount:
+            bank_share = min(amount, remaining)
+        else:
+            bank_share = min(amount, money(remaining * amount / remaining_gross))
+        payment.deposited_amount = bank_share
+        payment.deposit_status = "DEPOSITED" if bank_share >= amount else "PARTIALLY_DEPOSITED"
+        payment.collection_clearance_status = "CLEARED"
+        payment.collection_sheet_id = sheet.id
+        payment.collection_sheet_deposit_journal_id = sheet.bank_journal_id
+        remaining -= bank_share
+        remaining_gross -= amount
+
+
+def clearance_repair_report(sheet, apply=False):
+    """Preview or idempotently repair metadata only for an existing reconciled sheet."""
+    if sheet.status != "RECONCILED":
+        raise SheetError("Only RECONCILED collection sheets can be repaired", 409, sheet_status=sheet.status)
+    rows = []
+    for item in sorted(sheet.items, key=lambda row: row.id):
+        payment = item.payment
+        if not payment:
+            rows.append({"payment_id": None, "receipt_number": None, "error": "generated payment is missing"})
+            continue
+        rows.append({
+            "payment_id": payment.id, "receipt_number": payment.receipt_number,
+            "collected_amount": f"{money(payment.amount_collected):.2f}",
+            "current_amount_deposited": f"{money(payment.deposited_amount):.2f}",
+            "current_clearance_status": payment.collection_clearance_status,
+            "linked_deposit": payment.collection_sheet_deposit_journal_id,
+            "proposed_clearance_status": "CLEARED",
+            "proposed_linked_deposit": sheet.bank_journal_id,
+        })
+    if apply:
+        clear_reconciled_payments(sheet)
+    return {"mode": "apply" if apply else "preview", "sheet_number": sheet.sheet_number,
+            "sheet_status": sheet.status, "payments": rows, "accounting_changes": "NONE"}
+
+
 def reverse(sheet, user_id, reason, reversal_date=None):
     if sheet.status not in {"POSTED", "RECONCILED"}: raise SheetError("Only posted collection sheets can be reversed", 409)
     if not reason: raise SheetError("Reversal reason is required")
@@ -197,7 +251,11 @@ def reverse(sheet, user_id, reason, reversal_date=None):
     for expense in sheet.expenses:
         if expense.journal_entry_id: reverse_journal(db.session.get(AccountingJournalEntry, expense.journal_entry_id), reversal_date, reason, user_id)
     for item in sheet.items:
-        if item.payment_id: reverse_payment(db.session.get(Payment, item.payment_id), reversal_date, reason, user_id); item.posting_status = "REVERSED"
+        if item.payment_id:
+            payment = db.session.get(Payment, item.payment_id)
+            payment.deposited_amount = Decimal("0.00"); payment.collection_clearance_status = "UNDEPOSITED"
+            payment.collection_sheet_deposit_journal_id = None
+            reverse_payment(payment, reversal_date, reason, user_id); item.posting_status = "REVERSED"
     sheet.status = "REVERSED"; sheet.reversed_at = datetime.utcnow(); sheet.reversed_by_id = user_id; sheet.reversal_reason = reason
     log_audit("COLLECTION_SHEET_REVERSE", "CollectionSheet", sheet.id, user_id, {"reason": reason})
     db.session.commit(); return serialize(sheet, True)

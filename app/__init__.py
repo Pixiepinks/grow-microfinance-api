@@ -226,6 +226,32 @@ def create_app():
         if preview_mode:
             db.session.rollback()
 
+    @app.cli.command("repair-collection-sheet-clearance")
+    @click.option("--sheet-number", required=True)
+    @click.option("--preview", "preview_mode", is_flag=True, default=False)
+    @click.option("--apply", "apply_mode", is_flag=True, default=False)
+    def repair_collection_sheet_clearance(sheet_number, preview_mode, apply_mode):
+        """Repair receipt/deposit metadata without changing any accounting journal."""
+        if preview_mode == apply_mode:
+            raise click.ClickException("Specify exactly one of --preview or --apply")
+        from .collection_sheets import SheetError, clearance_repair_report
+        from .models import CollectionSheet
+        sheet = CollectionSheet.query.filter_by(sheet_number=sheet_number).first()
+        if not sheet:
+            raise click.ClickException("Collection sheet not found")
+        try:
+            report = clearance_repair_report(sheet, apply=apply_mode)
+        except SheetError as exc:
+            raise click.ClickException(str(exc)) from exc
+        if apply_mode:
+            db.session.commit()
+            # Re-read fields so output accurately confirms the final idempotent state.
+            report = clearance_repair_report(sheet, apply=False)
+            report["mode"] = "apply"
+        else:
+            db.session.rollback()
+        click.echo(report)
+
     @app.cli.command("reconcile-loan-paid-totals")
     @click.option("--preview", "preview_mode", is_flag=True, default=False, help="Report proposed cash-paid cache corrections.")
     @click.option("--post", "post_mode", is_flag=True, default=False, help="Update only the loan cash-paid summary cache.")

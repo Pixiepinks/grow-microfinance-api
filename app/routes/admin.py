@@ -1714,6 +1714,9 @@ def _payment_summary(p):
         "undeposited_amount": f"{acct_money(p.undeposited_amount):.2f}",
         "status": p.deposit_status,
         "deposit_status": p.deposit_status,
+        "collection_clearance_status": p.collection_clearance_status,
+        "collection_sheet_id": p.collection_sheet_id,
+        "deposit_id": p.collection_sheet_deposit_journal_id,
         "collection_account": p.collection_account.account_name if p.collection_account else None,
         "collection_account_id": p.collection_account_id,
     }
@@ -1732,7 +1735,8 @@ def undeposited_collections():
         Payment.status == "POSTED",
         Payment.journal_id.isnot(None),
         Payment.deposit_status.in_(["UNDEPOSITED", "PARTIALLY_DEPOSITED"]),
-        Payment.amount_collected > Payment.deposited_amount,
+        Payment.collection_clearance_status != "CLEARED",
+        Payment.amount_collected - Payment.deposited_amount > Decimal("0.01"),
     )
     if request.args.get("collector_id"): q = q.filter(Payment.collector_id == int(request.args["collector_id"]))
     if request.args.get("account_id"): q = q.filter(Payment.collection_account_id == int(request.args["account_id"]))
