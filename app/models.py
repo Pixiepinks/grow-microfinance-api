@@ -638,6 +638,8 @@ class Payment(db.Model):
     reversed_by = db.Column(db.Integer, db.ForeignKey("users.id"))
     deposited_amount = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
     deposit_status = db.Column(db.String(30), nullable=False, default="NOT_APPLICABLE")
+    transaction_type = db.Column(db.String(40), nullable=False, default="LOAN_PAYMENT", index=True)
+    idempotency_key = db.Column(db.String(160), unique=True, index=True)
 
     @property
     def undeposited_amount(self):
