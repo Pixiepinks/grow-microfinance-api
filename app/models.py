@@ -858,12 +858,21 @@ class AccountingJournalLine(db.Model):
     description = db.Column(db.Text)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    is_reconciled = db.Column(db.Boolean, nullable=False, default=False, index=True)
+    reconciled_at = db.Column(db.DateTime)
+    reconciled_date = db.Column(db.Date)
+    reconciled_by_id = db.Column(db.Integer, db.ForeignKey("users.id"))
+    bank_reconciliation_id = db.Column(db.Integer, db.ForeignKey("bank_reconciliations.id"), index=True)
+    bank_statement_reference = db.Column(db.String(255))
+    reconciliation_note = db.Column(db.Text)
 
     journal_entry = relationship("AccountingJournalEntry", back_populates="lines")
     account = relationship("AccountingAccount")
     customer = relationship("Customer")
     loan = relationship("Loan")
     payment = relationship("Payment")
+    bank_reconciliation = relationship("BankReconciliation", back_populates="lines")
+    reconciled_by = relationship("User", foreign_keys=[reconciled_by_id])
 
     @property
     def debit_amount(self):
@@ -880,6 +889,48 @@ class AccountingJournalLine(db.Model):
     @credit_amount.setter
     def credit_amount(self, value):
         self.credit = value
+
+
+class BankReconciliation(db.Model):
+    __tablename__ = "bank_reconciliations"
+    __table_args__ = (
+        db.CheckConstraint("status in ('DRAFT','IN_PROGRESS','COMPLETED','REOPENED','CANCELLED')", name="ck_bank_reconciliations_status"),
+    )
+    id = db.Column(db.Integer, primary_key=True)
+    reconciliation_number = db.Column(db.String(40), nullable=False, unique=True, index=True)
+    bank_account_id = db.Column(db.Integer, db.ForeignKey("accounting_accounts.id"), nullable=False, index=True)
+    statement_date_from = db.Column(db.Date, nullable=False)
+    statement_date_to = db.Column(db.Date, nullable=False)
+    statement_opening_balance = db.Column(Numeric(18, 2), nullable=False)
+    statement_closing_balance = db.Column(Numeric(18, 2), nullable=False)
+    gl_opening_balance = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    gl_closing_balance = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    total_reconciled_debits = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    total_reconciled_credits = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    total_unreconciled_debits = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    total_unreconciled_credits = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    status = db.Column(db.String(20), nullable=False, default="DRAFT")
+    notes = db.Column(db.Text)
+    created_by_id = db.Column(db.Integer, db.ForeignKey("users.id"))
+    approved_by_id = db.Column(db.Integer, db.ForeignKey("users.id"))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    completed_at = db.Column(db.DateTime)
+    bank_account = relationship("AccountingAccount")
+    lines = relationship("AccountingJournalLine", back_populates="bank_reconciliation")
+
+
+class BankReconciliationAudit(db.Model):
+    __tablename__ = "bank_reconciliation_audits"
+    id = db.Column(db.Integer, primary_key=True)
+    bank_reconciliation_id = db.Column(db.Integer, db.ForeignKey("bank_reconciliations.id"), nullable=False, index=True)
+    action = db.Column(db.String(30), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"))
+    bank_account_id = db.Column(db.Integer, db.ForeignKey("accounting_accounts.id"), nullable=False)
+    journal_line_id = db.Column(db.Integer, db.ForeignKey("accounting_journal_lines.id"))
+    reconciliation_number = db.Column(db.String(40), nullable=False)
+    reason = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
 
 
 class AccountingSetting(db.Model):
