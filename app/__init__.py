@@ -115,6 +115,18 @@ def create_app():
     app.register_blueprint(bank_reconciliation_bp)
     app.register_blueprint(bank_reconciliation_compat_bp)
 
+    bank_reconciliation_routes = []
+    for rule in sorted(app.url_map.iter_rules(), key=lambda item: item.rule):
+        methods = sorted(rule.methods - {"HEAD", "OPTIONS"})
+        if rule.endpoint.startswith("bank_reconciliation."):
+            bank_reconciliation_routes.extend(
+                f"- {method} {rule.rule}" for method in methods
+            )
+    app.logger.info(
+        "BANK_RECONCILIATION_ROUTES_REGISTERED:\n%s",
+        "\n".join(bank_reconciliation_routes),
+    )
+
     with app.app_context():
         ensure_customers_lead_status_column()
         try:
