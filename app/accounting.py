@@ -627,11 +627,14 @@ def general_ledger(account_id=None, date_from=None, date_to=None, customer_id=No
     current_app.logger.info("general_ledger query", extra={"query_params": query_params or {}, "resolved_account_id": account.id, "resolved_account_code": account.account_code, "generated_filters": generated_filters, "journal_lines_found": len(rows)})
     for l in rows:
         running=money(running+signed(l)); td+=money(l.debit); tc+=money(l.credit); e=l.journal_entry
-        tx.append({"journal_date": e.journal_date.isoformat(), "journal_no": e.journal_no, "description": e.description, "reference_type": e.reference_type, "reference_id": e.reference_id, "debit": f"{money(l.debit):.2f}", "credit": f"{money(l.credit):.2f}", "running_balance": f"{running:.2f}", "customer_id": l.customer_id, "loan_id": l.loan_id})
+        tx.append({"journal_date": e.journal_date.isoformat(), "journal_no": e.journal_no, "description": e.description, "reference_type": e.reference_type, "reference_id": e.reference_id, "debit": f"{money(l.debit):.2f}", "credit": f"{money(l.credit):.2f}", "running_balance": f"{running:.2f}", "customer_id": l.customer_id, "loan_id": l.loan_id,
+                   "is_reconciled": bool(l.is_reconciled), "reconciled_date": l.reconciled_date.isoformat() if l.reconciled_date else None,
+                   "reconciliation_number": l.bank_reconciliation.reconciliation_number if l.bank_reconciliation else None,
+                   "bank_statement_reference": l.bank_statement_reference})
     return {"account": {"id": account.id, "account_code": account.account_code, "account_name": account.account_name, "account_type": account.account_type, "normal_balance": account.normal_balance}, "opening_balance": f"{money(opening):.2f}", "transactions": tx, "running_balance": f"{running:.2f}", "closing_balance": f"{running:.2f}", "total_debit": f"{money(td):.2f}", "total_credit": f"{money(tc):.2f}"}
 
 def ledger_csv(data):
-    out=StringIO(); w=csv.DictWriter(out, fieldnames=["journal_date","journal_no","description","reference_type","reference_id","debit","credit","running_balance","customer_id","loan_id"]); w.writeheader(); w.writerows(data["transactions"]); return out.getvalue()
+    out=StringIO(); w=csv.DictWriter(out, fieldnames=["journal_date","journal_no","description","reference_type","reference_id","debit","credit","running_balance","customer_id","loan_id","is_reconciled","reconciled_date","reconciliation_number","bank_statement_reference"]); w.writeheader(); w.writerows(data["transactions"]); return out.getvalue()
 
 def _issue(issue_type, severity, source_type, source_id, source_reference, description, route_type=None, route_id=None, **extra):
     if not issue_type or not severity or not source_type or source_id is None or not description:
@@ -1069,7 +1072,10 @@ def general_ledger(account_id=None, date_from=None, date_to=None, customer_id=No
     current_app.logger.info("general_ledger query", extra={"query_params": query_params or {}, "resolved_account_id": account.id, "journal_lines_found": len(rows)})
     for l in rows:
         running=money(running+signed(l)); td+=money(l.debit); tc+=money(l.credit); e=l.journal_entry; ctx=_line_context(l)
-        all_tx.append({"journal_entry_id": e.id, "journal_date": e.journal_date.isoformat(), "journal_no": e.journal_no, "description": e.description, "reference_type": e.reference_type, "reference_id": e.reference_id, "source_module": e.source_module, "debit": f"{money(l.debit):.2f}", "credit": f"{money(l.credit):.2f}", "running_balance": f"{running:.2f}", **ctx})
+        all_tx.append({"journal_entry_id": e.id, "journal_date": e.journal_date.isoformat(), "journal_no": e.journal_no, "description": e.description, "reference_type": e.reference_type, "reference_id": e.reference_id, "source_module": e.source_module, "debit": f"{money(l.debit):.2f}", "credit": f"{money(l.credit):.2f}", "running_balance": f"{running:.2f}", **ctx,
+                       "is_reconciled": bool(l.is_reconciled), "reconciled_date": l.reconciled_date.isoformat() if l.reconciled_date else None,
+                       "reconciliation_number": l.bank_reconciliation.reconciliation_number if l.bank_reconciliation else None,
+                       "bank_statement_reference": l.bank_statement_reference})
     expected = money(opening + td - tc) if account.normal_balance == "DEBIT" else money(opening + tc - td)
     if expected != money(running):
         raise AccountingError("General ledger invariant failed: closing balance does not match account-normal movement")
@@ -1087,7 +1093,7 @@ def general_ledger(account_id=None, date_from=None, date_to=None, customer_id=No
     return result
 
 def ledger_csv(data):
-    fields=["journal_entry_id","journal_date","journal_no","description","reference_type","reference_id","source_module","debit","credit","running_balance","customer_id","customer_number","customer_name","loan_id","loan_number","payment_id","collection_id"]
+    fields=["journal_entry_id","journal_date","journal_no","description","reference_type","reference_id","source_module","debit","credit","running_balance","customer_id","customer_number","customer_name","loan_id","loan_number","payment_id","collection_id","is_reconciled","reconciled_date","reconciliation_number","bank_statement_reference"]
     out=StringIO(); w=csv.DictWriter(out, fieldnames=fields, extrasaction="ignore"); w.writeheader(); w.writerows(data["transactions"]); return out.getvalue()
 
 # Phase 2 financial reporting
