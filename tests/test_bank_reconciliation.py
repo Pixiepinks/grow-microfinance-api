@@ -90,10 +90,21 @@ def test_create_route_registration_and_production_compatibility_alias(app, clien
         "statement_date_from": "2026-01-01", "statement_date_to": "2026-02-28",
         "statement_opening_balance": "0.00", "statement_closing_balance": "81565.54", "notes": "Draft"})
     assert response.status_code == 201
+    assert response.get_json()["success"] is True
     assert response.get_json()["reconciliation_number"] == "BR-20260228-0001"
     assert response.get_json()["status"] == "DRAFT"
     assert BankReconciliation.query.count() == 1
     assert AccountingJournalEntry.query.count() == journal_count
+
+    # Cross-origin POST callers must not rely on Flask's slash redirect. Both
+    # deployed and canonical create paths accept either spelling directly.
+    slash_response = client.post("/admin/bank-reconciliations/", headers=headers, json={
+        "bank_account_id": bank.id, "statement_date_from": "2026-03-01",
+        "statement_date_to": "2026-03-31", "statement_opening_balance": "0.00",
+        "statement_closing_balance": "0.00"})
+    assert slash_response.status_code == 201
+    assert client.options("/bank-reconciliations").status_code == 204
+    assert client.options("/bank-reconciliations/").status_code == 204
 
 
 def test_create_validation_and_authorization(app, client):

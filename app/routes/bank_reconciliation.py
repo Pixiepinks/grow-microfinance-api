@@ -103,8 +103,8 @@ def _serialize(rec):
             "completed_at": rec.completed_at.isoformat() if rec.completed_at else None}
 
 
-@bank_reconciliation_bp.route("/bank-reconciliations", methods=["POST"])
-@bank_reconciliation_compat_bp.route("/bank-reconciliations", methods=["POST"])
+@bank_reconciliation_bp.route("/bank-reconciliations", methods=["POST"], strict_slashes=False)
+@bank_reconciliation_compat_bp.route("/bank-reconciliations", methods=["POST"], strict_slashes=False)
 @role_required(["admin"])
 def create_reconciliation():
     data = request.get_json() or {}
@@ -127,7 +127,9 @@ def create_reconciliation():
     # The database-generated id makes number allocation atomic across workers.
     rec.reconciliation_number = f"BR-{end:%Y%m%d}-{rec.id:04d}"
     _audit(rec, "CREATED"); db.session.commit()
-    return jsonify(_serialize(rec)), 201
+    response = _serialize(rec)
+    response["success"] = True
+    return jsonify(response), 201
 
 
 @bank_reconciliation_bp.route("/bank-reconciliations", methods=["GET"])
