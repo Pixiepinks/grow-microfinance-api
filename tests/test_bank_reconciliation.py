@@ -5,7 +5,7 @@ from flask_jwt_extended import create_access_token
 
 from app.extensions import db
 from app.models import (AccountingAccount, AccountingJournalEntry, AccountingJournalLine,
-                        BankReconciliationAudit, User)
+                        BankReconciliation, BankReconciliationAudit, User)
 
 
 def _headers(app):
@@ -70,3 +70,53 @@ def test_completion_rejects_difference_and_non_bank_account(app, client):
     incomplete = client.post(f"/admin/bank-reconciliations/{rec_id}/complete", headers=headers)
     assert incomplete.status_code == 422
     assert incomplete.get_json()["message"].endswith("1.00)")
+
+
+def test_create_route_registration_and_production_compatibility_alias(app, client):
+    rules = {(rule.rule, method) for rule in app.url_map.iter_rules() for method in rule.methods}
+    assert ("/admin/bank-reconciliations", "POST") in rules
+    assert ("/bank-reconciliations", "POST") in rules
+    assert ("/admin/bank-reconciliations", "GET") in rules
+    assert ("/admin/bank-reconciliations/<int:rec_id>", "GET") in rules
+    assert ("/admin/bank-reconciliations/<int:rec_id>/lines", "POST") in rules
+    assert ("/admin/bank-reconciliations/<int:rec_id>/complete", "POST") in rules
+
+    _, headers = _headers(app)
+    bank = AccountingAccount(account_code="1010", account_name="Bank", account_type="ASSET",
+        normal_balance="DEBIT", account_subtype="BANK", is_active=True, allow_manual_posting=True)
+    db.session.add(bank); db.session.commit()
+    journal_count = AccountingJournalEntry.query.count()
+    response = client.post("/bank-reconciliations", headers=headers, json={"bank_account_id": bank.id,
+        "statement_date_from": "2026-01-01", "statement_date_to": "2026-02-28",
+        "statement_opening_balance": "0.00", "statement_closing_balance": "81565.54", "notes": "Draft"})
+    assert response.status_code == 201
+    assert response.get_json()["reconciliation_number"] == "BR-20260228-0001"
+    assert response.get_json()["status"] == "DRAFT"
+    assert BankReconciliation.query.count() == 1
+    assert AccountingJournalEntry.query.count() == journal_count
+
+
+def test_create_validation_and_authorization(app, client):
+    _, headers = _headers(app)
+    bank = AccountingAccount(account_code="1010", account_name="Bank", account_type="ASSET",
+        normal_balance="DEBIT", account_subtype="BANK", is_active=True, allow_manual_posting=True)
+    expense = AccountingAccount(account_code="5000", account_name="Expense", account_type="EXPENSE",
+        normal_balance="DEBIT", account_subtype="OPERATING_EXPENSE")
+    db.session.add_all([bank, expense]); db.session.commit()
+    payload = {"bank_account_id": bank.id, "statement_date_from": "2026-01-01",
+        "statement_date_to": "2026-02-28", "statement_opening_balance": "0", "statement_closing_balance": "1"}
+    assert client.post("/bank-reconciliations", json=payload).status_code == 401
+    staff = User(email="staff@example.com", name="Staff", role="staff")
+    staff.set_password("password"); db.session.add(staff); db.session.commit()
+    with app.app_context():
+        staff_token = create_access_token(identity=str(staff.id), additional_claims={"role": "staff"})
+    assert client.post("/bank-reconciliations", headers={"Authorization": f"Bearer {staff_token}"},
+        json=payload).status_code == 403
+    missing = dict(payload); missing.pop("statement_date_from")
+    assert client.post("/bank-reconciliations", headers=headers, json=missing).status_code == 422
+    invalid = dict(payload, bank_account_id=999999)
+    assert client.post("/bank-reconciliations", headers=headers, json=invalid).status_code == 422
+    non_bank = dict(payload, bank_account_id=expense.id)
+    assert client.post("/bank-reconciliations", headers=headers, json=non_bank).status_code == 422
+    bank.is_active = False; db.session.commit()
+    assert client.post("/bank-reconciliations", headers=headers, json=payload).status_code == 422

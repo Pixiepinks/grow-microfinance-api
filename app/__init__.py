@@ -21,7 +21,7 @@ from .routes.leads import leads_bp
 from .routes.accounting import accounting_bp
 from .routes.investors import investors_bp
 from .routes.collection_sheets import collection_sheets_bp
-from .routes.bank_reconciliation import bank_reconciliation_bp
+from .routes.bank_reconciliation import bank_reconciliation_bp, bank_reconciliation_compat_bp
 from .schema_fix import ensure_customers_lead_status_column
 
 def create_app():
@@ -113,6 +113,7 @@ def create_app():
     app.register_blueprint(investors_bp)
     app.register_blueprint(collection_sheets_bp)
     app.register_blueprint(bank_reconciliation_bp)
+    app.register_blueprint(bank_reconciliation_compat_bp)
 
     with app.app_context():
         ensure_customers_lead_status_column()

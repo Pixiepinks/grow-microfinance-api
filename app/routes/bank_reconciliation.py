@@ -13,6 +13,10 @@ from .utils import role_required
 
 
 bank_reconciliation_bp = Blueprint("bank_reconciliation", __name__, url_prefix="/admin")
+# The deployed web application predates the admin-prefixed API contract and posts
+# to this path.  Keep the compatibility surface deliberately limited to create;
+# all new integrations should use /admin/bank-reconciliations.
+bank_reconciliation_compat_bp = Blueprint("bank_reconciliation_compat", __name__)
 EDITABLE = {"DRAFT", "IN_PROGRESS", "REOPENED"}
 ZERO = Decimal("0.00")
 
@@ -45,7 +49,13 @@ def _date(value, field):
 
 def _bank(account_id):
     account = db.session.get(AccountingAccount, account_id)
-    if not account or str(account.account_subtype).upper() != "BANK":
+    if not account:
+        raise ValueError("bank_account_id must identify a BANK account")
+    if not account.is_active:
+        raise ValueError("bank_account_id must identify an active account")
+    if not account.allow_manual_posting:
+        raise ValueError("bank_account_id must identify an account that allows posting")
+    if str(account.account_type).upper() != "ASSET" or str(account.account_subtype).upper() != "BANK":
         raise ValueError("bank_account_id must identify a BANK account")
     return account
 
@@ -94,6 +104,7 @@ def _serialize(rec):
 
 
 @bank_reconciliation_bp.route("/bank-reconciliations", methods=["POST"])
+@bank_reconciliation_compat_bp.route("/bank-reconciliations", methods=["POST"])
 @role_required(["admin"])
 def create_reconciliation():
     data = request.get_json() or {}
@@ -114,9 +125,16 @@ def create_reconciliation():
         gl_closing_balance=opening, notes=data.get("notes"), created_by_id=_uid())
     db.session.add(rec); db.session.flush()
     # The database-generated id makes number allocation atomic across workers.
-    rec.reconciliation_number = f"BR-{datetime.utcnow():%Y%m%d}-{rec.id:04d}"
+    rec.reconciliation_number = f"BR-{end:%Y%m%d}-{rec.id:04d}"
     _audit(rec, "CREATED"); db.session.commit()
     return jsonify(_serialize(rec)), 201
+
+
+@bank_reconciliation_bp.route("/bank-reconciliations", methods=["GET"])
+@role_required(["admin"])
+def list_reconciliations():
+    records = BankReconciliation.query.order_by(BankReconciliation.id.desc()).all()
+    return jsonify({"items": [_serialize(record) for record in records], "count": len(records)})
 
 
 @bank_reconciliation_bp.route("/bank-reconciliations/<int:rec_id>", methods=["GET"])
