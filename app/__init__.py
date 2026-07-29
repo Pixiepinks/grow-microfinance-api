@@ -178,33 +178,52 @@ def create_app():
         """Apply missing-only customer master backfill."""
         _customer_backfill_command(customer_id, all_customers, confirm, True)
 
-    def _bank_reconciliation_account_report(number, apply_changes=False):
+    def _bank_reconciliation_account_report(number, account_code="1010", apply_changes=False):
         from .accounting import get_gl_lines_for_account
         from .models import AccountingAccount, BankReconciliation
         rec = BankReconciliation.query.filter_by(reconciliation_number=number).one_or_none()
         if not rec:
             raise click.ClickException("Bank reconciliation not found")
         stored = rec.bank_account_id
-        account = db.session.get(AccountingAccount, stored)
-        proposed = None
-        # Legacy clients sometimes persisted the numeric account code in the FK.
-        if account is None:
-            account = AccountingAccount.query.filter_by(account_code=str(stored)).one_or_none()
-            if account:
-                proposed = {"from": stored, "to": account.id}
-        count = 0
-        if account:
-            count = len(get_gl_lines_for_account(account_id=account.id,
-                date_from=rec.statement_date_from, date_to=rec.statement_date_to)["lines"])
+        current = db.session.get(AccountingAccount, stored)
+        account = AccountingAccount.query.filter_by(account_code=str(account_code)).one_or_none()
+        if not account:
+            raise click.ClickException("Accounting account code was not found")
+        ledger = get_gl_lines_for_account(account_id=account.id,
+            date_from=rec.statement_date_from, date_to=rec.statement_date_to)
+        proposed = None if stored == account.id else {"from": stored, "to": account.id}
         if apply_changes:
-            if not proposed:
-                raise click.ClickException("No safe account repair is required")
-            rec.bank_account_id = account.id
+            if proposed:
+                rec.bank_account_id = account.id
+            rec.gl_opening_balance = ledger["opening_balance"]
+            rec.gl_closing_balance = ledger["closing_balance"]
+            selected = [line for line in ledger["lines"]
+                        if line.bank_reconciliation_id == rec.id]
+            unmatched = [line for line in ledger["lines"] if not line.is_reconciled]
+            rec.total_reconciled_debits = sum((Decimal(line.debit) for line in selected), Decimal("0"))
+            rec.total_reconciled_credits = sum((Decimal(line.credit) for line in selected), Decimal("0"))
+            rec.total_unreconciled_debits = sum((Decimal(line.debit) for line in unmatched), Decimal("0"))
+            rec.total_unreconciled_credits = sum((Decimal(line.credit) for line in unmatched), Decimal("0"))
             db.session.commit()
-        report = {"reconciliation_number": number, "stored_bank_account_value": stored,
-                  "resolved_accounting_account_id": account.id if account else None,
-                  "account_code": account.account_code if account else None,
-                  "transaction_count_for_period": count, "proposed_repair": proposed,
+        report = {"raw_fields": {"id": rec.id, "reconciliation_number": rec.reconciliation_number,
+                      "bank_account_id": stored,
+                      "statement_date_from": rec.statement_date_from.isoformat(),
+                      "statement_date_to": rec.statement_date_to.isoformat(),
+                      "statement_opening_balance": str(rec.statement_opening_balance),
+                      "statement_closing_balance": str(rec.statement_closing_balance),
+                      "status": rec.status},
+                  "current_account_link": ({"id": current.id, "code": current.account_code,
+                                             "name": current.account_name} if current else None),
+                  "expected_accounting_account_id": account.id,
+                  "account_code": account.account_code, "account_name": account.account_name,
+                  "account_type": account.account_type, "account_subtype": account.account_subtype,
+                  "is_active": account.is_active,
+                  "posting_allowed": account.allow_manual_posting,
+                  "transaction_count_for_period": len(ledger["lines"]),
+                  "gl_opening_balance": str(ledger["opening_balance"]),
+                  "gl_closing_balance": str(ledger["closing_balance"]),
+                  "proposed_repair": proposed, "accounting_journal_changes": "NONE",
+                  "changed": bool(apply_changes and proposed),
                   "mode": "apply" if apply_changes else "preview"}
         click.echo(json.dumps(report, sort_keys=True))
 
@@ -214,15 +233,18 @@ def create_app():
         """Inspect account resolution and GL activity without changing data."""
         _bank_reconciliation_account_report(number)
 
-    @app.cli.command("repair-bank-reconciliation-account")
+    @app.cli.command("repair-bank-reconciliation")
     @click.option("--number", required=True)
+    @click.option("--account-code", required=True)
     @click.option("--preview", "preview_mode", is_flag=True)
     @click.option("--apply", "apply_changes", is_flag=True)
-    def repair_bank_reconciliation_account(number, preview_mode, apply_changes):
+    def repair_bank_reconciliation_account(number, account_code, preview_mode, apply_changes):
         """Preview or explicitly apply a safe legacy account-code repair."""
         if preview_mode and apply_changes:
             raise click.ClickException("Choose either --preview or --apply")
-        _bank_reconciliation_account_report(number, apply_changes=apply_changes)
+        if not preview_mode and not apply_changes:
+            raise click.ClickException("Specify either --preview or --apply")
+        _bank_reconciliation_account_report(number, account_code, apply_changes=apply_changes)
 
     @app.cli.command("reconcile-loan-settlements")
     @click.option("--preview", "preview_mode", is_flag=True, default=False, help="Report only; makes no database changes.")
