@@ -64,7 +64,7 @@ def test_alembic_chain_has_one_head_and_valid_down_revisions():
     revision_set = set(revisions)
 
     assert len(revisions) == len(revision_set), "Alembic revision IDs must be unique"
-    assert script.get_heads() == ["0048_bank_reconciliation"]
+    assert script.get_heads() == ["0050_fix_empty_bank_recon"]
 
     for rev in migrations:
         downs = rev._normalized_down_revisions
@@ -112,7 +112,7 @@ def test_migration_from_production_revision_to_head_succeeds(tmp_path):
         text=True,
         capture_output=True,
     )
-    assert "0042_merge_heads" in current.stdout
+    assert "0050_fix_empty_bank_recon" in current.stdout
 
     # Re-running an upgrade at the head must not make additional schema changes.
     subprocess.run(
