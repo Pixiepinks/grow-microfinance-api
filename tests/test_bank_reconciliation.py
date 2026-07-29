@@ -328,8 +328,7 @@ def test_repair_empty_completed_reconciliation_is_preview_first(app):
     assert rec.status == "IN_PROGRESS" and rec.completed_at is None
     assert not entry.lines[0].is_reconciled and entry.lines[0].debit == Decimal("2100")
     audit = BankReconciliationAudit.query.filter_by(action="INVALID_COMPLETION_REPAIRED").one()
-    assert audit.reason == ("Automatically reopened because reconciliation was completed with "
-                            "zero matched bank GL lines.")
+    assert audit.reason == "Reopened because reconciliation completed with zero matched GL lines"
     second = runner.invoke(args=["repair-invalid-bank-reconciliation", "--number",
         rec.reconciliation_number, "--apply"])
     assert second.exit_code == 0 and '"changed": false' in second.output
