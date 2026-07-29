@@ -29,7 +29,8 @@ def _uid():
 
 
 def _error(message, field=None):
-    body = {"success": False, "error_code": "BANK_RECONCILIATION_VALIDATION", "message": message}
+    body = {"success": False, "error": "invalid_bank_account" if field == "bank_account_id" else "validation_error",
+            "error_code": "BANK_RECONCILIATION_VALIDATION", "message": message}
     if field:
         body["field"] = field
     return jsonify(body), 422
@@ -64,6 +65,9 @@ def _bank(account_id):
 
 def resolve_bank_account(value, *, code_hint=None):
     """Resolve API account references without confusing an account code for an ID."""
+    if isinstance(value, dict):
+        code_hint = value.get("code") or value.get("account_code") or code_hint
+        value = value.get("id")
     raw = code_hint if code_hint not in (None, "") else value
     account = None
     if code_hint not in (None, "") or isinstance(raw, str):
@@ -91,13 +95,16 @@ def _posted_query(account_id):
 
 
 def _refresh(rec):
+    ledger = get_gl_lines_for_account(account_id=rec.bank_account_id,
+                                      date_from=rec.statement_date_from,
+                                      date_to=rec.statement_date_to)
+    rec.gl_opening_balance = ledger["opening_balance"]
+    rec.gl_closing_balance = ledger["closing_balance"]
     selected = _posted_query(rec.bank_account_id).filter(
         AccountingJournalLine.bank_reconciliation_id == rec.id).all()
     rec.total_reconciled_debits = sum((Decimal(l.debit) for l in selected), ZERO)
     rec.total_reconciled_credits = sum((Decimal(l.credit) for l in selected), ZERO)
-    unmatched = _posted_query(rec.bank_account_id).filter(
-        AccountingJournalEntry.journal_date.between(rec.statement_date_from, rec.statement_date_to),
-        AccountingJournalLine.is_reconciled.is_(False)).all()
+    unmatched = [line for line in ledger["lines"] if not line.is_reconciled]
     rec.total_unreconciled_debits = sum((Decimal(l.debit) for l in unmatched), ZERO)
     rec.total_unreconciled_credits = sum((Decimal(l.credit) for l in unmatched), ZERO)
     return len(unmatched)
@@ -105,8 +112,14 @@ def _refresh(rec):
 
 def _serialize(rec):
     count = _refresh(rec)
+    account = rec.bank_account
+    difference = money(Decimal(rec.statement_closing_balance) - Decimal(rec.gl_closing_balance))
     return {"id": rec.id, "reconciliation_number": rec.reconciliation_number,
             "bank_account_id": rec.bank_account_id, "status": rec.status,
+            "bank_account_code": account.account_code if account else None,
+            "bank_account_name": account.account_name if account else None,
+            "bank_account": ({"id": account.id, "code": account.account_code,
+                              "name": account.account_name} if account else None),
             "statement_date_from": rec.statement_date_from.isoformat(),
             "statement_date_to": rec.statement_date_to.isoformat(),
             "statement_opening_balance": f"{rec.statement_opening_balance:.2f}",
@@ -117,6 +130,11 @@ def _serialize(rec):
             "total_reconciled_credits": f"{rec.total_reconciled_credits:.2f}",
             "total_unreconciled_debits": f"{rec.total_unreconciled_debits:.2f}",
             "total_unreconciled_credits": f"{rec.total_unreconciled_credits:.2f}",
+            "reconciled_debits": f"{rec.total_reconciled_debits:.2f}",
+            "reconciled_credits": f"{rec.total_reconciled_credits:.2f}",
+            "unreconciled_debits": f"{rec.total_unreconciled_debits:.2f}",
+            "unreconciled_credits": f"{rec.total_unreconciled_credits:.2f}",
+            "difference": f"{difference:.2f}",
             "unreconciled_count": count, "notes": rec.notes,
             "completed_at": rec.completed_at.isoformat() if rec.completed_at else None}
 
@@ -136,13 +154,14 @@ def create_reconciliation():
         opening = _decimal(data.get("statement_opening_balance"), "statement_opening_balance")
         closing = _decimal(data.get("statement_closing_balance"), "statement_closing_balance")
     except (ValueError, TypeError) as exc:
-        return _error(str(exc))
-    gl_opening = _posted_query(account.id).filter(AccountingJournalEntry.journal_date < start).with_entities(
-        func.coalesce(func.sum(AccountingJournalLine.debit - AccountingJournalLine.credit), 0)).scalar()
+        message = ("A valid accounting bank account is required."
+                   if "bank_account" in str(exc) else str(exc))
+        return _error(message, "bank_account_id" if "bank_account" in str(exc) else None)
+    ledger = get_gl_lines_for_account(account_id=account.id, date_from=start, date_to=end)
     rec = BankReconciliation(reconciliation_number=f"PENDING-{uuid4().hex}", bank_account_id=account.id,
         statement_date_from=start, statement_date_to=end, statement_opening_balance=opening,
-        statement_closing_balance=closing, gl_opening_balance=_decimal(gl_opening, "gl_opening_balance"),
-        gl_closing_balance=opening, notes=data.get("notes"), created_by_id=_uid())
+        statement_closing_balance=closing, gl_opening_balance=ledger["opening_balance"],
+        gl_closing_balance=ledger["closing_balance"], notes=data.get("notes"), created_by_id=_uid())
     db.session.add(rec); db.session.flush()
     # The database-generated id makes number allocation atomic across workers.
     rec.reconciliation_number = f"BR-{end:%Y%m%d}-{rec.id:04d}"
@@ -265,7 +284,8 @@ def reconciliation_transactions(rec_id):
             "bank_account_name": account.account_name,
             "statement_date_from": rec.statement_date_from.isoformat(),
             "statement_date_to": rec.statement_date_to.isoformat()},
-        "summary": {"gl_balance": f"{gl_balance:.2f}",
+        "summary": {"gl_opening_balance": f"{ledger['opening_balance']:.2f}",
+            "gl_closing_balance": f"{gl_balance:.2f}", "gl_balance": f"{gl_balance:.2f}",
             "reconciled_debits": f"{reconciled_debits:.2f}",
             "reconciled_credits": f"{reconciled_credits:.2f}",
             "unreconciled_debits": f"{unreconciled_debits:.2f}",
@@ -315,8 +335,8 @@ def complete(rec_id):
     rec = BankReconciliation.query.with_for_update().get_or_404(rec_id)
     if rec.status not in EDITABLE: return _error("Reconciliation is not editable")
     _refresh(rec)
-    # Statement opening plus individually matched activity is the reconciled GL closing balance.
-    rec.gl_closing_balance = Decimal(rec.statement_opening_balance) + Decimal(rec.total_reconciled_debits) - Decimal(rec.total_reconciled_credits)
+    # Completion compares the statement with the authoritative General Ledger,
+    # never merely the subset of lines selected in this workspace.
     difference = Decimal(rec.statement_closing_balance) - Decimal(rec.gl_closing_balance)
     if abs(difference) > Decimal("0.005"):
         rec.status = "IN_PROGRESS"; db.session.commit()

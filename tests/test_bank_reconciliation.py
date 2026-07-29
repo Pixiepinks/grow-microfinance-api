@@ -185,7 +185,8 @@ def test_reconciliation_transactions_reuse_gl_lines_and_calculate_summary(app, c
         row["journal_line_id"] for row in gl["transactions"]]
     assert {row["journal_line_id"] for row in body["transactions"]} == {line.id for line in bank_lines}
     assert body["transactions"][-1]["posting_date"] == "2026-02-28"
-    assert body["summary"] == {"gl_balance": "24750.00", "reconciled_debits": "0.00",
+    assert body["summary"] == {"gl_opening_balance": "0.00", "gl_closing_balance": "24750.00",
+        "gl_balance": "24750.00", "reconciled_debits": "0.00",
         "reconciled_credits": "0.00", "unreconciled_debits": "35000.00",
         "unreconciled_credits": "10250.00", "difference": "0.00"}
     assert body["reconciliation"]["bank_account_code"] == "1010"
@@ -229,3 +230,36 @@ def test_create_accepts_explicit_account_code_and_persists_database_id(app, clie
     assert response.status_code == 201
     assert response.get_json()["bank_account_id"] == bank.id
     assert BankReconciliation.query.one().bank_account_id == bank.id
+
+
+def test_serializer_account_shape_invalid_contract_and_idempotent_repair(app, client):
+    _, headers = _headers(app)
+    bank = AccountingAccount(account_code="1010", account_name="NDB Current Account",
+        account_type="ASSET", normal_balance="DEBIT", account_subtype="BANK")
+    db.session.add(bank); db.session.commit()
+    payload = {"bank_account_id": {"code": "1010"}, "statement_date_from": "2026-01-01",
+        "statement_date_to": "2026-02-28", "statement_opening_balance": "0",
+        "statement_closing_balance": "0"}
+    created = client.post("/admin/accounting/bank-reconciliations", headers=headers, json=payload)
+    assert created.status_code == 201
+    body = client.get(f"/admin/accounting/bank-reconciliations/{created.get_json()['id']}",
+                      headers=headers).get_json()
+    assert body["bank_account"] == {"id": bank.id, "code": "1010", "name": "NDB Current Account"}
+    before = BankReconciliation.query.count()
+    invalid = dict(payload, bank_account_id={"code": "missing"})
+    response = client.post("/admin/accounting/bank-reconciliations", headers=headers, json=invalid)
+    assert response.status_code == 422
+    assert response.get_json()["error"] == "invalid_bank_account"
+    assert response.get_json()["message"] == "A valid accounting bank account is required."
+    assert BankReconciliation.query.count() == before
+
+    runner = app.test_cli_runner()
+    journal_count = AccountingJournalEntry.query.count()
+    first = runner.invoke(args=["repair-bank-reconciliation", "--number",
+        body["reconciliation_number"], "--account-code", "1010", "--apply"])
+    second = runner.invoke(args=["repair-bank-reconciliation", "--number",
+        body["reconciliation_number"], "--account-code", "1010", "--apply"])
+    assert first.exit_code == second.exit_code == 0
+    assert '"changed": false' in first.output and '"changed": false' in second.output
+    assert '"accounting_journal_changes": "NONE"' in first.output
+    assert AccountingJournalEntry.query.count() == journal_count
