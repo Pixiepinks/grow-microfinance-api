@@ -918,6 +918,28 @@ class BankReconciliation(db.Model):
     completed_at = db.Column(db.DateTime)
     bank_account = relationship("AccountingAccount")
     lines = relationship("AccountingJournalLine", back_populates="bank_reconciliation")
+    allocations = relationship("BankReconciliationLine", back_populates="reconciliation",
+                               cascade="all, delete-orphan")
+
+
+class BankReconciliationLine(db.Model):
+    """Immutable-value record of a journal line selected for a reconciliation."""
+    __tablename__ = "bank_reconciliation_lines"
+    __table_args__ = (db.UniqueConstraint("bank_reconciliation_id", "journal_line_id",
+                                          name="uq_bank_reconciliation_line"),)
+    id = db.Column(db.Integer, primary_key=True)
+    bank_reconciliation_id = db.Column(db.Integer, db.ForeignKey("bank_reconciliations.id"),
+                                       nullable=False, index=True)
+    journal_line_id = db.Column(db.Integer, db.ForeignKey("accounting_journal_lines.id"),
+                                nullable=False, unique=True, index=True)
+    debit = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    credit = db.Column(Numeric(18, 2), nullable=False, default=Decimal("0.00"))
+    statement_reference = db.Column(db.String(255))
+    reconciled_date = db.Column(db.Date, nullable=False)
+    created_by_id = db.Column(db.Integer, db.ForeignKey("users.id"))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    reconciliation = relationship("BankReconciliation", back_populates="allocations")
+    journal_line = relationship("AccountingJournalLine")
 
 
 class BankReconciliationAudit(db.Model):
