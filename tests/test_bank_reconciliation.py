@@ -16,8 +16,8 @@ def _headers(app):
     return user, {"Authorization": f"Bearer {token}"}
 
 
-def _journal(bank, other):
-    entry = AccountingJournalEntry(journal_no="J-BANK-1", journal_date=date(2026, 2, 10),
+def _journal(bank, other, journal_no="J-BANK-1"):
+    entry = AccountingJournalEntry(journal_no=journal_no, journal_date=date(2026, 2, 10),
         description="Collector deposit", status="POSTED", total_debit=Decimal("2100"), total_credit=Decimal("2100"))
     entry.lines = [AccountingJournalLine(line_no=1, account=bank, debit=Decimal("2100"), credit=Decimal("0")),
                    AccountingJournalLine(line_no=2, account=other, debit=Decimal("0"), credit=Decimal("2100"))]
@@ -77,6 +77,7 @@ def test_create_route_registration_and_production_compatibility_alias(app, clien
     assert ("/admin/accounting/bank-reconciliations", "POST") in rules
     assert ("/admin/accounting/bank-reconciliations", "GET") in rules
     assert ("/admin/accounting/bank-reconciliations/<int:rec_id>", "GET") in rules
+    assert ("/admin/accounting/bank-reconciliations/<int:rec_id>/transactions", "GET") in rules
     assert ("/admin/accounting/bank-reconciliations/<int:rec_id>/lines", "POST") in rules
     assert ("/admin/accounting/bank-reconciliations/<int:rec_id>/lines/<int:line_id>", "DELETE") in rules
     assert ("/admin/accounting/bank-reconciliations/<int:rec_id>/complete", "POST") in rules
@@ -143,3 +144,88 @@ def test_create_validation_and_authorization(app, client):
     assert client.post(route, headers=headers, json=non_bank).status_code == 422
     bank.is_active = False; db.session.commit()
     assert client.post(route, headers=headers, json=payload).status_code == 422
+
+
+def test_reconciliation_transactions_reuse_gl_lines_and_calculate_summary(app, client):
+    _, headers = _headers(app)
+    bank = AccountingAccount(account_code="1010", account_name="NDB Current Account",
+        account_type="ASSET", normal_balance="DEBIT", account_subtype="BANK")
+    other = AccountingAccount(account_code="1050", account_name="Clearing",
+        account_type="ASSET", normal_balance="DEBIT", account_subtype="COLLECTION_CLEARING")
+    db.session.add_all([bank, other]); db.session.flush()
+
+    amounts = [("Investor funding", date(2026, 1, 1), "Posted", "30000", "0"),
+               ("Loan disbursement", date(2026, 1, 31), "POSTED", "0", "10000"),
+               ("Collector deposit", date(2026, 2, 15), "posted", "5000", "0"),
+               ("Bank charge", date(2026, 2, 28), "REVERSED", "0", "250")]
+    bank_lines = []
+    for index, (description, journal_date, status, debit, credit) in enumerate(amounts, 1):
+        amount = Decimal(debit) or Decimal(credit)
+        entry = AccountingJournalEntry(journal_no=f"J-BANK-{index}", journal_date=journal_date,
+            description=description, reference=f"REF-{index}", status=status,
+            total_debit=amount, total_credit=amount)
+        bank_line = AccountingJournalLine(line_no=1, account=bank,
+            debit=Decimal(debit), credit=Decimal(credit))
+        entry.lines = [bank_line, AccountingJournalLine(line_no=2, account=other,
+            debit=Decimal(credit), credit=Decimal(debit))]
+        db.session.add(entry); bank_lines.append(bank_line)
+    db.session.flush()
+    rec = BankReconciliation(reconciliation_number="BR-20260228-0001", bank_account_id=bank.id,
+        statement_date_from=date(2026, 1, 1), statement_date_to=date(2026, 2, 28),
+        statement_opening_balance=Decimal("0"), statement_closing_balance=Decimal("24750"))
+    db.session.add(rec); db.session.commit()
+
+    response = client.get(f"/admin/accounting/bank-reconciliations/{rec.id}/transactions",
+                          headers=headers)
+    assert response.status_code == 200
+    body = response.get_json()
+    gl = client.get(f"/admin/accounting/general-ledger?account_id={bank.id}"
+                    "&date_from=2026-01-01&date_to=2026-02-28", headers=headers).get_json()
+    assert [row["journal_line_id"] for row in body["transactions"]] == [
+        row["journal_line_id"] for row in gl["transactions"]]
+    assert {row["journal_line_id"] for row in body["transactions"]} == {line.id for line in bank_lines}
+    assert body["transactions"][-1]["posting_date"] == "2026-02-28"
+    assert body["summary"] == {"gl_balance": "24750.00", "reconciled_debits": "0.00",
+        "reconciled_credits": "0.00", "unreconciled_debits": "35000.00",
+        "unreconciled_credits": "10250.00", "difference": "0.00"}
+    assert body["reconciliation"]["bank_account_code"] == "1010"
+
+
+def test_reconciliation_visibility_excludes_other_completed_and_keeps_current_draft(app, client):
+    _, headers = _headers(app)
+    bank = AccountingAccount(account_code="1010", account_name="Bank", account_type="ASSET",
+        normal_balance="DEBIT", account_subtype="BANK")
+    other = AccountingAccount(account_code="1050", account_name="Other", account_type="ASSET",
+        normal_balance="DEBIT", account_subtype="OTHER")
+    db.session.add_all([bank, other]); db.session.commit()
+    entries = [_journal(bank, other, "J-BANK-1"), _journal(bank, other, "J-BANK-2")]
+    current = BankReconciliation(reconciliation_number="BR-CURRENT", bank_account_id=bank.id,
+        statement_date_from=date(2026, 2, 1), statement_date_to=date(2026, 2, 28),
+        statement_opening_balance=0, statement_closing_balance=4200)
+    completed = BankReconciliation(reconciliation_number="BR-COMPLETE", bank_account_id=bank.id,
+        statement_date_from=date(2026, 2, 1), statement_date_to=date(2026, 2, 28),
+        statement_opening_balance=0, statement_closing_balance=2100, status="COMPLETED")
+    db.session.add_all([current, completed]); db.session.flush()
+    entries[0].lines[0].is_reconciled = True
+    entries[0].lines[0].bank_reconciliation_id = current.id
+    entries[1].lines[0].is_reconciled = True
+    entries[1].lines[0].bank_reconciliation_id = completed.id
+    db.session.commit()
+    body = client.get(f"/admin/accounting/bank-reconciliations/{current.id}/transactions",
+                      headers=headers).get_json()
+    assert [row["journal_line_id"] for row in body["transactions"]] == [entries[0].lines[0].id]
+    assert body["transactions"][0]["is_reconciled"] is True
+
+
+def test_create_accepts_explicit_account_code_and_persists_database_id(app, client):
+    _, headers = _headers(app)
+    bank = AccountingAccount(account_code="1010", account_name="Bank", account_type="ASSET",
+        normal_balance="DEBIT", account_subtype="BANK")
+    db.session.add(bank); db.session.commit()
+    response = client.post("/admin/accounting/bank-reconciliations", headers=headers, json={
+        "bank_account_id": "1010", "statement_date_from": "2026-01-01",
+        "statement_date_to": "2026-02-28", "statement_opening_balance": "0",
+        "statement_closing_balance": "0"})
+    assert response.status_code == 201
+    assert response.get_json()["bank_account_id"] == bank.id
+    assert BankReconciliation.query.one().bank_account_id == bank.id

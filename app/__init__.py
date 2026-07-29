@@ -178,6 +178,52 @@ def create_app():
         """Apply missing-only customer master backfill."""
         _customer_backfill_command(customer_id, all_customers, confirm, True)
 
+    def _bank_reconciliation_account_report(number, apply_changes=False):
+        from .accounting import get_gl_lines_for_account
+        from .models import AccountingAccount, BankReconciliation
+        rec = BankReconciliation.query.filter_by(reconciliation_number=number).one_or_none()
+        if not rec:
+            raise click.ClickException("Bank reconciliation not found")
+        stored = rec.bank_account_id
+        account = db.session.get(AccountingAccount, stored)
+        proposed = None
+        # Legacy clients sometimes persisted the numeric account code in the FK.
+        if account is None:
+            account = AccountingAccount.query.filter_by(account_code=str(stored)).one_or_none()
+            if account:
+                proposed = {"from": stored, "to": account.id}
+        count = 0
+        if account:
+            count = len(get_gl_lines_for_account(account_id=account.id,
+                date_from=rec.statement_date_from, date_to=rec.statement_date_to)["lines"])
+        if apply_changes:
+            if not proposed:
+                raise click.ClickException("No safe account repair is required")
+            rec.bank_account_id = account.id
+            db.session.commit()
+        report = {"reconciliation_number": number, "stored_bank_account_value": stored,
+                  "resolved_accounting_account_id": account.id if account else None,
+                  "account_code": account.account_code if account else None,
+                  "transaction_count_for_period": count, "proposed_repair": proposed,
+                  "mode": "apply" if apply_changes else "preview"}
+        click.echo(json.dumps(report, sort_keys=True))
+
+    @app.cli.command("inspect-bank-reconciliation")
+    @click.option("--number", required=True)
+    def inspect_bank_reconciliation(number):
+        """Inspect account resolution and GL activity without changing data."""
+        _bank_reconciliation_account_report(number)
+
+    @app.cli.command("repair-bank-reconciliation-account")
+    @click.option("--number", required=True)
+    @click.option("--preview", "preview_mode", is_flag=True)
+    @click.option("--apply", "apply_changes", is_flag=True)
+    def repair_bank_reconciliation_account(number, preview_mode, apply_changes):
+        """Preview or explicitly apply a safe legacy account-code repair."""
+        if preview_mode and apply_changes:
+            raise click.ClickException("Choose either --preview or --apply")
+        _bank_reconciliation_account_report(number, apply_changes=apply_changes)
+
     @app.cli.command("reconcile-loan-settlements")
     @click.option("--preview", "preview_mode", is_flag=True, default=False, help="Report only; makes no database changes.")
     @click.option("--post", "post_mode", is_flag=True, default=False, help="Apply eligible reconciliations.")
