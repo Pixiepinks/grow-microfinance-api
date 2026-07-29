@@ -281,7 +281,10 @@ def test_complete_requires_persisted_transactions_and_bulk_line_ids(app, client)
 
     empty = client.post(f"/admin/accounting/bank-reconciliations/{rec_id}/complete", headers=headers)
     assert empty.status_code == 422
-    assert empty.get_json()["error"] == "no_transactions_selected"
+    assert empty.get_json() == {
+        "error": "no_transactions_matched",
+        "message": "Mark bank transactions as reconciled before completing the reconciliation."
+    }
     assert BankReconciliation.query.get(rec_id).status == "DRAFT"
 
     marked = client.post(f"/admin/accounting/bank-reconciliations/{rec_id}/lines", headers=headers,
@@ -289,6 +292,9 @@ def test_complete_requires_persisted_transactions_and_bulk_line_ids(app, client)
               "reconciled_date": "2026-02-28", "statement_reference": "STMT-1"})
     assert marked.status_code == 200
     assert marked.get_json()["matched_count"] == 2
+    assert marked.get_json()["matched_transaction_count"] == 2
+    assert all({"is_reconciled", "reconciliation_number", "reconciled_date"} <= row.keys()
+               for row in marked.get_json()["transactions"])
     assert marked.get_json()["reconciled_debits"] == "4200.00"
     assert BankReconciliationLine.query.count() == 2
     assert all(line.is_reconciled for line in (first.lines[0], second.lines[0]))
@@ -312,13 +318,18 @@ def test_repair_empty_completed_reconciliation_is_preview_first(app):
         completed_at=date(2026, 2, 28))
     db.session.add(rec); db.session.commit()
     runner = app.test_cli_runner()
-    preview = runner.invoke(args=["repair-empty-bank-reconciliation", "--number",
+    preview = runner.invoke(args=["repair-invalid-bank-reconciliation", "--number",
         rec.reconciliation_number, "--preview"])
     assert preview.exit_code == 0 and '"invalid_empty_completion": true' in preview.output
     assert rec.status == "COMPLETED"
-    applied = runner.invoke(args=["repair-empty-bank-reconciliation", "--number",
+    applied = runner.invoke(args=["repair-invalid-bank-reconciliation", "--number",
         rec.reconciliation_number, "--apply"])
     assert applied.exit_code == 0
     assert rec.status == "IN_PROGRESS" and rec.completed_at is None
     assert not entry.lines[0].is_reconciled and entry.lines[0].debit == Decimal("2100")
-    assert BankReconciliationAudit.query.filter_by(action="EMPTY_REPAIR").count() == 1
+    audit = BankReconciliationAudit.query.filter_by(action="INVALID_COMPLETION_REPAIRED").one()
+    assert audit.reason == "Reopened because reconciliation completed with zero matched GL lines"
+    second = runner.invoke(args=["repair-invalid-bank-reconciliation", "--number",
+        rec.reconciliation_number, "--apply"])
+    assert second.exit_code == 0 and '"changed": false' in second.output
+    assert BankReconciliationAudit.query.filter_by(action="INVALID_COMPLETION_REPAIRED").count() == 1
