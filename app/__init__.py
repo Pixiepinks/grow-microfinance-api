@@ -279,7 +279,7 @@ def create_app():
             db.session.add(BankReconciliationAudit(bank_reconciliation_id=rec.id,
                 action="INVALID_COMPLETION_REPAIRED", bank_account_id=rec.bank_account_id,
                 reconciliation_number=rec.reconciliation_number,
-                reason="Reopened because reconciliation completed with zero matched GL lines"))
+                reason="Automatically reopened because reconciliation was completed with zero matched bank GL lines."))
             db.session.commit()
             changed = True
         click.echo(json.dumps({"number": number, "mode": "apply" if apply_changes else "preview",
