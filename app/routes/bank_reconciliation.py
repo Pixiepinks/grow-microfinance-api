@@ -2,11 +2,12 @@ from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from uuid import uuid4
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, current_app, jsonify, request
 from flask_jwt_extended import get_jwt_identity
 from sqlalchemy import func, or_
 
 from ..extensions import db
+from ..accounting import get_gl_lines_for_account, money
 from ..models import (AccountingAccount, AccountingJournalEntry, AccountingJournalLine,
                       BankReconciliation, BankReconciliationAudit)
 from .utils import role_required
@@ -61,6 +62,22 @@ def _bank(account_id):
     return account
 
 
+def resolve_bank_account(value, *, code_hint=None):
+    """Resolve API account references without confusing an account code for an ID."""
+    raw = code_hint if code_hint not in (None, "") else value
+    account = None
+    if code_hint not in (None, "") or isinstance(raw, str):
+        account = AccountingAccount.query.filter_by(account_code=str(raw).strip()).one_or_none()
+    if account is None and code_hint in (None, ""):
+        try:
+            account = db.session.get(AccountingAccount, int(raw))
+        except (TypeError, ValueError):
+            account = None
+    if account is None:
+        raise ValueError("bank_account_id must identify a BANK account")
+    return _bank(account.id)
+
+
 def _audit(rec, action, line_id=None, reason=None):
     db.session.add(BankReconciliationAudit(bank_reconciliation_id=rec.id, action=action,
         user_id=_uid(), bank_account_id=rec.bank_account_id, journal_line_id=line_id,
@@ -111,7 +128,8 @@ def _serialize(rec):
 def create_reconciliation():
     data = request.get_json() or {}
     try:
-        account = _bank(int(data.get("bank_account_id")))
+        account = resolve_bank_account(data.get("bank_account_id"),
+                                       code_hint=data.get("bank_account_code"))
         start, end = _date(data.get("statement_date_from"), "statement_date_from"), _date(data.get("statement_date_to"), "statement_date_to")
         if end < start:
             raise ValueError("statement_date_to cannot precede statement_date_from")
@@ -187,6 +205,73 @@ def bank_transactions():
             "reconciliation_number": line.bank_reconciliation.reconciliation_number if line.bank_reconciliation else None,
             "statement_reference": line.bank_statement_reference})
     return jsonify({"transactions": items, "count": len(items)})
+
+
+@bank_reconciliation_bp.route("/bank-reconciliations/<int:rec_id>/transactions", methods=["GET"])
+@bank_reconciliation_legacy_bp.route("/bank-reconciliations/<int:rec_id>/transactions", methods=["GET"])
+@role_required(["admin"])
+def reconciliation_transactions(rec_id):
+    """Return GL-authoritative, selectable journal lines for a reconciliation."""
+    rec = BankReconciliation.query.get_or_404(rec_id)
+    account = _bank(rec.bank_account_id)
+    before_status = (AccountingJournalLine.query.join(AccountingJournalEntry)
+                     .filter(AccountingJournalLine.account_id == account.id,
+                             AccountingJournalEntry.journal_date >= rec.statement_date_from,
+                             AccountingJournalEntry.journal_date <= rec.statement_date_to)
+                     .count())
+    ledger = get_gl_lines_for_account(account_id=account.id,
+                                      date_from=rec.statement_date_from,
+                                      date_to=rec.statement_date_to)
+    eligible = []
+    for line in ledger["lines"]:
+        other_completed = (line.bank_reconciliation_id not in (None, rec.id)
+                           and line.bank_reconciliation
+                           and line.bank_reconciliation.status == "COMPLETED")
+        if not other_completed:
+            eligible.append(line)
+
+    reconciled = [line for line in eligible if line.bank_reconciliation_id == rec.id]
+    unreconciled = [line for line in eligible if line.bank_reconciliation_id != rec.id]
+    reconciled_debits = sum((money(line.debit) for line in reconciled), ZERO)
+    reconciled_credits = sum((money(line.credit) for line in reconciled), ZERO)
+    unreconciled_debits = sum((money(line.debit) for line in unreconciled), ZERO)
+    unreconciled_credits = sum((money(line.credit) for line in unreconciled), ZERO)
+    gl_balance = money(ledger["closing_balance"])
+    difference = money(Decimal(rec.statement_closing_balance) - gl_balance)
+    current_app.logger.info("bank_reconciliation_transactions", extra={
+        "reconciliation_id": rec.id, "reconciliation_number": rec.reconciliation_number,
+        "stored_bank_account_id": rec.bank_account_id, "resolved_account_id": account.id,
+        "resolved_account_code": account.account_code,
+        "date_from": rec.statement_date_from.isoformat(), "date_to": rec.statement_date_to.isoformat(),
+        "journal_line_count_before_status_filter": before_status,
+        "journal_line_count_after_status_filter": len(ledger["lines"]),
+        "eligible_reconciliation_line_count": len(eligible)})
+
+    transactions = []
+    for line in eligible:
+        entry = line.journal_entry
+        transactions.append({
+            "journal_line_id": line.id, "journal_entry_id": entry.id,
+            "journal_number": entry.journal_no, "posting_date": entry.journal_date.isoformat(),
+            "description": line.description or entry.description, "reference": entry.reference,
+            "debit": f"{money(line.debit):.2f}", "credit": f"{money(line.credit):.2f}",
+            "running_balance": f"{line.gl_running_balance:.2f}",
+            "is_reconciled": line.bank_reconciliation_id == rec.id,
+            "reconciliation_number": (line.bank_reconciliation.reconciliation_number
+                                      if line.bank_reconciliation else None)})
+    return jsonify({
+        "reconciliation": {"id": rec.id, "reconciliation_number": rec.reconciliation_number,
+            "bank_account_id": account.id, "bank_account_code": account.account_code,
+            "bank_account_name": account.account_name,
+            "statement_date_from": rec.statement_date_from.isoformat(),
+            "statement_date_to": rec.statement_date_to.isoformat()},
+        "summary": {"gl_balance": f"{gl_balance:.2f}",
+            "reconciled_debits": f"{reconciled_debits:.2f}",
+            "reconciled_credits": f"{reconciled_credits:.2f}",
+            "unreconciled_debits": f"{unreconciled_debits:.2f}",
+            "unreconciled_credits": f"{unreconciled_credits:.2f}",
+            "difference": f"{difference:.2f}"},
+        "transactions": transactions})
 
 
 @bank_reconciliation_bp.route("/bank-reconciliations/<int:rec_id>/lines", methods=["POST"])

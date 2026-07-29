@@ -1055,7 +1055,13 @@ def serialize_journal(entry):
     loan_id = entry.loan_id or ctx.get("loan_id")
     return {"id": entry.id, "journal_no": entry.journal_no, "journal_number": entry.journal_no, "journal_date": entry.journal_date.isoformat(), "accounting_date": entry.accounting_date.isoformat() if entry.accounting_date else None, "reference": getattr(entry, "reference", None), "description": entry.description, "reference_type": entry.reference_type or entry.source_type, "source_type": entry.source_type or entry.reference_type, "reference_id": entry.reference_id, "source_module": entry.source_module, "status": entry.status, "total_debit": f"{money(entry.total_debit):.2f}", "total_credit": f"{money(entry.total_credit):.2f}", "debit_total": f"{money(entry.total_debit):.2f}", "credit_total": f"{money(entry.total_credit):.2f}", "posted_at": entry.posted_at.isoformat() if entry.posted_at else None, "posting_datetime": entry.posted_at.isoformat() if entry.posted_at else None, "created_by_name": entry.created_by.name if entry.created_by else None, "posted_by_name": entry.posted_by.name if entry.posted_by else None, "customer_id": customer_id, "customer_number": ctx.get("customer_number"), "customer_name": ctx.get("customer_name"), "loan_id": loan_id, "loan_number": ctx.get("loan_number"), "installment_number": None, "payment_id": ctx.get("payment_id"), "collection_id": ctx.get("collection_id"), "original_journal_id": entry.reversal_of_id, "original_journal_no": entry.reversal_of.journal_no if entry.reversal_of else None, "original_journal_number": entry.reversal_of.journal_no if entry.reversal_of else None, "reversal_journal_id": reversal.id if reversal else entry.reversal_journal_id, "reversal_journal_no": reversal.journal_no if reversal else None, "reversal_journal_number": reversal.journal_no if reversal else None, "is_reversal": bool(entry.reversal_of_id), "can_view": True, "can_reverse": str(entry.status).upper() == "POSTED" and not reversal, "lines": [{"id": l.id, "line_no": l.line_no, "account_id": l.account_id, "account_code": l.account.account_code, "account_name": l.account.account_name, "account_type": l.account.account_type, "account_subtype": account_subtype(l.account), "debit": f"{money(l.debit):.2f}", "credit": f"{money(l.credit):.2f}", **_line_context(l), "description": l.description} for l in entry.lines]}
 
-def general_ledger(account_id=None, date_from=None, date_to=None, customer_id=None, loan_id=None, account_code=None, query_params=None):
+def get_gl_lines_for_account(account_id=None, date_from=None, date_to=None,
+                             customer_id=None, loan_id=None, account_code=None):
+    """Return the journal lines and balances used by the General Ledger.
+
+    Consumers which need bank-account activity must use this function rather
+    than recreating the GL's status, accounting-date, and ordering rules.
+    """
     account = _resolve_ledger_account(account_id, account_code)
     customer_id = _int_filter(customer_id, "customer_id"); loan_id = _int_filter(loan_id, "loan_id")
     filters=[AccountingJournalLine.account_id == account.id, func.upper(AccountingJournalEntry.status).in_(["POSTED", "REVERSED"])]
@@ -1067,12 +1073,26 @@ def general_ledger(account_id=None, date_from=None, date_to=None, customer_id=No
     if date_to: tx_query=tx_query.filter(AccountingJournalEntry.journal_date <= date_to)
     def signed(line): return money(line.debit-line.credit) if account.normal_balance=="DEBIT" else money(line.credit-line.debit)
     opening=sum((signed(l) for l in before.all()), Decimal("0.00")) if date_from else Decimal("0.00")
-    running=money(opening); all_tx=[]; td=tc=Decimal("0.00")
+    running=money(opening); td=tc=Decimal("0.00")
     rows=tx_query.order_by(AccountingJournalEntry.journal_date, AccountingJournalEntry.journal_no, AccountingJournalLine.line_no).all()
+    for l in rows:
+        running=money(running+signed(l)); td+=money(l.debit); tc+=money(l.credit)
+        l.gl_running_balance = running
+    return {"account": account, "opening_balance": money(opening), "lines": rows,
+            "closing_balance": money(running), "total_debit": money(td),
+            "total_credit": money(tc)}
+
+
+def general_ledger(account_id=None, date_from=None, date_to=None, customer_id=None, loan_id=None, account_code=None, query_params=None):
+    ledger = get_gl_lines_for_account(account_id, date_from, date_to, customer_id,
+                                      loan_id, account_code)
+    account=ledger["account"]; opening=ledger["opening_balance"]
+    running=ledger["closing_balance"]; td=ledger["total_debit"]; tc=ledger["total_credit"]
+    rows=ledger["lines"]; all_tx=[]
     current_app.logger.info("general_ledger query", extra={"query_params": query_params or {}, "resolved_account_id": account.id, "journal_lines_found": len(rows)})
     for l in rows:
-        running=money(running+signed(l)); td+=money(l.debit); tc+=money(l.credit); e=l.journal_entry; ctx=_line_context(l)
-        all_tx.append({"journal_entry_id": e.id, "journal_date": e.journal_date.isoformat(), "journal_no": e.journal_no, "description": e.description, "reference_type": e.reference_type, "reference_id": e.reference_id, "source_module": e.source_module, "debit": f"{money(l.debit):.2f}", "credit": f"{money(l.credit):.2f}", "running_balance": f"{running:.2f}", **ctx,
+        e=l.journal_entry; ctx=_line_context(l)
+        all_tx.append({"journal_line_id": l.id, "journal_entry_id": e.id, "journal_date": e.journal_date.isoformat(), "journal_no": e.journal_no, "description": e.description, "reference_type": e.reference_type, "reference_id": e.reference_id, "source_module": e.source_module, "debit": f"{money(l.debit):.2f}", "credit": f"{money(l.credit):.2f}", "running_balance": f"{l.gl_running_balance:.2f}", **ctx,
                        "is_reconciled": bool(l.is_reconciled), "reconciled_date": l.reconciled_date.isoformat() if l.reconciled_date else None,
                        "reconciliation_number": l.bank_reconciliation.reconciliation_number if l.bank_reconciliation else None,
                        "bank_statement_reference": l.bank_statement_reference})
