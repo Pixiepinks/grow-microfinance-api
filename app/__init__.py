@@ -238,26 +238,28 @@ def create_app():
         ledger = get_gl_lines_for_account(account_id=rec.bank_account_id,
             date_from=rec.statement_date_from, date_to=rec.statement_date_to)
         report = {"number": number, "status": rec.status,
+            "reconciliation_id": rec.id,
             "bank_account": {"id": rec.bank_account.id, "code": rec.bank_account.account_code,
                              "name": rec.bank_account.account_name},
             "period": [rec.statement_date_from.isoformat(), rec.statement_date_to.isoformat()],
             "eligible_transaction_count": len(ledger["lines"]),
             "reconciliation_line_count": len(rec.allocations),
+            "matched_journal_line_ids": [line.journal_line_id for line in rec.allocations],
             "reconciled_debit_total": str(rec.total_reconciled_debits),
             "reconciled_credit_total": str(rec.total_reconciled_credits),
             "journal_lines_currently_marked_reconciled": [line.id for line in ledger["lines"]
                                                            if line.is_reconciled],
             "completion_timestamp": rec.completed_at.isoformat() if rec.completed_at else None,
-            "completed_by": rec.approved_by_id,
+            "completed_by_id": rec.approved_by_id,
             "invalid_empty_completion": (rec.status == "COMPLETED" and not rec.allocations
                                            and bool(ledger["lines"]))}
         click.echo(json.dumps(report, sort_keys=True))
 
-    @app.cli.command("repair-empty-bank-reconciliation")
+    @app.cli.command("repair-invalid-bank-reconciliation")
     @click.option("--number", required=True)
     @click.option("--preview", "preview_mode", is_flag=True)
     @click.option("--apply", "apply_changes", is_flag=True)
-    def repair_empty_bank_reconciliation(number, preview_mode, apply_changes):
+    def repair_invalid_bank_reconciliation(number, preview_mode, apply_changes):
         """Safely reopen a completed reconciliation that persisted no selections."""
         from .accounting import get_gl_lines_for_account
         from .models import BankReconciliation, BankReconciliationAudit
@@ -268,17 +270,30 @@ def create_app():
         ledger = get_gl_lines_for_account(account_id=rec.bank_account_id,
             date_from=rec.statement_date_from, date_to=rec.statement_date_to)
         invalid = rec.status == "COMPLETED" and not rec.allocations and bool(ledger["lines"])
+        current_status = rec.status
+        current_completed_at = rec.completed_at.isoformat() if rec.completed_at else None
+        current_completed_by = rec.approved_by_id
+        changed = False
         if apply_changes and invalid:
             rec.status = "IN_PROGRESS"; rec.completed_at = None; rec.approved_by_id = None
             db.session.add(BankReconciliationAudit(bank_reconciliation_id=rec.id,
-                action="EMPTY_REPAIR", bank_account_id=rec.bank_account_id,
+                action="INVALID_COMPLETION_REPAIRED", bank_account_id=rec.bank_account_id,
                 reconciliation_number=rec.reconciliation_number,
-                reason="Invalid completed reconciliation had no persisted journal lines"))
+                reason="Reopened because reconciliation completed with zero matched GL lines"))
             db.session.commit()
+            changed = True
         click.echo(json.dumps({"number": number, "mode": "apply" if apply_changes else "preview",
-            "invalid_empty_completion": invalid, "eligible_transaction_count": len(ledger["lines"]),
-            "reconciliation_line_count": len(rec.allocations),
-            "resulting_status": rec.status, "journal_amount_changes": "NONE"}, sort_keys=True))
+            "invalid_empty_completion": invalid, "current_status": current_status,
+            "matched_transaction_count": len(rec.allocations),
+            "eligible_bank_line_count": len(ledger["lines"]),
+            "reconciled_debits": str(rec.total_reconciled_debits),
+            "reconciled_credits": str(rec.total_reconciled_credits),
+            "proposed_status": "IN_PROGRESS" if invalid else current_status,
+            "completed_at_to_be_cleared": current_completed_at,
+            "completed_by_id_to_be_cleared": current_completed_by,
+            "resulting_status": rec.status, "changed": changed,
+            "accounting_journal_changes": "NONE", "gl_amount_changes": "NONE"},
+            sort_keys=True))
 
     @app.cli.command("repair-bank-reconciliation")
     @click.option("--number", required=True)

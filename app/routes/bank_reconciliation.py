@@ -135,8 +135,33 @@ def _serialize(rec):
             "unreconciled_debits": f"{rec.total_unreconciled_debits:.2f}",
             "unreconciled_credits": f"{rec.total_unreconciled_credits:.2f}",
             "difference": f"{difference:.2f}",
-            "unreconciled_count": count, "notes": rec.notes,
-            "completed_at": rec.completed_at.isoformat() if rec.completed_at else None}
+            "unreconciled_count": count, "matched_transaction_count": len(rec.allocations),
+            "notes": rec.notes,
+            "completed_at": rec.completed_at.isoformat() if rec.completed_at else None,
+            "completed_by_id": rec.approved_by_id}
+
+
+def _transaction_rows(rec):
+    """Return the reconciliation-period bank lines using the public API shape."""
+    lines = (_posted_query(rec.bank_account_id)
+             .filter(AccountingJournalEntry.journal_date >= rec.statement_date_from,
+                     AccountingJournalEntry.journal_date <= rec.statement_date_to)
+             .order_by(AccountingJournalEntry.journal_date,
+                       AccountingJournalEntry.journal_no,
+                       AccountingJournalLine.line_no).all())
+    return [{"journal_line_id": line.id, "journal_entry_id": line.journal_entry.id,
+             "journal_number": line.journal_entry.journal_no,
+             "posting_date": line.journal_entry.journal_date.isoformat(),
+             "description": line.description or line.journal_entry.description,
+             "reference": line.journal_entry.reference,
+             "debit": f"{money(line.debit):.2f}", "credit": f"{money(line.credit):.2f}",
+             "is_reconciled": bool(line.is_reconciled),
+             "reconciliation_number": (line.bank_reconciliation.reconciliation_number
+                                       if line.bank_reconciliation else None),
+             "reconciled_date": (line.reconciled_date.isoformat()
+                                 if line.reconciled_date else None),
+             "statement_reference": line.bank_statement_reference}
+            for line in lines]
 
 
 @bank_reconciliation_bp.route("/bank-reconciliations", methods=["POST"], strict_slashes=False)
@@ -305,7 +330,12 @@ def add_line(rec_id):
     if ids is None: ids = [data.get("journal_line_id")]
     if not isinstance(ids, list) or not ids or any(not isinstance(value, int) for value in ids):
         return _error("journal_line_ids must be a non-empty list of journal-line IDs")
-    reconciled_date = _date(data.get("reconciled_date") or rec.statement_date_to, "reconciled_date")
+    try:
+        reconciled_date = _date(data.get("reconciled_date") or rec.statement_date_to,
+                                "reconciled_date")
+    except ValueError as exc:
+        db.session.rollback()
+        return _error(str(exc))
     if not rec.statement_date_from <= reconciled_date <= rec.statement_date_to:
         return _error("reconciled_date must fall within the reconciliation period")
     reference = data.get("bank_statement_reference") or data.get("statement_reference")
@@ -316,7 +346,8 @@ def add_line(rec_id):
                 or not rec.statement_date_from <= line.journal_entry.journal_date <= rec.statement_date_to):
             return _error("Journal line must belong to the bank account and reconciliation period")
         if str(line.journal_entry.status).upper() != "POSTED": return _error("Only posted journal lines can be reconciled")
-        if line.bank_reconciliation_id not in (None, rec.id): return _error("Journal line is already reconciled in another reconciliation")
+        if line.bank_reconciliation_id not in (None, rec.id):
+            return _error("Journal line is already reconciled in another reconciliation")
     for line in lines:
         allocation = BankReconciliationLine.query.filter_by(bank_reconciliation_id=rec.id, journal_line_id=line.id).one_or_none()
         if not allocation:
@@ -326,9 +357,14 @@ def add_line(rec_id):
         line.is_reconciled = True; line.bank_reconciliation_id = rec.id
         line.reconciled_date = reconciled_date; line.reconciled_at = datetime.utcnow(); line.reconciled_by_id = _uid()
         line.bank_statement_reference = reference
-        _audit(rec, "LINE_ADDED", line.id)
+        if not allocation:
+            _audit(rec, "LINE_ADDED", line.id)
     rec.status = "IN_PROGRESS"; db.session.flush(); _refresh(rec); db.session.commit()
-    result = _serialize(rec); result.update(success=True, matched_count=len(rec.allocations)); return jsonify(result)
+    result = _serialize(rec)
+    result.update(success=True, matched_count=len(rec.allocations),
+                  matched_transaction_count=len(rec.allocations),
+                  transactions=_transaction_rows(rec))
+    return jsonify(result)
 
 
 @bank_reconciliation_bp.route("/bank-reconciliations/<int:rec_id>/lines/<int:line_id>", methods=["DELETE"])
@@ -351,7 +387,8 @@ def remove_line(rec_id, line_id):
 @role_required(["admin"])
 def complete(rec_id):
     rec = BankReconciliation.query.with_for_update().get_or_404(rec_id)
-    if rec.status not in EDITABLE: return _error("Reconciliation is not editable")
+    if rec.status not in {"DRAFT", "IN_PROGRESS"}:
+        return _error("Reconciliation is not editable")
     data = request.get_json(silent=True) or {}
     # Support the frontend's one-shot completion payload while retaining the
     # persisted-lines workflow. The same validation and transaction are used.
@@ -366,8 +403,10 @@ def complete(rec_id):
         date_from=rec.statement_date_from, date_to=rec.statement_date_to)["lines"])
     if eligible_count and not rec.allocations:
         db.session.rollback()
-        return _error("Select and mark bank transactions before completing reconciliation.",
-                      code="no_transactions_selected")
+        return jsonify({
+            "error": "no_transactions_matched",
+            "message": "Mark bank transactions as reconciled before completing the reconciliation.",
+        }), 422
     if rec.allocations and rec.total_reconciled_debits == ZERO and rec.total_reconciled_credits == ZERO:
         db.session.rollback(); return _error("Selected transactions must have a non-zero value")
     # Adjust the GL balance for unmatched in-period deposits/payments; completion
