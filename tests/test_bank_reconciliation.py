@@ -74,6 +74,13 @@ def test_completion_rejects_difference_and_non_bank_account(app, client):
 
 def test_create_route_registration_and_production_compatibility_alias(app, client):
     rules = {(rule.rule, method) for rule in app.url_map.iter_rules() for method in rule.methods}
+    assert ("/admin/accounting/bank-reconciliations", "POST") in rules
+    assert ("/admin/accounting/bank-reconciliations", "GET") in rules
+    assert ("/admin/accounting/bank-reconciliations/<int:rec_id>", "GET") in rules
+    assert ("/admin/accounting/bank-reconciliations/<int:rec_id>/lines", "POST") in rules
+    assert ("/admin/accounting/bank-reconciliations/<int:rec_id>/lines/<int:line_id>", "DELETE") in rules
+    assert ("/admin/accounting/bank-reconciliations/<int:rec_id>/complete", "POST") in rules
+    assert ("/admin/accounting/bank-reconciliations/<int:rec_id>/reopen", "POST") in rules
     assert ("/admin/bank-reconciliations", "POST") in rules
     assert ("/bank-reconciliations", "POST") in rules
     assert ("/admin/bank-reconciliations", "GET") in rules
@@ -86,7 +93,7 @@ def test_create_route_registration_and_production_compatibility_alias(app, clien
         normal_balance="DEBIT", account_subtype="BANK", is_active=True, allow_manual_posting=True)
     db.session.add(bank); db.session.commit()
     journal_count = AccountingJournalEntry.query.count()
-    response = client.post("/bank-reconciliations", headers=headers, json={"bank_account_id": bank.id,
+    response = client.post("/admin/accounting/bank-reconciliations", headers=headers, json={"bank_account_id": bank.id,
         "statement_date_from": "2026-01-01", "statement_date_to": "2026-02-28",
         "statement_opening_balance": "0.00", "statement_closing_balance": "81565.54", "notes": "Draft"})
     assert response.status_code == 201
@@ -98,13 +105,13 @@ def test_create_route_registration_and_production_compatibility_alias(app, clien
 
     # Cross-origin POST callers must not rely on Flask's slash redirect. Both
     # deployed and canonical create paths accept either spelling directly.
-    slash_response = client.post("/admin/bank-reconciliations/", headers=headers, json={
+    slash_response = client.post("/admin/accounting/bank-reconciliations/", headers=headers, json={
         "bank_account_id": bank.id, "statement_date_from": "2026-03-01",
         "statement_date_to": "2026-03-31", "statement_opening_balance": "0.00",
         "statement_closing_balance": "0.00"})
     assert slash_response.status_code == 201
-    assert client.options("/bank-reconciliations").status_code == 204
-    assert client.options("/bank-reconciliations/").status_code == 204
+    assert client.options("/admin/accounting/bank-reconciliations").status_code == 204
+    assert client.options("/admin/accounting/bank-reconciliations/").status_code == 204
 
 
 def test_create_validation_and_authorization(app, client):
@@ -116,18 +123,23 @@ def test_create_validation_and_authorization(app, client):
     db.session.add_all([bank, expense]); db.session.commit()
     payload = {"bank_account_id": bank.id, "statement_date_from": "2026-01-01",
         "statement_date_to": "2026-02-28", "statement_opening_balance": "0", "statement_closing_balance": "1"}
-    assert client.post("/bank-reconciliations", json=payload).status_code == 401
+    route = "/admin/accounting/bank-reconciliations"
+    assert client.post(route, json=payload).status_code == 401
     staff = User(email="staff@example.com", name="Staff", role="staff")
     staff.set_password("password"); db.session.add(staff); db.session.commit()
     with app.app_context():
         staff_token = create_access_token(identity=str(staff.id), additional_claims={"role": "staff"})
-    assert client.post("/bank-reconciliations", headers={"Authorization": f"Bearer {staff_token}"},
+    assert client.post(route, headers={"Authorization": f"Bearer {staff_token}"},
         json=payload).status_code == 403
     missing = dict(payload); missing.pop("statement_date_from")
-    assert client.post("/bank-reconciliations", headers=headers, json=missing).status_code == 422
+    assert client.post(route, headers=headers, json=missing).status_code == 422
+    missing_closing = dict(payload); missing_closing.pop("statement_closing_balance")
+    assert client.post(route, headers=headers, json=missing_closing).status_code == 422
+    invalid_range = dict(payload, statement_date_from="2026-03-01")
+    assert client.post(route, headers=headers, json=invalid_range).status_code == 422
     invalid = dict(payload, bank_account_id=999999)
-    assert client.post("/bank-reconciliations", headers=headers, json=invalid).status_code == 422
+    assert client.post(route, headers=headers, json=invalid).status_code == 422
     non_bank = dict(payload, bank_account_id=expense.id)
-    assert client.post("/bank-reconciliations", headers=headers, json=non_bank).status_code == 422
+    assert client.post(route, headers=headers, json=non_bank).status_code == 422
     bank.is_active = False; db.session.commit()
-    assert client.post("/bank-reconciliations", headers=headers, json=payload).status_code == 422
+    assert client.post(route, headers=headers, json=payload).status_code == 422

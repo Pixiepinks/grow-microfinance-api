@@ -12,10 +12,11 @@ from ..models import (AccountingAccount, AccountingJournalEntry, AccountingJourn
 from .utils import role_required
 
 
-bank_reconciliation_bp = Blueprint("bank_reconciliation", __name__, url_prefix="/admin")
-# The deployed web application predates the admin-prefixed API contract and posts
-# to this path.  Keep the compatibility surface deliberately limited to create;
-# all new integrations should use /admin/bank-reconciliations.
+bank_reconciliation_bp = Blueprint("bank_reconciliation", __name__, url_prefix="/admin/accounting")
+# Retain the previously published admin routes while making the build/web route
+# the canonical API surface. The unprefixed compatibility surface remains
+# deliberately limited to create.
+bank_reconciliation_legacy_bp = Blueprint("bank_reconciliation_legacy", __name__, url_prefix="/admin")
 bank_reconciliation_compat_bp = Blueprint("bank_reconciliation_compat", __name__)
 EDITABLE = {"DRAFT", "IN_PROGRESS", "REOPENED"}
 ZERO = Decimal("0.00")
@@ -104,6 +105,7 @@ def _serialize(rec):
 
 
 @bank_reconciliation_bp.route("/bank-reconciliations", methods=["POST"], strict_slashes=False)
+@bank_reconciliation_legacy_bp.route("/bank-reconciliations", methods=["POST"], strict_slashes=False)
 @bank_reconciliation_compat_bp.route("/bank-reconciliations", methods=["POST"], strict_slashes=False)
 @role_required(["admin"])
 def create_reconciliation():
@@ -133,6 +135,7 @@ def create_reconciliation():
 
 
 @bank_reconciliation_bp.route("/bank-reconciliations", methods=["GET"])
+@bank_reconciliation_legacy_bp.route("/bank-reconciliations", methods=["GET"])
 @role_required(["admin"])
 def list_reconciliations():
     records = BankReconciliation.query.order_by(BankReconciliation.id.desc()).all()
@@ -140,12 +143,14 @@ def list_reconciliations():
 
 
 @bank_reconciliation_bp.route("/bank-reconciliations/<int:rec_id>", methods=["GET"])
+@bank_reconciliation_legacy_bp.route("/bank-reconciliations/<int:rec_id>", methods=["GET"])
 @role_required(["admin"])
 def get_reconciliation(rec_id):
     return jsonify(_serialize(BankReconciliation.query.get_or_404(rec_id)))
 
 
 @bank_reconciliation_bp.route("/bank-reconciliation/transactions", methods=["GET"])
+@bank_reconciliation_legacy_bp.route("/bank-reconciliation/transactions", methods=["GET"])
 @role_required(["admin"])
 def bank_transactions():
     try:
@@ -185,6 +190,7 @@ def bank_transactions():
 
 
 @bank_reconciliation_bp.route("/bank-reconciliations/<int:rec_id>/lines", methods=["POST"])
+@bank_reconciliation_legacy_bp.route("/bank-reconciliations/<int:rec_id>/lines", methods=["POST"])
 @role_required(["admin"])
 def add_line(rec_id):
     rec = BankReconciliation.query.with_for_update().get_or_404(rec_id)
@@ -204,6 +210,7 @@ def add_line(rec_id):
 
 
 @bank_reconciliation_bp.route("/bank-reconciliations/<int:rec_id>/lines/<int:line_id>", methods=["DELETE"])
+@bank_reconciliation_legacy_bp.route("/bank-reconciliations/<int:rec_id>/lines/<int:line_id>", methods=["DELETE"])
 @role_required(["admin"])
 def remove_line(rec_id, line_id):
     rec = BankReconciliation.query.with_for_update().get_or_404(rec_id)
@@ -217,6 +224,7 @@ def remove_line(rec_id, line_id):
 
 
 @bank_reconciliation_bp.route("/bank-reconciliations/<int:rec_id>/complete", methods=["POST"])
+@bank_reconciliation_legacy_bp.route("/bank-reconciliations/<int:rec_id>/complete", methods=["POST"])
 @role_required(["admin"])
 def complete(rec_id):
     rec = BankReconciliation.query.with_for_update().get_or_404(rec_id)
@@ -234,6 +242,7 @@ def complete(rec_id):
 
 
 @bank_reconciliation_bp.route("/bank-reconciliations/<int:rec_id>/reopen", methods=["POST"])
+@bank_reconciliation_legacy_bp.route("/bank-reconciliations/<int:rec_id>/reopen", methods=["POST"])
 @role_required(["admin"])
 def reopen(rec_id):
     rec = BankReconciliation.query.with_for_update().get_or_404(rec_id); data = request.get_json() or {}; reason = str(data.get("reason") or "").strip()
@@ -248,6 +257,7 @@ def reopen(rec_id):
 
 
 @bank_reconciliation_bp.route("/bank-reconciliations/<int:rec_id>/cancel", methods=["POST"])
+@bank_reconciliation_legacy_bp.route("/bank-reconciliations/<int:rec_id>/cancel", methods=["POST"])
 @role_required(["admin"])
 def cancel(rec_id):
     rec = BankReconciliation.query.with_for_update().get_or_404(rec_id); data = request.get_json() or {}; reason = str(data.get("reason") or "").strip()
