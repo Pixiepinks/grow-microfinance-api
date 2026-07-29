@@ -5,7 +5,7 @@ from flask_jwt_extended import create_access_token
 
 from app.extensions import db
 from app.models import (AccountingAccount, AccountingJournalEntry, AccountingJournalLine,
-                        BankReconciliation, BankReconciliationAudit, User)
+                        BankReconciliation, BankReconciliationAudit, BankReconciliationLine, User)
 
 
 def _headers(app):
@@ -263,3 +263,62 @@ def test_serializer_account_shape_invalid_contract_and_idempotent_repair(app, cl
     assert '"changed": false' in first.output and '"changed": false' in second.output
     assert '"accounting_journal_changes": "NONE"' in first.output
     assert AccountingJournalEntry.query.count() == journal_count
+
+
+def test_complete_requires_persisted_transactions_and_bulk_line_ids(app, client):
+    _, headers = _headers(app)
+    bank = AccountingAccount(account_code="1010", account_name="Bank", account_type="ASSET",
+        normal_balance="DEBIT", account_subtype="BANK")
+    other = AccountingAccount(account_code="1050", account_name="Other", account_type="ASSET",
+        normal_balance="DEBIT", account_subtype="OTHER")
+    db.session.add_all([bank, other]); db.session.commit()
+    first = _journal(bank, other, "J-BULK-1")
+    second = _journal(bank, other, "J-BULK-2")
+    rec_id = client.post("/admin/accounting/bank-reconciliations", headers=headers, json={
+        "bank_account_id": bank.id, "statement_date_from": "2026-02-01",
+        "statement_date_to": "2026-02-28", "statement_opening_balance": "0",
+        "statement_closing_balance": "4200"}).get_json()["id"]
+
+    empty = client.post(f"/admin/accounting/bank-reconciliations/{rec_id}/complete", headers=headers)
+    assert empty.status_code == 422
+    assert empty.get_json()["error"] == "no_transactions_selected"
+    assert BankReconciliation.query.get(rec_id).status == "DRAFT"
+
+    marked = client.post(f"/admin/accounting/bank-reconciliations/{rec_id}/lines", headers=headers,
+        json={"journal_line_ids": [first.lines[0].id, second.lines[0].id],
+              "reconciled_date": "2026-02-28", "statement_reference": "STMT-1"})
+    assert marked.status_code == 200
+    assert marked.get_json()["matched_count"] == 2
+    assert marked.get_json()["reconciled_debits"] == "4200.00"
+    assert BankReconciliationLine.query.count() == 2
+    assert all(line.is_reconciled for line in (first.lines[0], second.lines[0]))
+    assert not first.lines[1].is_reconciled and not second.lines[1].is_reconciled
+
+    completed = client.post(f"/admin/accounting/bank-reconciliations/{rec_id}/complete", headers=headers,
+        json={"journal_line_ids": [first.lines[0].id, second.lines[0].id]})
+    assert completed.status_code == 200
+    assert completed.get_json()["status"] == "COMPLETED"
+
+
+def test_repair_empty_completed_reconciliation_is_preview_first(app):
+    bank = AccountingAccount(account_code="1010", account_name="Bank", account_type="ASSET",
+        normal_balance="DEBIT", account_subtype="BANK")
+    other = AccountingAccount(account_code="1050", account_name="Other", account_type="ASSET",
+        normal_balance="DEBIT", account_subtype="OTHER")
+    db.session.add_all([bank, other]); db.session.commit(); entry = _journal(bank, other)
+    rec = BankReconciliation(reconciliation_number="BR-20260228-0001", bank_account_id=bank.id,
+        statement_date_from=date(2026, 2, 1), statement_date_to=date(2026, 2, 28),
+        statement_opening_balance=0, statement_closing_balance=2100, status="COMPLETED",
+        completed_at=date(2026, 2, 28))
+    db.session.add(rec); db.session.commit()
+    runner = app.test_cli_runner()
+    preview = runner.invoke(args=["repair-empty-bank-reconciliation", "--number",
+        rec.reconciliation_number, "--preview"])
+    assert preview.exit_code == 0 and '"invalid_empty_completion": true' in preview.output
+    assert rec.status == "COMPLETED"
+    applied = runner.invoke(args=["repair-empty-bank-reconciliation", "--number",
+        rec.reconciliation_number, "--apply"])
+    assert applied.exit_code == 0
+    assert rec.status == "IN_PROGRESS" and rec.completed_at is None
+    assert not entry.lines[0].is_reconciled and entry.lines[0].debit == Decimal("2100")
+    assert BankReconciliationAudit.query.filter_by(action="EMPTY_REPAIR").count() == 1

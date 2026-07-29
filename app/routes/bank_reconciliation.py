@@ -9,7 +9,7 @@ from sqlalchemy import func, or_
 from ..extensions import db
 from ..accounting import get_gl_lines_for_account, money
 from ..models import (AccountingAccount, AccountingJournalEntry, AccountingJournalLine,
-                      BankReconciliation, BankReconciliationAudit)
+                      BankReconciliation, BankReconciliationAudit, BankReconciliationLine)
 from .utils import role_required
 
 
@@ -28,8 +28,8 @@ def _uid():
     return int(identity) if identity else None
 
 
-def _error(message, field=None):
-    body = {"success": False, "error": "invalid_bank_account" if field == "bank_account_id" else "validation_error",
+def _error(message, field=None, code=None):
+    body = {"success": False, "error": code or ("invalid_bank_account" if field == "bank_account_id" else "validation_error"),
             "error_code": "BANK_RECONCILIATION_VALIDATION", "message": message}
     if field:
         body["field"] = field
@@ -100,11 +100,11 @@ def _refresh(rec):
                                       date_to=rec.statement_date_to)
     rec.gl_opening_balance = ledger["opening_balance"]
     rec.gl_closing_balance = ledger["closing_balance"]
-    selected = _posted_query(rec.bank_account_id).filter(
-        AccountingJournalLine.bank_reconciliation_id == rec.id).all()
+    selected = [allocation.journal_line for allocation in rec.allocations]
     rec.total_reconciled_debits = sum((Decimal(l.debit) for l in selected), ZERO)
     rec.total_reconciled_credits = sum((Decimal(l.credit) for l in selected), ZERO)
-    unmatched = [line for line in ledger["lines"] if not line.is_reconciled]
+    selected_ids = {line.id for line in selected}
+    unmatched = [line for line in ledger["lines"] if line.id not in selected_ids and not line.is_reconciled]
     rec.total_unreconciled_debits = sum((Decimal(l.debit) for l in unmatched), ZERO)
     rec.total_unreconciled_credits = sum((Decimal(l.credit) for l in unmatched), ZERO)
     return len(unmatched)
@@ -300,18 +300,35 @@ def reconciliation_transactions(rec_id):
 def add_line(rec_id):
     rec = BankReconciliation.query.with_for_update().get_or_404(rec_id)
     if rec.status not in EDITABLE: return _error("Completed or cancelled reconciliations are not editable")
-    data = request.get_json() or {}; line = db.session.get(AccountingJournalLine, data.get("journal_line_id"))
-    if not line or line.account_id != rec.bank_account_id or str(line.account.account_subtype).upper() != "BANK": return _error("Journal line must belong to the reconciliation bank account")
-    if line.bank_reconciliation_id == rec.id: return _error("Journal line is already in this reconciliation")
-    if line.is_reconciled or line.bank_reconciliation_id: return _error("Journal line is already reconciled in another reconciliation")
-    if str(line.journal_entry.status).upper() not in {"POSTED", "REVERSED"}: return _error("Only posted journal lines can be reconciled")
-    line.is_reconciled = True; line.bank_reconciliation_id = rec.id
-    line.reconciled_date = _date(data.get("reconciled_date") or rec.statement_date_to, "reconciled_date")
-    line.reconciled_at = datetime.utcnow(); line.reconciled_by_id = _uid()
-    line.bank_statement_reference = data.get("bank_statement_reference") or data.get("statement_reference")
-    line.reconciliation_note = data.get("reconciliation_note") or data.get("note")
-    rec.status = "IN_PROGRESS"; _refresh(rec); _audit(rec, "LINE_ADDED", line.id); db.session.commit()
-    return jsonify(_serialize(rec))
+    data = request.get_json() or {}
+    ids = data.get("journal_line_ids")
+    if ids is None: ids = [data.get("journal_line_id")]
+    if not isinstance(ids, list) or not ids or any(not isinstance(value, int) for value in ids):
+        return _error("journal_line_ids must be a non-empty list of journal-line IDs")
+    reconciled_date = _date(data.get("reconciled_date") or rec.statement_date_to, "reconciled_date")
+    if not rec.statement_date_from <= reconciled_date <= rec.statement_date_to:
+        return _error("reconciled_date must fall within the reconciliation period")
+    reference = data.get("bank_statement_reference") or data.get("statement_reference")
+    lines = AccountingJournalLine.query.filter(AccountingJournalLine.id.in_(set(ids))).with_for_update().all()
+    if len(lines) != len(set(ids)): return _error("Every journal_line_id must exist")
+    for line in lines:
+        if (line.account_id != rec.bank_account_id or str(line.account.account_subtype).upper() != "BANK"
+                or not rec.statement_date_from <= line.journal_entry.journal_date <= rec.statement_date_to):
+            return _error("Journal line must belong to the bank account and reconciliation period")
+        if str(line.journal_entry.status).upper() != "POSTED": return _error("Only posted journal lines can be reconciled")
+        if line.bank_reconciliation_id not in (None, rec.id): return _error("Journal line is already reconciled in another reconciliation")
+    for line in lines:
+        allocation = BankReconciliationLine.query.filter_by(bank_reconciliation_id=rec.id, journal_line_id=line.id).one_or_none()
+        if not allocation:
+            db.session.add(BankReconciliationLine(bank_reconciliation_id=rec.id, journal_line_id=line.id,
+                debit=line.debit, credit=line.credit, statement_reference=reference,
+                reconciled_date=reconciled_date, created_by_id=_uid()))
+        line.is_reconciled = True; line.bank_reconciliation_id = rec.id
+        line.reconciled_date = reconciled_date; line.reconciled_at = datetime.utcnow(); line.reconciled_by_id = _uid()
+        line.bank_statement_reference = reference
+        _audit(rec, "LINE_ADDED", line.id)
+    rec.status = "IN_PROGRESS"; db.session.flush(); _refresh(rec); db.session.commit()
+    result = _serialize(rec); result.update(success=True, matched_count=len(rec.allocations)); return jsonify(result)
 
 
 @bank_reconciliation_bp.route("/bank-reconciliations/<int:rec_id>/lines/<int:line_id>", methods=["DELETE"])
@@ -324,6 +341,7 @@ def remove_line(rec_id, line_id):
     if not line or line.bank_reconciliation_id != rec.id: return _error("Journal line is not in this reconciliation")
     line.is_reconciled = False; line.bank_reconciliation_id = None; line.reconciled_date = None
     line.reconciled_at = None; line.reconciled_by_id = None; line.bank_statement_reference = None; line.reconciliation_note = None
+    BankReconciliationLine.query.filter_by(bank_reconciliation_id=rec.id, journal_line_id=line.id).delete()
     _audit(rec, "LINE_REMOVED", line.id, request.args.get("reason")); _refresh(rec); db.session.commit()
     return jsonify(_serialize(rec))
 
@@ -334,15 +352,34 @@ def remove_line(rec_id, line_id):
 def complete(rec_id):
     rec = BankReconciliation.query.with_for_update().get_or_404(rec_id)
     if rec.status not in EDITABLE: return _error("Reconciliation is not editable")
+    data = request.get_json(silent=True) or {}
+    # Support the frontend's one-shot completion payload while retaining the
+    # persisted-lines workflow. The same validation and transaction are used.
+    if "journal_line_ids" in data:
+        supplied = data["journal_line_ids"]
+        persisted = {allocation.journal_line_id for allocation in rec.allocations}
+        if not isinstance(supplied, list) or set(supplied) != persisted:
+            db.session.rollback()
+            return _error("All journal_line_ids must be persisted with the lines endpoint before completion")
     _refresh(rec)
-    # Completion compares the statement with the authoritative General Ledger,
-    # never merely the subset of lines selected in this workspace.
-    difference = Decimal(rec.statement_closing_balance) - Decimal(rec.gl_closing_balance)
+    eligible_count = len(get_gl_lines_for_account(account_id=rec.bank_account_id,
+        date_from=rec.statement_date_from, date_to=rec.statement_date_to)["lines"])
+    if eligible_count and not rec.allocations:
+        db.session.rollback()
+        return _error("Select and mark bank transactions before completing reconciliation.",
+                      code="no_transactions_selected")
+    if rec.allocations and rec.total_reconciled_debits == ZERO and rec.total_reconciled_credits == ZERO:
+        db.session.rollback(); return _error("Selected transactions must have a non-zero value")
+    # Adjust the GL balance for unmatched in-period deposits/payments; completion
+    # is therefore based on the matched population, not merely the full GL total.
+    adjusted_gl = (Decimal(rec.gl_closing_balance) - Decimal(rec.total_unreconciled_debits)
+                   + Decimal(rec.total_unreconciled_credits))
+    difference = Decimal(rec.statement_closing_balance) - adjusted_gl
     if abs(difference) > Decimal("0.005"):
-        rec.status = "IN_PROGRESS"; db.session.commit()
+        db.session.rollback()
         return _error(f"Reconciliation difference must be 0.00 (current difference {difference:.2f})")
     rec.status = "COMPLETED"; rec.completed_at = datetime.utcnow(); rec.approved_by_id = _uid()
-    _audit(rec, "COMPLETED", reason=(request.get_json(silent=True) or {}).get("reason")); db.session.commit()
+    _audit(rec, "COMPLETED", reason=data.get("reason")); db.session.commit()
     result = _serialize(rec); result["difference"] = f"{difference:.2f}"; return jsonify(result)
 
 
@@ -356,6 +393,7 @@ def reopen(rec_id):
     line_ids = [line.id for line in rec.lines]
     for line in rec.lines:
         line.is_reconciled = False; line.bank_reconciliation_id = None; line.reconciled_date = None; line.reconciled_at = None; line.reconciled_by_id = None
+    BankReconciliationLine.query.filter_by(bank_reconciliation_id=rec.id).delete()
     rec.status = "REOPENED"; rec.completed_at = None; _audit(rec, "REOPENED", reason=reason)
     for line_id in line_ids: _audit(rec, "LINE_UNRECONCILED", line_id, reason)
     _refresh(rec); db.session.commit(); return jsonify(_serialize(rec))
@@ -370,5 +408,6 @@ def cancel(rec_id):
     if not reason: return _error("A cancellation reason is required", "reason")
     for line in list(rec.lines):
         line.is_reconciled = False; line.bank_reconciliation_id = None; line.reconciled_date = None; line.reconciled_at = None; line.reconciled_by_id = None
+    BankReconciliationLine.query.filter_by(bank_reconciliation_id=rec.id).delete()
     rec.status = "CANCELLED"; _audit(rec, "CANCELLED", reason=reason); _refresh(rec); db.session.commit()
     return jsonify(_serialize(rec))
