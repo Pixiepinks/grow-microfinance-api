@@ -32,6 +32,9 @@ from .models import (
 CENT = Decimal("0.01")
 ACCOUNT_TYPES = {"ASSET", "LIABILITY", "EQUITY", "INCOME", "EXPENSE"}
 NORMAL_BALANCES = {"DEBIT", "CREDIT"}
+EFFECTIVELY_POSTED_JOURNAL_STATUSES = frozenset({
+    "POSTED", "REVERSED", "APPROVED_AND_POSTED",
+})
 ACCOUNT_SUBTYPES = {"CASH", "BANK", "COLLECTION_CLEARING", "COLLECTION_CLEARING_CONTROL", "LOAN_RECEIVABLE", "INTEREST_RECEIVABLE", "PENALTY_RECEIVABLE", "OTHER_CURRENT_ASSET", "FIXED_ASSET", "ACCOUNTS_PAYABLE", "BORROWING", "CUSTOMER_ADVANCE", "CAPITAL", "RETAINED_EARNINGS", "INTEREST_INCOME", "PENALTY_INCOME", "FEE_INCOME", "OPERATING_EXPENSE", "WRITE_OFF_EXPENSE", "DELAY_INTEREST_WAIVER", "SUSPENSE", "OTHER"}
 SYSTEM_MAPPINGS = {
     "DEFAULT_DISBURSEMENT_ACCOUNT": "1010",
@@ -1064,7 +1067,7 @@ def get_gl_lines_for_account(account_id=None, date_from=None, date_to=None,
     """
     account = _resolve_ledger_account(account_id, account_code)
     customer_id = _int_filter(customer_id, "customer_id"); loan_id = _int_filter(loan_id, "loan_id")
-    filters=[AccountingJournalLine.account_id == account.id, func.upper(AccountingJournalEntry.status).in_(["POSTED", "REVERSED"])]
+    filters=[AccountingJournalLine.account_id == account.id, effectively_posted_journal_filter()]
     if customer_id is not None: filters.append(AccountingJournalLine.customer_id == customer_id)
     if loan_id is not None: filters.append(AccountingJournalLine.loan_id == loan_id)
     q=(AccountingJournalLine.query.join(AccountingJournalEntry).outerjoin(Customer, AccountingJournalLine.customer_id == Customer.id).outerjoin(Loan, AccountingJournalLine.loan_id == Loan.id).outerjoin(Payment, AccountingJournalLine.payment_id == Payment.id).filter(*filters))
@@ -1169,9 +1172,29 @@ def _normal_balance_for(account):
     return "DEBIT" if _normal_account_type(account.account_type) in ("ASSET", "EXPENSE") else "CREDIT"
 
 
+def normalized_journal_status(status):
+    return str(status or "").strip().upper()
+
+
+def is_effectively_posted_journal(entry):
+    """Return whether an entry participates in posted accounting reports.
+
+    Reversed entries remain in the ledger so that the original/reversal pair nets
+    to zero.  APPROVED_AND_POSTED is retained for historical finalized entries;
+    plain APPROVED, DRAFT, and missing statuses are not postings.
+    """
+    return normalized_journal_status(entry.status) in EFFECTIVELY_POSTED_JOURNAL_STATUSES
+
+
+def effectively_posted_journal_filter():
+    """SQL equivalent of :func:`is_effectively_posted_journal`."""
+    return func.upper(func.trim(AccountingJournalEntry.status)).in_(
+        EFFECTIVELY_POSTED_JOURNAL_STATUSES
+    )
+
+
 def _posted_filter():
-    # Include posted reversal pairs so reversed activity nets to zero in shared balances.
-    return func.upper(AccountingJournalEntry.status).in_(["POSTED", "REVERSED"])
+    return effectively_posted_journal_filter()
 
 
 def _journal_accounting_date():

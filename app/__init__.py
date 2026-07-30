@@ -3,7 +3,7 @@ import time
 import click
 import json
 from decimal import Decimal
-from datetime import date
+from datetime import date, datetime
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
@@ -232,7 +232,7 @@ def create_app():
     def inspect_bank_reconciliation(number):
         """Inspect reconciliation selections and GL flags without changing data."""
         from .accounting import get_gl_lines_for_account
-        from .models import BankReconciliation
+        from .models import AccountingJournalEntry, AccountingJournalLine, BankReconciliation
         rec = BankReconciliation.query.filter_by(reconciliation_number=number).one_or_none()
         if not rec: raise click.ClickException("Bank reconciliation not found")
         ledger = get_gl_lines_for_account(account_id=rec.bank_account_id,
@@ -254,6 +254,106 @@ def create_app():
             "invalid_empty_completion": (rec.status == "COMPLETED" and not rec.allocations
                                            and bool(ledger["lines"]))}
         click.echo(json.dumps(report, sort_keys=True))
+
+    def _bank_recon_journal_status_rows(rec):
+        from .accounting import is_effectively_posted_journal, normalized_journal_status
+        from .models import AccountingJournalEntry, AccountingJournalLine
+        lines = (AccountingJournalLine.query.join(AccountingJournalEntry)
+                 .filter(AccountingJournalLine.account_id == rec.bank_account_id,
+                         AccountingJournalEntry.journal_date >= rec.statement_date_from,
+                         AccountingJournalEntry.journal_date <= rec.statement_date_to)
+                 .order_by(AccountingJournalEntry.journal_date,
+                           AccountingJournalEntry.journal_no,
+                           AccountingJournalLine.line_no).all())
+        rows = []
+        for line in lines:
+            entry = line.journal_entry
+            effective = is_effectively_posted_journal(entry)
+            reason = None if effective else "Only posted journal lines can be reconciled."
+            rows.append({"journal_line_id": line.id, "journal_entry_id": entry.id,
+                "journal_number": entry.journal_no,
+                "posting_date": entry.journal_date.isoformat(),
+                "description": line.description or entry.description,
+                "account_id": line.account_id, "account_code": line.account.account_code,
+                "journal_header_status": entry.status, "journal_line_status": None,
+                "normalized_status": normalized_journal_status(entry.status),
+                "posted_at": entry.posted_at.isoformat() if entry.posted_at else None,
+                "is_posted": effective, "is_reconcilable": effective,
+                "eligibility_result": "eligible" if effective else "rejected",
+                "rejection_reason": reason,
+                "currently_reconciled": bool(line.is_reconciled),
+                "selected_in_reconciliation": line.bank_reconciliation_id == rec.id})
+        return rows
+
+    @app.cli.command("inspect-bank-recon-line-status")
+    @click.option("--reconciliation-number", required=True)
+    def inspect_bank_recon_line_status(reconciliation_number):
+        """Report every period bank line and its reconciliation eligibility."""
+        from .models import AccountingJournalEntry, AccountingJournalLine, BankReconciliation
+        rec = BankReconciliation.query.filter_by(
+            reconciliation_number=reconciliation_number).one_or_none()
+        if not rec:
+            raise click.ClickException("Bank reconciliation not found")
+        rows = _bank_recon_journal_status_rows(rec)
+        click.echo(json.dumps({"reconciliation_number": reconciliation_number,
+            "request_payload_note": "HTTP request payloads are not persisted; selected_in_reconciliation reflects persisted selections.",
+            "lines": rows,
+            "invalid_lines": [row for row in rows if not row["is_reconcilable"]],
+            "journal_amount_changes": "NONE", "gl_line_changes": "NONE"},
+            indent=2, sort_keys=True))
+
+    @app.cli.command("repair-posted-journal-status")
+    @click.option("--reconciliation-number", required=True)
+    @click.option("--preview", "preview_mode", is_flag=True)
+    @click.option("--apply", "apply_changes", is_flag=True)
+    def repair_posted_journal_status(reconciliation_number, preview_mode, apply_changes):
+        """Canonicalize only entries already included by the shared GL predicate."""
+        from .accounting import is_effectively_posted_journal, normalized_journal_status
+        from .models import AccountingJournalEntry, AccountingJournalLine, BankReconciliation
+        if preview_mode == apply_changes:
+            raise click.ClickException("Specify exactly one of --preview or --apply")
+        rec = BankReconciliation.query.filter_by(
+            reconciliation_number=reconciliation_number).with_for_update().one_or_none()
+        if not rec:
+            raise click.ClickException("Bank reconciliation not found")
+        entries = {line.journal_entry for line in
+                   (allocation.journal_line for allocation in rec.allocations)}
+        if not entries:
+            # A failed request leaves no allocations, so inspect all bank lines in
+            # the period while retaining the same strict effective-posting guard.
+            period_lines = (AccountingJournalLine.query.join(AccountingJournalEntry)
+                            .filter(AccountingJournalLine.account_id == rec.bank_account_id,
+                                    AccountingJournalEntry.journal_date >= rec.statement_date_from,
+                                    AccountingJournalEntry.journal_date <= rec.statement_date_to).all())
+            entries = {line.journal_entry for line in period_lines}
+        repairs = []
+        for entry in sorted(entries, key=lambda item: item.id):
+            if not is_effectively_posted_journal(entry):
+                continue
+            normalized = normalized_journal_status(entry.status)
+            proposed = "REVERSED" if normalized == "REVERSED" else "POSTED"
+            if entry.status == proposed and entry.posted_at is not None:
+                continue
+            repairs.append({"journal_number": entry.journal_no,
+                "current_status": entry.status,
+                "posted_at": entry.posted_at.isoformat() if entry.posted_at else None,
+                "why_effective_posting": "Included by the shared General Ledger posted-status predicate.",
+                "proposed_canonical_status": proposed,
+                "proposed_posted_at": (entry.posted_at or entry.created_at).isoformat(),
+                "journal_amount_changes": "NONE", "gl_line_changes": "NONE"})
+            if apply_changes:
+                entry.status = proposed
+                if entry.posted_at is None:
+                    entry.posted_at = entry.created_at or datetime.utcnow()
+        if apply_changes:
+            db.session.commit()
+        else:
+            db.session.rollback()
+        click.echo(json.dumps({"reconciliation_number": reconciliation_number,
+            "mode": "apply" if apply_changes else "preview", "repairs": repairs,
+            "changed": len(repairs) if apply_changes else 0,
+            "journal_amount_changes": "NONE", "gl_line_changes": "NONE"},
+            indent=2, sort_keys=True))
 
     @app.cli.command("repair-invalid-bank-reconciliation")
     @click.option("--number", required=True)

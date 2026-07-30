@@ -333,3 +333,97 @@ def test_repair_empty_completed_reconciliation_is_preview_first(app):
         rec.reconciliation_number, "--apply"])
     assert second.exit_code == 0 and '"changed": false' in second.output
     assert BankReconciliationAudit.query.filter_by(action="INVALID_COMPLETION_REPAIRED").count() == 1
+
+
+def test_effective_posted_status_is_shared_by_gl_listing_and_marking(app, client):
+    _, headers = _headers(app)
+    bank = AccountingAccount(account_code="1010", account_name="Bank", account_type="ASSET",
+        normal_balance="DEBIT", account_subtype="BANK")
+    other = AccountingAccount(account_code="1050", account_name="Other", account_type="ASSET",
+        normal_balance="DEBIT", account_subtype="OTHER")
+    db.session.add_all([bank, other]); db.session.commit()
+    legacy = _journal(bank, other, "J-LEGACY-POSTED")
+    legacy.status = " posted "
+    finalized = _journal(bank, other, "J-APPROVED-AND-POSTED")
+    finalized.status = "APPROVED_AND_POSTED"
+    db.session.commit()
+    rec_id = client.post("/admin/accounting/bank-reconciliations", headers=headers, json={
+        "bank_account_id": bank.id, "statement_date_from": "2026-02-01",
+        "statement_date_to": "2026-02-28", "statement_opening_balance": "0",
+        "statement_closing_balance": "4200"}).get_json()["id"]
+
+    gl = client.get(f"/admin/accounting/general-ledger?account_id={bank.id}",
+                    headers=headers).get_json()
+    assert {row["journal_no"] for row in gl["transactions"]} == {
+        "J-LEGACY-POSTED", "J-APPROVED-AND-POSTED"}
+    listing = client.get(
+        f"/admin/accounting/bank-reconciliations/{rec_id}/transactions",
+        headers=headers).get_json()["transactions"]
+    assert all(row["is_posted"] and row["is_reconcilable"] for row in listing)
+    response = client.post(f"/admin/accounting/bank-reconciliations/{rec_id}/lines",
+        headers=headers, json={"journal_line_ids": [legacy.lines[0].id, finalized.lines[0].id]})
+    assert response.status_code == 200
+    assert BankReconciliationLine.query.count() == 2
+
+
+def test_draft_and_mixed_batch_return_line_details_without_partial_marking(app, client):
+    _, headers = _headers(app)
+    bank = AccountingAccount(account_code="1010", account_name="Bank", account_type="ASSET",
+        normal_balance="DEBIT", account_subtype="BANK")
+    other = AccountingAccount(account_code="1050", account_name="Other", account_type="ASSET",
+        normal_balance="DEBIT", account_subtype="OTHER")
+    db.session.add_all([bank, other]); db.session.commit()
+    posted = _journal(bank, other, "J-POSTED")
+    draft = _journal(bank, other, "J-DRAFT")
+    draft.status = "DRAFT"; db.session.commit()
+    rec_id = client.post("/admin/accounting/bank-reconciliations", headers=headers, json={
+        "bank_account_id": bank.id, "statement_date_from": "2026-02-01",
+        "statement_date_to": "2026-02-28", "statement_opening_balance": "0",
+        "statement_closing_balance": "2100"}).get_json()["id"]
+
+    listing = client.get(
+        f"/admin/accounting/bank-reconciliations/{rec_id}/transactions",
+        headers=headers).get_json()["transactions"]
+    draft_row = next(row for row in listing if row["journal_number"] == "J-DRAFT")
+    assert draft_row["journal_status"] == "DRAFT"
+    assert draft_row["is_posted"] is False and draft_row["is_reconcilable"] is False
+    assert draft_row["reconciliation_block_reason"] == "Journal entry is not posted."
+
+    response = client.post(f"/admin/accounting/bank-reconciliations/{rec_id}/lines",
+        headers=headers, json={"journal_line_ids": [posted.lines[0].id, draft.lines[0].id]})
+    assert response.status_code == 422
+    assert response.get_json() == {"error": "unposted_journal_lines",
+        "message": "One or more selected journal lines are not posted.",
+        "invalid_lines": [{"journal_line_id": draft.lines[0].id,
+            "journal_number": "J-DRAFT", "description": "Collector deposit",
+            "journal_status": "DRAFT",
+            "reason": "Only posted journal lines can be reconciled."}]}
+    assert BankReconciliationLine.query.count() == 0
+    assert not posted.lines[0].is_reconciled and not draft.lines[0].is_reconciled
+
+
+def test_posted_status_repair_is_preview_first_and_never_repairs_draft(app):
+    bank = AccountingAccount(account_code="1010", account_name="Bank", account_type="ASSET",
+        normal_balance="DEBIT", account_subtype="BANK")
+    other = AccountingAccount(account_code="1050", account_name="Other", account_type="ASSET",
+        normal_balance="DEBIT", account_subtype="OTHER")
+    db.session.add_all([bank, other]); db.session.commit()
+    legacy = _journal(bank, other, "J-LEGACY"); legacy.status = "posted"
+    draft = _journal(bank, other, "J-GENUINE-DRAFT"); draft.status = "DRAFT"
+    rec = BankReconciliation(reconciliation_number="BR-20260307-0002", bank_account_id=bank.id,
+        statement_date_from=date(2026, 2, 1), statement_date_to=date(2026, 3, 7),
+        statement_opening_balance=0, statement_closing_balance=2100, status="DRAFT")
+    db.session.add(rec); db.session.commit()
+    runner = app.test_cli_runner()
+    preview = runner.invoke(args=["repair-posted-journal-status",
+        "--reconciliation-number", rec.reconciliation_number, "--preview"])
+    assert preview.exit_code == 0
+    assert '"journal_number": "J-LEGACY"' in preview.output
+    assert "J-GENUINE-DRAFT" not in preview.output
+    assert legacy.status == "posted" and legacy.posted_at is None
+    applied = runner.invoke(args=["repair-posted-journal-status",
+        "--reconciliation-number", rec.reconciliation_number, "--apply"])
+    assert applied.exit_code == 0
+    assert legacy.status == "POSTED" and legacy.posted_at is not None
+    assert draft.status == "DRAFT" and draft.posted_at is None
+    assert legacy.total_debit == Decimal("2100") and draft.total_debit == Decimal("2100")
