@@ -7,7 +7,8 @@ from flask_jwt_extended import get_jwt_identity
 from sqlalchemy import func, or_
 
 from ..extensions import db
-from ..accounting import get_gl_lines_for_account, money
+from ..accounting import (effectively_posted_journal_filter, get_gl_lines_for_account,
+                          is_effectively_posted_journal, money)
 from ..models import (AccountingAccount, AccountingJournalEntry, AccountingJournalLine,
                       BankReconciliation, BankReconciliationAudit, BankReconciliationLine)
 from .utils import role_required
@@ -91,7 +92,30 @@ def _audit(rec, action, line_id=None, reason=None):
 def _posted_query(account_id):
     return (AccountingJournalLine.query.join(AccountingJournalEntry)
             .filter(AccountingJournalLine.account_id == account_id,
-                    func.upper(AccountingJournalEntry.status).in_(["POSTED", "REVERSED"])))
+                    effectively_posted_journal_filter()))
+
+
+def _reconciliation_eligibility(line, rec=None):
+    entry = line.journal_entry
+    if not is_effectively_posted_journal(entry):
+        return False, "Journal entry is not posted."
+    if rec and line.account_id != rec.bank_account_id:
+        return False, "Journal line does not belong to the reconciliation bank account."
+    if rec and not rec.statement_date_from <= entry.journal_date <= rec.statement_date_to:
+        return False, "Journal line is outside the reconciliation period."
+    if rec and line.bank_reconciliation_id not in (None, rec.id):
+        return False, "Journal line is already reconciled in another reconciliation."
+    return True, None
+
+
+def _line_status_fields(line, rec=None):
+    posted = is_effectively_posted_journal(line.journal_entry)
+    eligible, reason = _reconciliation_eligibility(line, rec)
+    return {"journal_status": line.journal_entry.status, "journal_line_status": None,
+            "posted_at": (line.journal_entry.posted_at.isoformat()
+                          if line.journal_entry.posted_at else None),
+            "is_posted": posted, "is_reconcilable": eligible,
+            "reconciliation_block_reason": reason}
 
 
 def _refresh(rec):
@@ -258,24 +282,28 @@ def reconciliation_transactions(rec_id):
     """Return GL-authoritative, selectable journal lines for a reconciliation."""
     rec = BankReconciliation.query.get_or_404(rec_id)
     account = _bank(rec.bank_account_id)
-    before_status = (AccountingJournalLine.query.join(AccountingJournalEntry)
+    period_lines = (AccountingJournalLine.query.join(AccountingJournalEntry)
                      .filter(AccountingJournalLine.account_id == account.id,
                              AccountingJournalEntry.journal_date >= rec.statement_date_from,
                              AccountingJournalEntry.journal_date <= rec.statement_date_to)
-                     .count())
+                     .order_by(AccountingJournalEntry.journal_date,
+                               AccountingJournalEntry.journal_no,
+                               AccountingJournalLine.line_no).all())
+    before_status = len(period_lines)
     ledger = get_gl_lines_for_account(account_id=account.id,
                                       date_from=rec.statement_date_from,
                                       date_to=rec.statement_date_to)
-    eligible = []
-    for line in ledger["lines"]:
+    visible = []
+    for line in period_lines:
         other_completed = (line.bank_reconciliation_id not in (None, rec.id)
                            and line.bank_reconciliation
                            and line.bank_reconciliation.status == "COMPLETED")
         if not other_completed:
-            eligible.append(line)
+            visible.append(line)
 
-    reconciled = [line for line in eligible if line.bank_reconciliation_id == rec.id]
-    unreconciled = [line for line in eligible if line.bank_reconciliation_id != rec.id]
+    posted_visible = [line for line in visible if is_effectively_posted_journal(line.journal_entry)]
+    reconciled = [line for line in posted_visible if line.bank_reconciliation_id == rec.id]
+    unreconciled = [line for line in posted_visible if line.bank_reconciliation_id != rec.id]
     reconciled_debits = sum((money(line.debit) for line in reconciled), ZERO)
     reconciled_credits = sum((money(line.credit) for line in reconciled), ZERO)
     unreconciled_debits = sum((money(line.debit) for line in unreconciled), ZERO)
@@ -289,20 +317,24 @@ def reconciliation_transactions(rec_id):
         "date_from": rec.statement_date_from.isoformat(), "date_to": rec.statement_date_to.isoformat(),
         "journal_line_count_before_status_filter": before_status,
         "journal_line_count_after_status_filter": len(ledger["lines"]),
-        "eligible_reconciliation_line_count": len(eligible)})
+        "eligible_reconciliation_line_count": sum(_reconciliation_eligibility(line, rec)[0]
+                                                   for line in visible)})
 
     transactions = []
-    for line in eligible:
+    running_by_id = {line.id: line.gl_running_balance for line in ledger["lines"]}
+    for line in visible:
         entry = line.journal_entry
         transactions.append({
             "journal_line_id": line.id, "journal_entry_id": entry.id,
             "journal_number": entry.journal_no, "posting_date": entry.journal_date.isoformat(),
             "description": line.description or entry.description, "reference": entry.reference,
             "debit": f"{money(line.debit):.2f}", "credit": f"{money(line.credit):.2f}",
-            "running_balance": f"{line.gl_running_balance:.2f}",
+            "running_balance": (f"{running_by_id[line.id]:.2f}"
+                                if line.id in running_by_id else None),
             "is_reconciled": line.bank_reconciliation_id == rec.id,
             "reconciliation_number": (line.bank_reconciliation.reconciliation_number
-                                      if line.bank_reconciliation else None)})
+                                      if line.bank_reconciliation else None),
+            **_line_status_fields(line, rec)})
     return jsonify({
         "reconciliation": {"id": rec.id, "reconciliation_number": rec.reconciliation_number,
             "bank_account_id": account.id, "bank_account_code": account.account_code,
@@ -337,16 +369,33 @@ def add_line(rec_id):
         db.session.rollback()
         return _error(str(exc))
     if not rec.statement_date_from <= reconciled_date <= rec.statement_date_to:
+        db.session.rollback()
         return _error("reconciled_date must fall within the reconciliation period")
     reference = data.get("bank_statement_reference") or data.get("statement_reference")
     lines = AccountingJournalLine.query.filter(AccountingJournalLine.id.in_(set(ids))).with_for_update().all()
-    if len(lines) != len(set(ids)): return _error("Every journal_line_id must exist")
+    if len(lines) != len(set(ids)):
+        db.session.rollback()
+        return _error("Every journal_line_id must exist")
+    invalid_posted = []
+    for line in lines:
+        if not is_effectively_posted_journal(line.journal_entry):
+            invalid_posted.append({"journal_line_id": line.id,
+                "journal_number": line.journal_entry.journal_no,
+                "description": line.description or line.journal_entry.description,
+                "journal_status": line.journal_entry.status,
+                "reason": "Only posted journal lines can be reconciled."})
+    if invalid_posted:
+        db.session.rollback()
+        return jsonify({"error": "unposted_journal_lines",
+            "message": "One or more selected journal lines are not posted.",
+            "invalid_lines": invalid_posted}), 422
     for line in lines:
         if (line.account_id != rec.bank_account_id or str(line.account.account_subtype).upper() != "BANK"
                 or not rec.statement_date_from <= line.journal_entry.journal_date <= rec.statement_date_to):
+            db.session.rollback()
             return _error("Journal line must belong to the bank account and reconciliation period")
-        if str(line.journal_entry.status).upper() != "POSTED": return _error("Only posted journal lines can be reconciled")
         if line.bank_reconciliation_id not in (None, rec.id):
+            db.session.rollback()
             return _error("Journal line is already reconciled in another reconciliation")
     for line in lines:
         allocation = BankReconciliationLine.query.filter_by(bank_reconciliation_id=rec.id, journal_line_id=line.id).one_or_none()
