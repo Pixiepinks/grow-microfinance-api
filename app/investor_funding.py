@@ -619,6 +619,45 @@ def run_monthly_investor_interest_accrual(period_start, period_end, agreement_id
     }
 
 
+def investor_interest_accrual_dashboard(period_start, period_end):
+    """Build one month's dashboard from the same calculations used by a preview.
+
+    Persisted and calculated values are kept separate in the response so callers
+    cannot mistake a preview for accounting history.  This function never posts
+    or otherwise mutates an accrual or journal.
+    """
+    preview = run_monthly_investor_interest_accrual(period_start, period_end, post=False)
+    posted = InvestorInterestAccrual.query.filter_by(
+        accrual_period_start=period_start,
+        accrual_period_end=period_end,
+    ).filter(
+        InvestorInterestAccrual.status.in_(POSTED_ACCRUAL_STATUSES),
+        InvestorInterestAccrual.reversed_at.is_(None),
+    ).all()
+
+    preview_items = [item for item in preview["items"] if item["status"] != "ALREADY_POSTED"]
+    posted_principal = sum((money(item.average_daily_balance) for item in posted), Decimal("0.00"))
+    preview_principal = sum((money(item["average_daily_balance"]) for item in preview_items), Decimal("0.00"))
+    posted_interest = sum((money(item.gross_interest_amount) for item in posted), Decimal("0.00"))
+    preview_interest = sum((money(item["gross_interest"]) for item in preview_items), Decimal("0.00"))
+
+    awaiting_payment = sum(
+        money(item.net_interest_payable) - money(item.payment_amount) - money(item.capitalization_amount) > 0
+        for item in posted
+    )
+    return {
+        "accrual_month": period_start.strftime("%Y-%m"),
+        "agreements_requiring_accrual": len(preview_items),
+        "accruals_posted_this_month": len(posted),
+        "accruals_awaiting_payment": awaiting_payment,
+        "accrual_exceptions": len(preview["exceptions"]),
+        "total_investor_principal": str(money(posted_principal + preview_principal)),
+        "posted_accrued_interest": str(money(posted_interest)),
+        "preview_accrued_interest": str(money(preview_interest)),
+        "total_accrued_interest": str(money(posted_interest + preview_interest)),
+    }
+
+
 def post_investor_interest_accrual(agreement_id, period_start, period_end, requested_by=None):
     agr = InvestorFundingAgreement.query.get(agreement_id); require_open_accounting_period(period_end)
     existing = InvestorInterestAccrual.query.filter_by(agreement_id=agreement_id, accrual_period_start=period_start, accrual_period_end=period_end).first()

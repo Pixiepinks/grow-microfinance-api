@@ -50,6 +50,34 @@ def test_canonical_route_is_registered_and_validation_is_json(app, client):
     }
 
 
+def test_dashboard_route_is_registered_supports_month_alias_and_options(app, client):
+    rules = {rule.rule: rule.methods for rule in app.url_map.iter_rules()}
+    path = "/admin/investor-funding/interest-accruals/dashboard"
+    assert path in rules
+    assert {"GET", "OPTIONS"}.issubset(rules[path])
+    headers = auth_headers(app)
+    funded_agreement()
+
+    for query in ("month=2026-07", "accrual_month=2026-07"):
+        response = client.get(f"{path}?{query}", headers=headers)
+        assert response.status_code == 200
+        assert response.is_json
+        body = response.get_json()
+        assert body == {
+            "accrual_month": "2026-07",
+            "agreements_requiring_accrual": 1,
+            "accruals_posted_this_month": 0,
+            "accruals_awaiting_payment": 0,
+            "accrual_exceptions": 0,
+            "total_investor_principal": "100000.00",
+            "posted_accrued_interest": "0.00",
+            "preview_accrued_interest": "2000.00",
+            "total_accrued_interest": "2000.00",
+        }
+
+    assert client.options(path).status_code in {200, 204}
+
+
 def test_blank_missing_and_null_agreement_preview_all_without_writes(app, client):
     headers = auth_headers(app)
     first = funded_agreement("First Investor")
@@ -68,6 +96,8 @@ def test_blank_missing_and_null_agreement_preview_all_without_writes(app, client
         assert response.status_code == 200
         body = response.get_json()
         assert body["preview_only"] is True
+        assert body["accrual_month"] == "2026-07"
+        assert all(row["accrual_month"] == "2026-07" for row in body["items"])
         assert {row["agreement_id"] for row in body["items"]} == {first.id, second.id}
         assert body["agreements_requiring_accrual"] == 2
         assert body["total_accrued_interest"] == "4000.00"
@@ -75,6 +105,17 @@ def test_blank_missing_and_null_agreement_preview_all_without_writes(app, client
     assert AccountingJournalEntry.query.count() == journals_before
     if hasattr(payable, "journal_lines"):
         assert sum(len(j.lines) for j in payable.journal_lines) == payable_lines_before
+
+
+def test_full_iso_date_is_normalized_without_changing_month(app, client):
+    headers = auth_headers(app)
+    funded_agreement()
+    response = client.post("/admin/investor-funding/interest-accruals/run", json={
+        "accrual_month": "2026-07-31", "preview_only": True, "post": False,
+    }, headers=headers)
+    assert response.status_code == 200
+    assert response.get_json()["accrual_month"] == "2026-07"
+    assert response.get_json()["items"][0]["accrual_month"] == "2026-07"
 
 
 def test_specific_agreement_errors_and_filtering(app, client):
@@ -127,6 +168,45 @@ def test_post_is_balanced_duplicate_safe_and_visible_in_list_and_summary(app, cl
     summary = client.get("/admin/investor-funding/interest-accruals/summary?month=2026-07", headers=headers).get_json()
     assert summary["accruals_posted_this_month"] == 1
     assert summary["accruals_awaiting_payment"] == 1
+    assert summary["agreements_requiring_accrual"] == 0
+    assert summary["posted_accrued_interest"] == "2000.00"
+    assert summary["preview_accrued_interest"] == "0.00"
+    assert summary["total_accrued_interest"] == "2000.00"
+
+
+def test_month_filters_and_dashboard_do_not_mix_june_and_july(app, client):
+    headers = auth_headers(app)
+    agreement = funded_agreement("Historical Investor", start_date="2026-06-01")
+    june_payload = {"accrual_month": "2026-06", "preview_only": False, "post": True}
+    june_post = client.post(
+        "/admin/investor-funding/interest-accruals/run", json=june_payload, headers=headers
+    )
+    assert june_post.status_code == 200
+    june_accrual = InvestorInterestAccrual.query.one()
+    june_snapshot = (june_accrual.id, june_accrual.gross_interest_amount, june_accrual.journal_entry_id)
+    journal_count = AccountingJournalEntry.query.count()
+
+    july_list = client.get(
+        "/admin/investor-funding/interest-accruals?month=2026-07", headers=headers
+    ).get_json()
+    june_list = client.get(
+        "/admin/investor-funding/interest-accruals?accrual_month=2026-06", headers=headers
+    ).get_json()
+    july_dashboard = client.get(
+        "/admin/investor-funding/interest-accruals/dashboard?month=2026-07", headers=headers
+    ).get_json()
+
+    assert july_list["items"] == []
+    assert july_list["total"] == 0
+    assert june_list["total"] == 1
+    assert june_list["items"][0]["accrual_month"] == "2026-06"
+    assert july_dashboard["accruals_posted_this_month"] == 0
+    assert july_dashboard["agreements_requiring_accrual"] == 1
+    assert july_dashboard["total_investor_principal"] == "100000.00"
+    assert july_dashboard["preview_accrued_interest"] == "2000.00"
+    assert AccountingJournalEntry.query.count() == journal_count
+    db.session.refresh(june_accrual)
+    assert (june_accrual.id, june_accrual.gross_interest_amount, june_accrual.journal_entry_id) == june_snapshot
 
 
 def test_inactive_and_not_started_agreements_are_excluded(app, client):

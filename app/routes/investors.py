@@ -5,7 +5,7 @@ from sqlalchemy import or_
 from flask_jwt_extended import get_jwt_identity
 from ..extensions import db
 from ..models import AccountingJournalEntry, Investor, InvestorFundingAgreement, InvestorFundingTransaction, InvestorInterestAccrual
-from ..investor_funding import INCREASE_TYPES, DECREASE_TYPES, create_investor, create_agreement, record_funding, principal_repayment, calculate_investor_interest, post_investor_interest_accrual, pay_interest, capitalize_interest, month_bounds, completed_periods_for, reverse_investor_transaction, investor_reconciliation, reverse_interest_accrual, catch_up_investor_interest, investor_interest_summary, run_monthly_investor_interest_accrual
+from ..investor_funding import INCREASE_TYPES, DECREASE_TYPES, create_investor, create_agreement, record_funding, principal_repayment, calculate_investor_interest, post_investor_interest_accrual, pay_interest, capitalize_interest, month_bounds, completed_periods_for, reverse_investor_transaction, investor_reconciliation, reverse_interest_accrual, catch_up_investor_interest, investor_interest_summary, run_monthly_investor_interest_accrual, investor_interest_accrual_dashboard
 from ..accounting import ValidationError, AccountingError
 from .utils import role_required
 
@@ -517,6 +517,13 @@ def accruals(aid): return jsonify({"items":[ac_dict(a) for a in InvestorInterest
 
 def _parse_accrual_month(value):
     raw = str(value or "").strip()
+    # A date picker may submit a full ISO date.  Reading its year/month as text
+    # avoids JavaScript/UTC conversions and therefore any off-by-one month.
+    if len(raw) == 10:
+        try:
+            raw = date.fromisoformat(raw).strftime("%Y-%m")
+        except ValueError:
+            return None
     if len(raw) != 7:
         return None
     try:
@@ -559,6 +566,11 @@ def run_interest_accruals():
         return jsonify({"error": "funding_agreement_not_found", "message": "The selected funding agreement was not found."}), 404
     try:
         result = run_monthly_investor_interest_accrual(period_start, period_end, agreement_id, post, uid())
+        expected_month = period_start.strftime("%Y-%m")
+        if result.get("accrual_month") != expected_month or any(
+            item.get("accrual_month") != expected_month for item in result.get("items", [])
+        ):
+            raise AccountingError("Interest accrual result month does not match the requested month")
         if post:
             critical_codes = {"MISSING_INTEREST_RATE", "INVALID_RATE_BASIS", "MISSING_EXPENSE_ACCOUNT",
                               "MISSING_PAYABLE_ACCOUNT", "INVALID_FUNDING_HISTORY"}
@@ -589,7 +601,7 @@ def list_interest_accruals():
         if not start:
             return jsonify({"error": "invalid_accrual_month", "message": "Provide the accrual month in YYYY-MM format."}), 422
         end = date(start.year, start.month, __import__("calendar").monthrange(start.year, start.month)[1])
-        query = query.filter(InvestorInterestAccrual.accrual_period_start <= end, InvestorInterestAccrual.accrual_period_end >= start)
+        query = query.filter_by(accrual_period_start=start, accrual_period_end=end)
     for field, column in (("investor_id", InvestorInterestAccrual.investor_id), ("agreement_id", InvestorInterestAccrual.agreement_id)):
         raw = request.args.get(field)
         if raw:
@@ -612,21 +624,16 @@ def _monthly_accrual_item_for_route(accrual):
                                  accrual=accrual, status=accrual.status)
 
 
+@investors_bp.route("/investor-funding/interest-accruals/dashboard", methods=["GET"], strict_slashes=False)
 @investors_bp.route("/investor-funding/interest-accruals/summary", methods=["GET"], strict_slashes=False)
 @role_required(["admin"])
 def interest_accrual_summary():
-    start = _parse_accrual_month(request.args.get("accrual_month", request.args.get("month")))
+    raw_month = request.args.get("accrual_month", request.args.get("month"))
+    start = _parse_accrual_month(raw_month) if raw_month else date.today().replace(day=1)
     if not start:
         return jsonify({"error": "invalid_accrual_month", "message": "Provide the accrual month in YYYY-MM format."}), 422
     end = date(start.year, start.month, __import__("calendar").monthrange(start.year, start.month)[1])
-    preview = run_monthly_investor_interest_accrual(start, end, post=False)
-    posted = InvestorInterestAccrual.query.filter(InvestorInterestAccrual.accrual_period_start <= end, InvestorInterestAccrual.accrual_period_end >= start).all()
-    db.session.rollback()
-    return jsonify({**preview,
-        "accruals_posted_this_month": sum(a.status in {"POSTED", "PARTIALLY_PAID", "PAID", "CAPITALIZED"} for a in posted),
-        "accruals_awaiting_payment": sum(a.status in {"POSTED", "PARTIALLY_PAID"} for a in posted),
-        "accrual_exceptions": len(preview["exceptions"]),
-    })
+    return jsonify(investor_interest_accrual_dashboard(start, end))
 @investors_bp.route("/investor-interest-accruals/<int:accrual_id>/pay", methods=["POST"])
 @role_required(["admin"])
 def pay(accrual_id):
