@@ -5,7 +5,7 @@ from sqlalchemy import or_
 from flask_jwt_extended import get_jwt_identity
 from ..extensions import db
 from ..models import AccountingJournalEntry, Investor, InvestorFundingAgreement, InvestorFundingTransaction, InvestorInterestAccrual
-from ..investor_funding import INCREASE_TYPES, DECREASE_TYPES, create_investor, create_agreement, record_funding, principal_repayment, calculate_investor_interest, post_investor_interest_accrual, pay_interest, capitalize_interest, month_bounds, completed_periods_for, reverse_investor_transaction, investor_reconciliation, reverse_interest_accrual, catch_up_investor_interest, investor_interest_summary
+from ..investor_funding import INCREASE_TYPES, DECREASE_TYPES, create_investor, create_agreement, record_funding, principal_repayment, calculate_investor_interest, post_investor_interest_accrual, pay_interest, capitalize_interest, month_bounds, completed_periods_for, reverse_investor_transaction, investor_reconciliation, reverse_interest_accrual, catch_up_investor_interest, investor_interest_summary, run_monthly_investor_interest_accrual
 from ..accounting import ValidationError, AccountingError
 from .utils import role_required
 
@@ -513,6 +513,120 @@ def accrue(aid):
 @investors_bp.route("/investor-agreements/<int:aid>/interest-accruals")
 @role_required(["admin"])
 def accruals(aid): return jsonify({"items":[ac_dict(a) for a in InvestorInterestAccrual.query.filter_by(agreement_id=aid).order_by(InvestorInterestAccrual.accrual_period_end).all()]})
+
+
+def _parse_accrual_month(value):
+    raw = str(value or "").strip()
+    if len(raw) != 7:
+        return None
+    try:
+        parsed = date.fromisoformat(raw + "-01")
+    except ValueError:
+        return None
+    return parsed if parsed.strftime("%Y-%m") == raw else None
+
+
+def _normalized_accrual_request():
+    data = request.get_json(silent=True) or {}
+    period_start = _parse_accrual_month(data.get("accrual_month", data.get("month")))
+    if not period_start:
+        return None, (jsonify({"error": "invalid_accrual_month", "message": "Provide the accrual month in YYYY-MM format."}), 422)
+    raw_agreement = data.get("agreement_id", data.get("funding_agreement_id"))
+    if raw_agreement is None or (isinstance(raw_agreement, str) and not raw_agreement.strip()):
+        agreement_id = None
+    else:
+        try:
+            agreement_id = int(raw_agreement)
+            if agreement_id <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            return None, (jsonify({"error": "invalid_agreement", "message": "Select a valid funding agreement or leave the field blank."}), 422)
+    post = data.get("post") is True
+    if data.get("preview_only") is True:
+        post = False
+    return (period_start, agreement_id, post), None
+
+
+@investors_bp.route("/investor-funding/interest-accruals/run", methods=["POST"], strict_slashes=False)
+@role_required(["admin"])
+def run_interest_accruals():
+    normalized, response = _normalized_accrual_request()
+    if response:
+        return response
+    period_start, agreement_id, post = normalized
+    period_end = date(period_start.year, period_start.month, __import__("calendar").monthrange(period_start.year, period_start.month)[1])
+    if agreement_id is not None and db.session.get(InvestorFundingAgreement, agreement_id) is None:
+        return jsonify({"error": "funding_agreement_not_found", "message": "The selected funding agreement was not found."}), 404
+    try:
+        result = run_monthly_investor_interest_accrual(period_start, period_end, agreement_id, post, uid())
+        if post:
+            critical_codes = {"MISSING_INTEREST_RATE", "INVALID_RATE_BASIS", "MISSING_EXPENSE_ACCOUNT",
+                              "MISSING_PAYABLE_ACCOUNT", "INVALID_FUNDING_HISTORY"}
+            if any(item["reason_code"] in critical_codes for item in result["exceptions"]):
+                db.session.rollback()
+                return jsonify({"error": "accrual_posting_validation_failed", "message": "Investor interest accrual posting failed validation.", **result}), 422
+            db.session.commit()
+        else:
+            db.session.rollback()
+        if not result["items"] and not result["exceptions"]:
+            result["message"] = f"No eligible investor agreements were found for {period_start.strftime('%B %Y')}."
+        return jsonify(result)
+    except Exception as exc:
+        db.session.rollback()
+        if isinstance(exc, (ValidationError, AccountingError)):
+            return error(exc)
+        current_app.logger.exception("Investor interest accrual run failed", exc_info=exc)
+        return jsonify({"error": "interest_accrual_failed", "message": "Investor interest accrual could not be completed."}), 500
+
+
+@investors_bp.route("/investor-funding/interest-accruals", methods=["GET"], strict_slashes=False)
+@role_required(["admin"])
+def list_interest_accruals():
+    query = InvestorInterestAccrual.query
+    month = request.args.get("accrual_month", request.args.get("month"))
+    if month:
+        start = _parse_accrual_month(month)
+        if not start:
+            return jsonify({"error": "invalid_accrual_month", "message": "Provide the accrual month in YYYY-MM format."}), 422
+        end = date(start.year, start.month, __import__("calendar").monthrange(start.year, start.month)[1])
+        query = query.filter(InvestorInterestAccrual.accrual_period_start <= end, InvestorInterestAccrual.accrual_period_end >= start)
+    for field, column in (("investor_id", InvestorInterestAccrual.investor_id), ("agreement_id", InvestorInterestAccrual.agreement_id)):
+        raw = request.args.get(field)
+        if raw:
+            try: query = query.filter(column == int(raw))
+            except ValueError: return jsonify({"error": "invalid_filter", "message": f"{field} must be an integer."}), 422
+    if request.args.get("status"):
+        query = query.filter(InvestorInterestAccrual.status == request.args["status"].upper())
+    try:
+        page, per_page = max(int(request.args.get("page", 1)), 1), min(max(int(request.args.get("per_page", 50)), 1), 200)
+    except ValueError:
+        return jsonify({"error": "invalid_pagination", "message": "page and per_page must be integers."}), 422
+    pagination = query.order_by(InvestorInterestAccrual.accrual_period_end.desc(), InvestorInterestAccrual.id.desc()).paginate(page=page, per_page=per_page, error_out=False)
+    items = [_monthly_accrual_item_for_route(a) for a in pagination.items]
+    return jsonify({"items": items, "page": page, "per_page": per_page, "total": pagination.total, "pages": pagination.pages})
+
+
+def _monthly_accrual_item_for_route(accrual):
+    from ..investor_funding import _monthly_accrual_item
+    return _monthly_accrual_item(accrual.agreement, accrual.accrual_period_start, accrual.accrual_period_end,
+                                 accrual=accrual, status=accrual.status)
+
+
+@investors_bp.route("/investor-funding/interest-accruals/summary", methods=["GET"], strict_slashes=False)
+@role_required(["admin"])
+def interest_accrual_summary():
+    start = _parse_accrual_month(request.args.get("accrual_month", request.args.get("month")))
+    if not start:
+        return jsonify({"error": "invalid_accrual_month", "message": "Provide the accrual month in YYYY-MM format."}), 422
+    end = date(start.year, start.month, __import__("calendar").monthrange(start.year, start.month)[1])
+    preview = run_monthly_investor_interest_accrual(start, end, post=False)
+    posted = InvestorInterestAccrual.query.filter(InvestorInterestAccrual.accrual_period_start <= end, InvestorInterestAccrual.accrual_period_end >= start).all()
+    db.session.rollback()
+    return jsonify({**preview,
+        "accruals_posted_this_month": sum(a.status in {"POSTED", "PARTIALLY_PAID", "PAID", "CAPITALIZED"} for a in posted),
+        "accruals_awaiting_payment": sum(a.status in {"POSTED", "PARTIALLY_PAID"} for a in posted),
+        "accrual_exceptions": len(preview["exceptions"]),
+    })
 @investors_bp.route("/investor-interest-accruals/<int:accrual_id>/pay", methods=["POST"])
 @role_required(["admin"])
 def pay(accrual_id):
