@@ -502,6 +502,123 @@ def calculate_investor_interest(agreement_id, period_start, period_end):
     return {**engine, "calendar_days_in_month": days_in_calendar_month, "interest_rate": rate, "interest_rate_period": agr.interest_rate_period, "calculation_method": method, "gross_interest_amount": gross, "withholding_tax_amount": tax, "net_interest_payable": money(gross - tax)}
 
 
+POSTED_ACCRUAL_STATUSES = {"POSTED", "PARTIALLY_PAID", "PAID", "CAPITALIZED"}
+
+
+def _monthly_accrual_item(agreement, period_start, period_end, calc=None, accrual=None, status="PREVIEW"):
+    """Return the common API representation without changing calculation precision."""
+    investor = agreement.investor
+    journal = accrual.journal_entry if accrual else None
+    values = calc or {
+        "opening_balance": accrual.opening_principal_balance,
+        "closing_balance": accrual.closing_principal_balance,
+        "average_daily_balance": accrual.average_daily_balance,
+        "interest_rate": accrual.interest_rate,
+        "interest_rate_period": accrual.interest_rate_period,
+        "calculation_method": accrual.calculation_method,
+        "gross_interest_amount": accrual.gross_interest_amount,
+        "withholding_tax_amount": accrual.withholding_tax_amount,
+        "net_interest_payable": accrual.net_interest_payable,
+    }
+    paid = money(accrual.payment_amount if accrual else 0)
+    capitalized = money(accrual.capitalization_amount if accrual else 0)
+    return {
+        "id": accrual.id if accrual else None,
+        "accrual_month": period_start.strftime("%Y-%m"),
+        "period_start": period_start.isoformat(),
+        "period_end": period_end.isoformat(),
+        "investor_id": agreement.investor_id,
+        "investor_name": (investor.full_name or investor.company_name or investor.investor_number) if investor else None,
+        "agreement_id": agreement.id,
+        "agreement_number": agreement.agreement_number,
+        "opening_principal": str(money(values["opening_balance"])),
+        "closing_principal": str(money(values["closing_balance"])),
+        "average_daily_balance": str(money(values["average_daily_balance"])),
+        "rate": str(Decimal(str(values["interest_rate"]))),
+        "rate_basis": values["interest_rate_period"],
+        "calculation_method": values["calculation_method"],
+        "gross_interest": str(money(values["gross_interest_amount"])),
+        "withholding_tax": str(money(values["withholding_tax_amount"])),
+        "net_payable": str(money(values["net_interest_payable"])),
+        "paid": str(paid),
+        "outstanding": str(money(values["net_interest_payable"]) - paid - capitalized),
+        "status": status,
+        "journal_id": accrual.journal_entry_id if accrual else None,
+        "journal_number": journal.journal_number if journal else None,
+    }
+
+
+def run_monthly_investor_interest_accrual(period_start, period_end, agreement_id=None, post=False, requested_by=None):
+    """Preview or atomically stage one month's accruals using the canonical calculator/poster.
+
+    The caller owns commit/rollback.  This makes an all-agreement posting atomic while
+    preserving ``post_investor_interest_accrual`` as the sole posting implementation.
+    """
+    query = InvestorFundingAgreement.query
+    if agreement_id is not None:
+        query = query.filter_by(id=agreement_id)
+    agreements = query.order_by(InvestorFundingAgreement.id).all()
+    items, exceptions = [], []
+    already_posted = 0
+
+    for agreement in agreements:
+        reason = None
+        if not agreement.investor or str(agreement.investor.status or "").upper() != "ACTIVE":
+            reason = ("AGREEMENT_INACTIVE", "The investor or funding agreement is inactive.")
+        elif str(agreement.status or "").upper() != "ACTIVE":
+            reason = ("AGREEMENT_INACTIVE", "The funding agreement is inactive.")
+        elif agreement.start_date > period_end:
+            reason = ("AGREEMENT_NOT_STARTED", "The funding agreement had not started in the selected month.")
+        elif agreement.maturity_date and agreement.maturity_date < period_start:
+            reason = ("AGREEMENT_ENDED", "The funding agreement ended before the selected month.")
+        elif money(agreement.interest_rate) <= 0:
+            reason = ("MISSING_INTEREST_RATE", "The funding agreement has no valid interest rate.")
+        elif agreement.calculation_method not in MONTHLY_METHODS | {"ANNUAL_ACTUAL_365", "ANNUAL_ACTUAL_366"}:
+            reason = ("INVALID_RATE_BASIS", "The funding agreement has an invalid interest calculation method.")
+        elif not agreement.interest_expense_account_id:
+            reason = ("MISSING_EXPENSE_ACCOUNT", "The investor interest expense account is not configured.")
+        elif not agreement.accrued_interest_payable_account_id:
+            reason = ("MISSING_PAYABLE_ACCOUNT", "The accrued investor interest payable account is not configured.")
+        if reason:
+            exceptions.append({"agreement_id": agreement.id, "agreement_number": agreement.agreement_number,
+                               "investor_name": (agreement.investor.full_name if agreement.investor else None),
+                               "reason_code": reason[0], "message": reason[1]})
+            continue
+
+        existing = InvestorInterestAccrual.query.filter_by(
+            agreement_id=agreement.id, accrual_period_start=period_start, accrual_period_end=period_end
+        ).first()
+        if existing and existing.status in POSTED_ACCRUAL_STATUSES and not existing.reversed_at:
+            already_posted += 1
+            items.append(_monthly_accrual_item(agreement, period_start, period_end, accrual=existing,
+                                               status="ALREADY_POSTED"))
+            continue
+        calc = calculate_investor_interest(agreement.id, period_start, period_end)
+        if calc["average_daily_balance"] <= 0 or calc["gross_interest_amount"] <= 0:
+            exceptions.append({"agreement_id": agreement.id, "agreement_number": agreement.agreement_number,
+                               "investor_name": agreement.investor.full_name,
+                               "reason_code": "NO_FUNDING_BALANCE", "message": "No investor principal balance exists for the selected month."})
+            continue
+        if post:
+            accrual = post_investor_interest_accrual(agreement.id, period_start, period_end, requested_by)
+            items.append(_monthly_accrual_item(agreement, period_start, period_end, accrual=accrual, status=accrual.status))
+        else:
+            items.append(_monthly_accrual_item(agreement, period_start, period_end, calc=calc))
+
+    actionable = [item for item in items if item["status"] != "ALREADY_POSTED"]
+    return {
+        "success": True,
+        "accrual_month": period_start.strftime("%Y-%m"),
+        "preview_only": not post,
+        "agreements_requiring_accrual": len(actionable),
+        "accruals_already_posted": already_posted,
+        "total_investor_principal": str(money(sum(Decimal(i["average_daily_balance"]) for i in actionable))),
+        "total_accrued_interest": str(money(sum(Decimal(i["gross_interest"]) for i in actionable))),
+        "items": items,
+        "exceptions": exceptions,
+    }
+
+
 def post_investor_interest_accrual(agreement_id, period_start, period_end, requested_by=None):
     agr = InvestorFundingAgreement.query.get(agreement_id); require_open_accounting_period(period_end)
     existing = InvestorInterestAccrual.query.filter_by(agreement_id=agreement_id, accrual_period_start=period_start, accrual_period_end=period_end).first()
