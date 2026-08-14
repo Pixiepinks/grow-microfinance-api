@@ -37,6 +37,11 @@ def _error(message, field=None, code=None):
     return jsonify(body), 422
 
 
+def _remove_error(error, message, status):
+    """Return the stable JSON contract used by reconciliation unmatching."""
+    return jsonify({"success": False, "error": error, "message": message}), status
+
+
 def _decimal(value, field):
     try:
         return Decimal(str(value)).quantize(Decimal("0.01"))
@@ -416,19 +421,73 @@ def add_line(rec_id):
     return jsonify(result)
 
 
+def _remove_reconciliation_match(rec_id, line_id):
+    """Undo add_line's reconciliation metadata without changing accounting data."""
+    rec = BankReconciliation.query.filter_by(id=rec_id).with_for_update().one_or_none()
+    if not rec:
+        return _remove_error("reconciliation_not_found", "Bank reconciliation not found.", 404)
+    if rec.status not in EDITABLE:
+        return _remove_error(
+            "reconciliation_locked", "Completed reconciliations cannot be modified.", 409)
+
+    line = db.session.get(AccountingJournalLine, line_id)
+    if not line:
+        return _remove_error("match_not_found", "Transaction match not found.", 404)
+    if line.bank_reconciliation_id not in (None, rec.id):
+        return _remove_error(
+            "match_conflict", "Journal line belongs to another reconciliation.", 409)
+    allocation = BankReconciliationLine.query.filter_by(
+        bank_reconciliation_id=rec.id, journal_line_id=line.id).one_or_none()
+    if line.bank_reconciliation_id != rec.id or not allocation:
+        return _remove_error("match_not_found", "Transaction match not found.", 404)
+
+    line.is_reconciled = False; line.bank_reconciliation_id = None; line.reconciled_date = None
+    line.reconciled_at = None; line.reconciled_by_id = None; line.bank_statement_reference = None; line.reconciliation_note = None
+    db.session.delete(allocation)
+    _audit(rec, "LINE_REMOVED", line.id, request.args.get("reason")); _refresh(rec); db.session.commit()
+    summary = _serialize(rec)
+    response = dict(summary)
+    response.update(success=True, message="Transaction match removed.",
+                    reconciliation_id=rec.id, journal_line_id=line.id,
+                    summary={
+                        "matched_transaction_count": summary["matched_transaction_count"],
+                        "statement_closing_balance": summary["statement_closing_balance"],
+                        "gl_balance": summary["gl_closing_balance"],
+                        "reconciled_debits": summary["reconciled_debits"],
+                        "reconciled_credits": summary["reconciled_credits"],
+                        "unreconciled_debits": summary["unreconciled_debits"],
+                        "unreconciled_credits": summary["unreconciled_credits"],
+                        "difference": summary["difference"],
+                    }, transactions=_transaction_rows(rec))
+    return jsonify(response)
+
+
 @bank_reconciliation_bp.route("/bank-reconciliations/<int:rec_id>/lines/<int:line_id>", methods=["DELETE"])
 @bank_reconciliation_legacy_bp.route("/bank-reconciliations/<int:rec_id>/lines/<int:line_id>", methods=["DELETE"])
 @role_required(["admin"])
 def remove_line(rec_id, line_id):
-    rec = BankReconciliation.query.with_for_update().get_or_404(rec_id)
-    if rec.status not in EDITABLE: return _error("Completed or cancelled reconciliations are not editable")
-    line = db.session.get(AccountingJournalLine, line_id)
-    if not line or line.bank_reconciliation_id != rec.id: return _error("Journal line is not in this reconciliation")
-    line.is_reconciled = False; line.bank_reconciliation_id = None; line.reconciled_date = None
-    line.reconciled_at = None; line.reconciled_by_id = None; line.bank_statement_reference = None; line.reconciliation_note = None
-    BankReconciliationLine.query.filter_by(bank_reconciliation_id=rec.id, journal_line_id=line.id).delete()
-    _audit(rec, "LINE_REMOVED", line.id, request.args.get("reason")); _refresh(rec); db.session.commit()
-    return jsonify(_serialize(rec))
+    return _remove_reconciliation_match(rec_id, line_id)
+
+
+@bank_reconciliation_bp.route("/bank-reconciliations/<int:rec_id>/matches", methods=["DELETE"])
+@bank_reconciliation_legacy_bp.route("/bank-reconciliations/<int:rec_id>/matches", methods=["DELETE"])
+@role_required(["admin"])
+def remove_match(rec_id):
+    """Compatibility route used by the deployed Bank Reconciliation screen."""
+    data = request.get_json(silent=True) or {}
+    line_id = data.get("journal_line_id")
+    if not isinstance(line_id, int):
+        return _remove_error(
+            "invalid_journal_line_id", "journal_line_id must be a journal-line ID.", 422)
+    return _remove_reconciliation_match(rec_id, line_id)
+
+
+@bank_reconciliation_bp.route("/bank-reconciliations/<int:rec_id>/matches/<int:line_id>", methods=["DELETE"])
+@bank_reconciliation_legacy_bp.route("/bank-reconciliations/<int:rec_id>/matches/<int:line_id>", methods=["DELETE"])
+@role_required(["admin"])
+def remove_match_by_line(rec_id, line_id):
+    """Path-parameter alias for clients which identify the matched journal line in the URL."""
+    return _remove_reconciliation_match(rec_id, line_id)
 
 
 @bank_reconciliation_bp.route("/bank-reconciliations/<int:rec_id>/complete", methods=["POST"])

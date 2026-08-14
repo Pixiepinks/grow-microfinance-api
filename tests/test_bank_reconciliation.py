@@ -80,6 +80,8 @@ def test_create_route_registration_and_production_compatibility_alias(app, clien
     assert ("/admin/accounting/bank-reconciliations/<int:rec_id>/transactions", "GET") in rules
     assert ("/admin/accounting/bank-reconciliations/<int:rec_id>/lines", "POST") in rules
     assert ("/admin/accounting/bank-reconciliations/<int:rec_id>/lines/<int:line_id>", "DELETE") in rules
+    assert ("/admin/accounting/bank-reconciliations/<int:rec_id>/matches", "DELETE") in rules
+    assert ("/admin/accounting/bank-reconciliations/<int:rec_id>/matches/<int:line_id>", "DELETE") in rules
     assert ("/admin/accounting/bank-reconciliations/<int:rec_id>/complete", "POST") in rules
     assert ("/admin/accounting/bank-reconciliations/<int:rec_id>/reopen", "POST") in rules
     assert ("/admin/bank-reconciliations", "POST") in rules
@@ -113,6 +115,121 @@ def test_create_route_registration_and_production_compatibility_alias(app, clien
     assert slash_response.status_code == 201
     assert client.options("/admin/accounting/bank-reconciliations").status_code == 204
     assert client.options("/admin/accounting/bank-reconciliations/").status_code == 204
+
+
+def test_remove_match_compatibility_route_unmatches_only_selected_line(app, client):
+    _, headers = _headers(app)
+    bank = AccountingAccount(account_code="1010", account_name="Bank", account_type="ASSET",
+        normal_balance="DEBIT", account_subtype="BANK")
+    other = AccountingAccount(account_code="1050", account_name="Other", account_type="ASSET",
+        normal_balance="DEBIT", account_subtype="OTHER")
+    db.session.add_all([bank, other]); db.session.commit()
+    debit_entry = _journal(bank, other, "J-REMOVE-DEBIT")
+    credit_entry = AccountingJournalEntry(journal_no="J-KEEP-CREDIT",
+        journal_date=date(2026, 2, 11), description="Bank payment", status="POSTED",
+        total_debit=Decimal("100"), total_credit=Decimal("100"))
+    credit_entry.lines = [AccountingJournalLine(line_no=1, account=bank,
+        debit=Decimal("0"), credit=Decimal("100")),
+        AccountingJournalLine(line_no=2, account=other,
+        debit=Decimal("100"), credit=Decimal("0"))]
+    db.session.add(credit_entry); db.session.commit()
+    rec_id = client.post("/admin/accounting/bank-reconciliations", headers=headers, json={
+        "bank_account_id": bank.id, "statement_date_from": "2026-02-01",
+        "statement_date_to": "2026-02-28", "statement_opening_balance": "0",
+        "statement_closing_balance": "2000"}).get_json()["id"]
+    line_ids = [debit_entry.lines[0].id, credit_entry.lines[0].id]
+    marked = client.post(f"/admin/accounting/bank-reconciliations/{rec_id}/lines",
+        headers=headers, json={"journal_line_ids": line_ids})
+    assert marked.status_code == 200
+    gl_before = client.get(f"/admin/accounting/general-ledger?account_id={bank.id}",
+                           headers=headers).get_json()
+    entry_count = AccountingJournalEntry.query.count()
+    line_count = AccountingJournalLine.query.count()
+
+    route = f"/admin/accounting/bank-reconciliations/{rec_id}/matches"
+    assert client.options(route).status_code == 204
+    removed = client.delete(route, headers=headers,
+                            json={"journal_line_id": debit_entry.lines[0].id})
+    assert removed.status_code == 200
+    body = removed.get_json()
+    assert body["success"] is True and body["message"] == "Transaction match removed."
+    assert body["reconciliation_id"] == rec_id
+    assert body["journal_line_id"] == debit_entry.lines[0].id
+    assert body["summary"] == {
+        "matched_transaction_count": 1, "statement_closing_balance": "2000.00",
+        "gl_balance": "2000.00", "reconciled_debits": "0.00",
+        "reconciled_credits": "100.00", "unreconciled_debits": "2100.00",
+        "unreconciled_credits": "0.00", "difference": "0.00"}
+    assert body["matched_transaction_count"] == 1
+    assert AccountingJournalEntry.query.count() == entry_count
+    assert AccountingJournalLine.query.count() == line_count
+    assert debit_entry.lines[0].debit == Decimal("2100")
+    assert debit_entry.lines[0].bank_reconciliation_id is None
+    assert debit_entry.lines[0].is_reconciled is False
+    assert debit_entry.lines[0].reconciled_date is None
+    assert debit_entry.lines[0].reconciled_at is None
+    assert debit_entry.lines[0].reconciled_by_id is None
+    assert credit_entry.lines[0].bank_reconciliation_id == rec_id
+    assert credit_entry.lines[0].is_reconciled is True
+    assert BankReconciliationLine.query.filter_by(bank_reconciliation_id=rec_id).count() == 1
+    gl_after = client.get(f"/admin/accounting/general-ledger?account_id={bank.id}",
+                          headers=headers).get_json()
+    assert [(row["journal_line_id"], row["debit"], row["credit"], row["running_balance"])
+            for row in gl_after["transactions"]] == [
+        (row["journal_line_id"], row["debit"], row["credit"], row["running_balance"])
+        for row in gl_before["transactions"]]
+
+    repeated = client.delete(route, headers=headers,
+                             json={"journal_line_id": debit_entry.lines[0].id})
+    assert repeated.status_code == 404
+    assert repeated.get_json()["error"] == "match_not_found"
+
+
+def test_remove_match_conflict_lock_and_round_trip(app, client):
+    _, headers = _headers(app)
+    bank = AccountingAccount(account_code="1010", account_name="Bank", account_type="ASSET",
+        normal_balance="DEBIT", account_subtype="BANK")
+    other = AccountingAccount(account_code="1050", account_name="Other", account_type="ASSET",
+        normal_balance="DEBIT", account_subtype="OTHER")
+    db.session.add_all([bank, other]); db.session.commit()
+    entry = _journal(bank, other)
+    recs = [BankReconciliation(reconciliation_number=f"BR-REMOVE-{number}",
+        bank_account_id=bank.id, statement_date_from=date(2026, 2, 1),
+        statement_date_to=date(2026, 2, 28), statement_opening_balance=0,
+        statement_closing_balance=2100, status=status)
+        for number, status in ((1, "IN_PROGRESS"), (2, "IN_PROGRESS"), (3, "COMPLETED"))]
+    db.session.add_all(recs); db.session.flush()
+    line = entry.lines[0]
+    line.is_reconciled = True; line.bank_reconciliation_id = recs[0].id
+    line.reconciled_date = date(2026, 2, 28)
+    db.session.add(BankReconciliationLine(bank_reconciliation_id=recs[0].id,
+        journal_line_id=line.id, debit=line.debit, credit=line.credit,
+        reconciled_date=date(2026, 2, 28)))
+    db.session.commit()
+
+    other_rec = client.delete(
+        f"/admin/accounting/bank-reconciliations/{recs[1].id}/matches/{line.id}",
+        headers=headers)
+    assert other_rec.status_code == 409
+    assert other_rec.get_json()["error"] == "match_conflict"
+    locked = client.delete(
+        f"/admin/accounting/bank-reconciliations/{recs[2].id}/matches",
+        headers=headers, json={"journal_line_id": line.id})
+    assert locked.status_code == 409
+    assert locked.get_json() == {"success": False, "error": "reconciliation_locked",
+        "message": "Completed reconciliations cannot be modified."}
+    assert recs[2].status == "COMPLETED" and line.bank_reconciliation_id == recs[0].id
+
+    removed = client.delete(
+        f"/admin/accounting/bank-reconciliations/{recs[0].id}/matches/{line.id}",
+        headers=headers)
+    assert removed.status_code == 200 and line.is_reconciled is False
+    remarked = client.post(f"/admin/accounting/bank-reconciliations/{recs[0].id}/lines",
+        headers=headers, json={"journal_line_id": line.id})
+    assert remarked.status_code == 200 and line.is_reconciled is True
+    assert BankReconciliationLine.query.filter_by(journal_line_id=line.id).count() == 1
+    assert client.delete("/admin/accounting/bank-reconciliations/999999/matches",
+        headers=headers, json={"journal_line_id": line.id}).status_code == 404
 
 
 def test_create_validation_and_authorization(app, client):
