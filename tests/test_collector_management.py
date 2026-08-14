@@ -7,7 +7,10 @@ from sqlalchemy import event
 
 from app.accounting import seed_default_accounts
 from app.extensions import db
-from app.models import AccountingAccount, Customer, Loan, Payment, User
+from app.models import (
+    AccountingAccount, AccountingJournalLine, AccountingSetting, CollectionDepositAllocation,
+    CollectionDepositBatch, Customer, Loan, Payment, User,
+)
 
 
 def _user(role="admin", name=None, email=None):
@@ -336,6 +339,107 @@ def test_collection_deposit_posts_full_deposit_and_rolls_back_on_failure(app, cl
     assert failed.status_code == 422
     rolled_back_payment = db.session.get(__import__("app.models", fromlist=["Payment"]).Payment, payment2)
     assert rolled_back_payment.deposit_status == "UNDEPOSITED"
+
+
+def test_payment_can_be_partially_deposited_across_multiple_batches(app, client):
+    admin, collector, account_id, bank_id, payment_id = _deposit_setup(app, client)
+    headers = _headers(app, admin)
+    payment = db.session.get(Payment, payment_id)
+    payment_count = Payment.query.filter_by(loan_id=payment.loan_id).count()
+
+    first = client.post("/admin/collection-deposits", headers=headers, json=_deposit_payload(
+        collector, account_id, bank_id, payment_id,
+        allocations=[{"payment_id": payment_id, "amount": "650.00"}],
+    ))
+    assert first.status_code == 201
+    payment = db.session.get(Payment, payment_id)
+    assert payment.deposited_amount == Decimal("650.00")
+    assert payment.undeposited_amount == Decimal("1450.00")
+    assert payment.deposit_status == "PARTIALLY_DEPOSITED"
+
+    listing = client.get("/admin/collections/undeposited", headers=headers)
+    row = next(item for item in listing.get_json()["items"] if item["payment_id"] == payment_id)
+    assert row["amount_deposited"] == "650.00"
+    assert row["undeposited_amount"] == "1450.00"
+
+    second = client.post("/admin/collection-deposits", headers=headers, json=_deposit_payload(
+        collector, account_id, bank_id, payment_id,
+        allocations=[{"payment_id": payment_id, "amount": "1450.00"}],
+    ))
+    assert second.status_code == 201
+    assert CollectionDepositAllocation.query.filter_by(payment_id=payment_id).count() == 2
+    assert len({a.deposit_batch_id for a in CollectionDepositAllocation.query.filter_by(payment_id=payment_id)}) == 2
+    assert Payment.query.filter_by(loan_id=payment.loan_id).count() == payment_count
+    assert db.session.get(Payment, payment_id).deposited_amount == Decimal("2100.00")
+    assert payment_id not in [item["payment_id"] for item in client.get(
+        "/admin/collections/undeposited", headers=headers).get_json()["items"]]
+    lines = AccountingJournalLine.query.filter_by(journal_entry_id=second.get_json()["journal_entry_id"]).all()
+    assert sum((line.debit for line in lines), Decimal("0")) == Decimal("1450.00")
+    assert sum((line.credit for line in lines), Decimal("0")) == Decimal("1450.00")
+
+
+def test_partial_deposit_controls_reject_invalid_amounts_atomically(app, client):
+    admin, collector, account_id, bank_id, payment_id = _deposit_setup(app, client)
+    headers = _headers(app, admin)
+    for invalid in ("0", "-1"):
+        response = client.post("/admin/collection-deposits/preview", headers=headers, json=_deposit_payload(
+            collector, account_id, bank_id, payment_id,
+            allocations=[{"payment_id": payment_id, "amount": invalid}],
+        ))
+        assert response.status_code == 422
+    first = client.post("/admin/collection-deposits", headers=headers, json=_deposit_payload(
+        collector, account_id, bank_id, payment_id,
+        allocations=[{"payment_id": payment_id, "amount": "650.00"}],
+    ))
+    assert first.status_code == 201
+    before = (CollectionDepositBatch.query.count(), CollectionDepositAllocation.query.count())
+
+    excessive = client.post("/admin/collection-deposits", headers=headers, json=_deposit_payload(
+        collector, account_id, bank_id, payment_id,
+        allocations=[{"payment_id": payment_id, "amount": "1450.01"}],
+    ))
+    assert excessive.status_code == 422
+    assert excessive.get_json() == {
+        "error": "allocation_exceeds_undeposited_amount",
+        "message": "Requested deposit amount exceeds the remaining undeposited balance.",
+        "payment_id": payment_id, "amount_collected": "2100.00",
+        "amount_deposited": "650.00", "undeposited_amount": "1450.00",
+        "requested_amount": "1450.01",
+    }
+    duplicate = client.post("/admin/collection-deposits", headers=headers, json=_deposit_payload(
+        collector, account_id, bank_id, payment_id,
+        allocations=[{"payment_id": payment_id, "amount": "1000"}, {"payment_id": payment_id, "amount": "450"}],
+    ))
+    assert duplicate.status_code == 422
+    assert (CollectionDepositBatch.query.count(), CollectionDepositAllocation.query.count()) == before
+
+
+def test_partial_setting_and_reversed_batches_restore_available_balance(app, client):
+    admin, collector, account_id, bank_id, payment_id = _deposit_setup(app, client)
+    headers = _headers(app, admin)
+    setting = AccountingSetting(setting_key="allow_partial_deposits", setting_value="false")
+    db.session.add(setting); db.session.commit()
+    partial = client.post("/admin/collection-deposits", headers=headers, json=_deposit_payload(
+        collector, account_id, bank_id, payment_id,
+        allocations=[{"payment_id": payment_id, "amount": "650"}],
+    ))
+    assert partial.status_code == 422
+    setting.setting_value = "true"; db.session.commit()
+    posted = client.post("/admin/collection-deposits", headers=headers, json=_deposit_payload(
+        collector, account_id, bank_id, payment_id,
+        allocations=[{"payment_id": payment_id, "amount": "650"}],
+    ))
+    assert posted.status_code == 201
+    batch = db.session.get(CollectionDepositBatch, posted.get_json()["deposit_batch_id"])
+    batch.status = "REVERSED"
+    # Simulate the canonical reversal's cached-balance update while retaining its audit allocation.
+    payment = db.session.get(Payment, payment_id)
+    payment.deposited_amount = Decimal("0"); payment.deposit_status = "UNDEPOSITED"
+    db.session.commit()
+    full = client.post("/admin/collection-deposits", headers=headers, json=_deposit_payload(
+        collector, account_id, bank_id, payment_id,
+    ))
+    assert full.status_code == 201
 
 
 def test_cleared_sheet_payment_is_hidden_and_cannot_be_deposited_again(app, client):
