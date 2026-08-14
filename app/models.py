@@ -1089,6 +1089,9 @@ class CollectionSheetExpense(db.Model):
 
 class CollectionDepositAllocation(db.Model):
     __tablename__ = "collection_deposit_allocations"
+    __table_args__ = (
+        db.UniqueConstraint("deposit_batch_id", "payment_id", name="uq_dep_alloc_batch_payment"),
+    )
 
     id = db.Column(db.Integer, primary_key=True)
     deposit_batch_id = db.Column(db.Integer, db.ForeignKey("collection_deposit_batches.id"), nullable=False, index=True)

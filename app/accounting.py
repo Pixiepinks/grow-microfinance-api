@@ -2155,7 +2155,30 @@ def _parse_deposit_date(value):
     return parsed
 
 
-def validate_collection_deposit_payload(data):
+def _active_deposited_amount(payment_id):
+    """Return allocations which still consume the payment's bankable balance."""
+    from .models import CollectionDepositBatch
+
+    value = db.session.query(func.coalesce(func.sum(CollectionDepositAllocation.allocated_amount), 0)).join(
+        CollectionDepositBatch,
+        CollectionDepositBatch.id == CollectionDepositAllocation.deposit_batch_id,
+    ).filter(
+        CollectionDepositAllocation.payment_id == payment_id,
+        CollectionDepositBatch.status != "REVERSED",
+    ).scalar()
+    return money(value)
+
+
+def _partial_deposits_allowed():
+    setting = AccountingSetting.query.filter_by(setting_key="allow_partial_deposits").first()
+    if setting is None:
+        # Partial allocations were already accepted by this workflow; retain that
+        # behaviour when older installations do not yet have the setting row.
+        return True
+    return str(setting.setting_value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def validate_collection_deposit_payload(data, *, lock_payments=False):
     data = data or {}
     required_fields = ["collector_id", "collector_account_id", "bank_account_id", "deposit_date", "allocations"]
     missing = [field for field in required_fields if data.get(field) in (None, "", [])]
@@ -2215,6 +2238,7 @@ def validate_collection_deposit_payload(data):
     if not isinstance(allocations, list):
         raise ValidationError("allocations must be a list")
     seen = set(); total = Decimal("0.00"); rows = []
+    allow_partial_deposits = _partial_deposits_allowed()
     earliest_payment_date = None
     for idx, raw in enumerate(allocations):
         if not isinstance(raw, dict):
@@ -2226,7 +2250,10 @@ def validate_collection_deposit_payload(data):
         amt = money(raw.get("amount"))
         if amt <= 0:
             raise ValidationError("Allocation amount must be greater than zero", payment_id=payment_id)
-        payment = db.session.get(Payment, payment_id)
+        payment_query = Payment.query.filter_by(id=payment_id)
+        if lock_payments:
+            payment_query = payment_query.with_for_update()
+        payment = payment_query.populate_existing().one_or_none()
         if not payment:
             raise ValidationError("Payment not found", payment_id=payment_id)
         payment_date = payment.accounting_date or payment.payment_date or payment.collection_date
@@ -2241,13 +2268,24 @@ def validate_collection_deposit_payload(data):
             raise ValidationError("Payment must be posted with a journal before deposit", payment_id=payment_id)
         if payment.reversed_at or payment.deposit_status in ("NOT_APPLICABLE", "REVERSED"):
             raise ValidationError("Payment is not depositable", payment_id=payment_id)
-        if payment.collection_clearance_status == "CLEARED" or money(payment.undeposited_amount) <= Decimal("0.01"):
+        already_deposited = _active_deposited_amount(payment.id)
+        amount_collected = money(payment.amount_collected)
+        remaining = money(amount_collected - already_deposited)
+        if payment.collection_clearance_status == "CLEARED" or remaining <= Decimal("0.00"):
             raise ValidationError("Payment collection is already cleared", payment_id=payment_id)
         if payment_date and payment_date > deposit_date:
             raise ValidationError("Deposit date cannot be earlier than any selected payment date", payment_id=payment_id)
-        if amt > money(payment.undeposited_amount):
-            raise ValidationError("Allocation exceeds undeposited amount", payment_id=payment_id, undeposited_amount=f"{money(payment.undeposited_amount):.2f}")
-        total += amt; rows.append({"payment": payment, "amount": amt})
+        if amt > remaining:
+            raise ValidationError(
+                "allocation_exceeds_undeposited_amount",
+                message="Requested deposit amount exceeds the remaining undeposited balance.",
+                payment_id=payment_id, amount_collected=f"{amount_collected:.2f}",
+                amount_deposited=f"{already_deposited:.2f}", undeposited_amount=f"{remaining:.2f}",
+                requested_amount=f"{amt:.2f}",
+            )
+        if not allow_partial_deposits and amt != remaining:
+            raise ValidationError("partial_deposits_disabled", message="The full remaining undeposited balance must be deposited.", payment_id=payment_id)
+        total += amt; rows.append({"payment": payment, "amount": amt, "already_deposited": already_deposited})
     if total <= 0:
         raise ValidationError("Deposit allocations are required")
     balance = collector_cash_position(collector.id, deposit_date)["closing_balance"]
@@ -2281,7 +2319,9 @@ def preview_collection_deposit(data):
 
 def create_collection_deposit(data, user_id=None):
     from .models import CollectionDepositBatch, CollectionDepositAllocation
-    validated = validate_collection_deposit_payload(data)
+    # Row locks serialize deposits against the same payments. Validation and
+    # allocation creation remain in the route's single atomic transaction.
+    validated = validate_collection_deposit_payload(data, lock_payments=True)
     total = validated["total_amount"]
     batch = CollectionDepositBatch(
         deposit_number=generate_deposit_number(validated["deposit_date"]), collector_id=validated["collector"].id,
@@ -2293,8 +2333,11 @@ def create_collection_deposit(data, user_id=None):
     for row in validated["rows"]:
         p = row["payment"]; amt = row["amount"]
         db.session.add(CollectionDepositAllocation(deposit_batch_id=batch.id, payment_id=p.id, allocated_amount=amt))
-        p.deposited_amount = money(Decimal(p.deposited_amount or 0) + amt)
+        p.deposited_amount = money(row["already_deposited"] + amt)
         p.deposit_status = _payment_deposit_status(p)
+    # Surface constraint/data errors here, before journal idempotency queries
+    # can trigger an incidental autoflush.
+    db.session.flush()
     entry = create_draft_journal(
         batch.accounting_date, f"Collector deposit {batch.deposit_number}",
         [{"account_id": batch.bank_account_id, "debit": total}, {"account_id": batch.collector_account_id, "credit": total}],
